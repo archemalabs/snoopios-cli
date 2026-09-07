@@ -34,6 +34,8 @@ var READ_ONLY_POST = [
   /^https:\/\/oauth2\.googleapis\.com\/token$/,
   /^https:\/\/login\.microsoftonline\.com\/[^/]+\/oauth2\/v2\.0\/token$/,
   /^https:\/\/api\.supabase\.com\/v1\/oauth\/token$/,
+  // MongoDB Atlas service account: client credentials for a one-hour token.
+  /^https:\/\/cloud\.mongodb\.com\/api\/oauth\/token$/,
   // Supabase's read-only SQL endpoint: the server refuses anything but a read.
   /^https:\/\/api\.supabase\.com\/v1\/projects\/[^/]+\/database\/query\/read-only$/,
   // UptimeRobot's API is POST-only; these two methods read.
@@ -109,12 +111,12 @@ async function dohTxt(ctx, name, type = "TXT") {
   return json;
 }
 function realTls(host) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve2, reject) => {
     const socket = tlsConnect(
       { host, port: 443, servername: host, rejectUnauthorized: false, timeout: TIMEOUT_MS },
       () => {
         const cert = socket.getPeerCertificate();
-        resolve({
+        resolve2({
           protocol: socket.getProtocol(),
           cipher: socket.getCipher()?.name ?? null,
           validTo: cert?.valid_to ?? null,
@@ -891,6 +893,231 @@ async function runRenderChecks(ctx) {
   return out;
 }
 
+// ../lib/checks/providers/heroku.ts
+function herokuApi(key, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://api.heroku.com${path}`, {
+        headers: { authorization: `Bearer ${key}`, accept: "application/vnd.heroku+json; version=3", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+var SUPPORTED_STACKS = /* @__PURE__ */ new Set(["heroku-22", "heroku-24", "container"]);
+async function apps(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const max = ctx.maxApps ?? 30;
+  const r = await ctx.api.get("/apps");
+  if (r.status === 403) throw new Error("scope:apps.read");
+  if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.apps");
+  let list = r.json.filter((a) => a && a.id && a.name);
+  if (ctx.apps?.length) list = list.filter((a) => ctx.apps.includes(a.name));
+  return list.slice(0, max);
+}
+var managedCerts = {
+  code: "heroku.app.managed_certs",
+  provider: "heroku",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
+  run: (ctx) => guarded("api.domains", async () => {
+    const list = await apps(ctx);
+    if (list.length === 0) return unknown("api.no_apps");
+    const bad = {};
+    const evidence = {};
+    let custom = 0;
+    for (const a of list) {
+      const r = await ctx.api.get(`/apps/${encodeURIComponent(a.id)}/domains`);
+      if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.domains");
+      const domains = r.json.filter((d) => d.kind === "custom");
+      custom += domains.length;
+      const without = domains.filter((d) => !d.sni_endpoint || d.status && d.status !== "succeeded").map((d) => d.hostname ?? "?");
+      evidence[a.name] = { acm: a.acm ?? null, customDomains: domains.map((d) => ({ hostname: d.hostname ?? null, status: d.status ?? null, cert: Boolean(d.sni_endpoint) })) };
+      if (without.length) bad[a.name] = without;
+    }
+    const observed = { apps: list.length, customDomains: custom, withoutCertificate: bad };
+    return Object.keys(bad).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var maintenanceOff = {
+  code: "heroku.app.maintenance_off",
+  provider: "heroku",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:A1.1", "iso:8.16"],
+  run: (ctx) => guarded("api.apps", async () => {
+    const list = await apps(ctx);
+    if (list.length === 0) return unknown("api.no_apps");
+    const on = list.filter((a) => a.maintenance === true).map((a) => a.name);
+    const observed = { apps: list.length, inMaintenance: on };
+    return on.length === 0 ? pass(observed, list.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false }))) : fail(observed, list.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false })));
+  })
+};
+var stackSupported = {
+  code: "heroku.app.stack_supported",
+  provider: "heroku",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
+  run: (ctx) => guarded("api.apps", async () => {
+    const list = await apps(ctx);
+    if (list.length === 0) return unknown("api.no_apps");
+    const old = list.filter((a) => !SUPPORTED_STACKS.has(a.stack?.name ?? "")).map((a) => `${a.name} (${a.stack?.name ?? "unknown"})`);
+    const observed = { apps: list.length, unsupportedStack: old, supported: [...SUPPORTED_STACKS] };
+    const evidence = list.map((a) => ({ name: a.name, stack: a.stack?.name ?? null, buildStack: a.build_stack?.name ?? null }));
+    return old.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var webRedundancy = {
+  code: "heroku.formation.web_redundant",
+  provider: "heroku",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:A1.2", "iso:8.14"],
+  run: (ctx) => guarded("api.formation", async () => {
+    const list = await apps(ctx);
+    if (list.length === 0) return unknown("api.no_apps");
+    const single = [];
+    const evidence = {};
+    let withWeb = 0;
+    for (const a of list) {
+      const r = await ctx.api.get(`/apps/${encodeURIComponent(a.id)}/formation`);
+      if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.formation");
+      const web = r.json.find((f) => f.type === "web");
+      evidence[a.name] = web ? { quantity: web.quantity ?? 0, size: web.size ?? null } : null;
+      if (!web || (web.quantity ?? 0) === 0) continue;
+      withWeb++;
+      if ((web.quantity ?? 0) < 2) single.push(a.name);
+    }
+    if (withWeb === 0) return unknown("api.no_web_dynos", { apps: list.length });
+    const observed = { appsWithWeb: withWeb, singleWebDyno: single };
+    return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var HEROKU_CHECKS = [managedCerts, maintenanceOff, stackSupported, webRedundancy];
+async function runHerokuChecks(ctx) {
+  const out = [];
+  for (const c of HEROKU_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/clerk.ts
+function clerkApi(key, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://api.clerk.com/v1${path}`, {
+        headers: { authorization: `Bearer ${key}`, accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+var DORMANT_DAYS = 90;
+var NEW_DAYS = 30;
+var USER_CAP = 500;
+var MAX_JWT_LIFETIME = 3600;
+var DAY = 24 * 3600 * 1e3;
+var redirectUrlsHttps = {
+  code: "clerk.redirect_urls.https_only",
+  provider: "clerk",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
+  run: (ctx) => guarded("api.redirect_urls", async () => {
+    if (!ctx.api) throw new Error("scope:api.not_connected");
+    const r = await ctx.api.get("/redirect_urls");
+    if (r.status === 403) throw new Error("scope:redirect_urls.read");
+    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.redirect_urls");
+    const urls = r.json.map((u) => u.url ?? "").filter(Boolean);
+    const bad = urls.filter((u) => !/^https:\/\//i.test(u) || /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:|\/|$)/i.test(u) || /^https:\/\/[^/]*\.(local|test|localhost)(:|\/|$)/i.test(u));
+    const observed = { redirectUrls: urls.length, insecureOrLocal: bad };
+    return bad.length === 0 ? pass(observed, { urls }) : fail(observed, { urls });
+  })
+};
+var jwtLifetime = {
+  code: "clerk.jwt_templates.short_lifetime",
+  provider: "clerk",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:8.5"],
+  run: (ctx) => guarded("api.jwt_templates", async () => {
+    if (!ctx.api) throw new Error("scope:api.not_connected");
+    const r = await ctx.api.get("/jwt_templates");
+    if (r.status === 403) throw new Error("scope:jwt_templates.read");
+    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.jwt_templates");
+    const templates = r.json;
+    if (templates.length === 0) return pass({ templates: 0, longLived: [], maxSeconds: MAX_JWT_LIFETIME }, []);
+    const long = templates.filter((t) => (t.lifetime ?? 0) > MAX_JWT_LIFETIME).map((t) => `${t.name ?? "?"} (${t.lifetime}s)`);
+    const observed = { templates: templates.length, longLived: long, maxSeconds: MAX_JWT_LIFETIME };
+    const evidence = templates.map((t) => ({ name: t.name ?? null, lifetime: t.lifetime ?? null }));
+    return long.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var dormantUsers = {
+  code: "clerk.users.dormant",
+  provider: "clerk",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.2", "soc2:CC6.3", "iso:5.18", "ce:user-access"],
+  run: (ctx) => guarded("api.users", async () => {
+    if (!ctx.api) throw new Error("scope:api.not_connected");
+    const r = await ctx.api.get(`/users?limit=${USER_CAP}&order_by=-last_active_at`);
+    if (r.status === 403) throw new Error("scope:users.read");
+    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.users");
+    const users = r.json.filter((u) => u && u.id && !u.banned && !u.locked);
+    if (r.json.length >= USER_CAP) return unknown("api.users.too_many", { users: r.json.length, cap: USER_CAP });
+    if (users.length === 0) return unknown("api.no_users");
+    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    const dormant = users.filter((u) => {
+      const last = u.last_active_at ?? u.last_sign_in_at ?? null;
+      if (last) return now - last > DORMANT_DAYS * DAY;
+      return (u.created_at ?? now) < now - NEW_DAYS * DAY;
+    });
+    const observed = { users: users.length, dormant: dormant.length, dormantDays: DORMANT_DAYS };
+    const evidence = { dormantUserIds: dormant.map((u) => u.id) };
+    return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var CLERK_CHECKS = [redirectUrlsHttps, jwtLifetime, dormantUsers];
+async function runClerkChecks(ctx) {
+  const out = [];
+  for (const c of CLERK_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
 // ../lib/checks/providers/supabase.ts
 var SECRET_KEY2 = /(secret|smtp_pass|_token|api_key|password)/i;
 function scrubAuthConfig(cfg) {
@@ -1150,6 +1377,176 @@ async function runSupabaseChecks(ctx) {
   }
   return out;
 }
+
+// ../lib/checks/providers/repo.ts
+var HISTORY_CAP = 64 * 1024 * 1024;
+var SECRET_PATTERNS = [
+  { name: "AWS access key", re: /\bAKIA[0-9A-Z]{16}\b/ },
+  { name: "GitHub token", re: /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{60,}\b/ },
+  { name: "GitLab token", re: /\bglpat-[A-Za-z0-9._-]{20,}\b/ },
+  { name: "Stripe live key", re: /\b(sk|rk)_live_[A-Za-z0-9]{20,}\b/ },
+  { name: "Slack token", re: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/ },
+  { name: "Google API key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
+  { name: "OpenAI key", re: /\bsk-(proj-)?[A-Za-z0-9_-]{32,}\b/ },
+  { name: "Supabase service key", re: /\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]*"role":"service_role"|\bsb_secret_[A-Za-z0-9_-]{20,}\b/ },
+  { name: "Private key block", re: /-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/ },
+  { name: "Resend key", re: /\bre_[A-Za-z0-9]{20,}\b/ },
+  { name: "Vercel token", re: /\bvercel_[A-Za-z0-9]{20,}\b/ },
+  { name: "npm token", re: /\bnpm_[A-Za-z0-9]{36}\b/ }
+];
+var ENV_PATH = /(^|\/)\.env(\.[^/]+)?$/;
+var ENV_ALLOWED = /\.env\.(example|sample|template|dist|test)$/;
+var MANIFESTS = [
+  { manifest: /(^|\/)package\.json$/, lockfiles: ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock", "npm-shrinkwrap.json"] },
+  { manifest: /(^|\/)pyproject\.toml$/, lockfiles: ["poetry.lock", "uv.lock", "pdm.lock", "requirements.txt"] },
+  { manifest: /(^|\/)Cargo\.toml$/, lockfiles: ["Cargo.lock"] },
+  { manifest: /(^|\/)go\.mod$/, lockfiles: ["go.sum"] },
+  { manifest: /(^|\/)Gemfile$/, lockfiles: ["Gemfile.lock"] },
+  { manifest: /(^|\/)composer\.json$/, lockfiles: ["composer.lock"] }
+];
+function src(ctx) {
+  if (!ctx.source) throw new Error("scope:repo.not_opened");
+  return ctx.source;
+}
+var envCommitted = {
+  code: "repo.env_committed",
+  provider: "repo",
+  version: 1,
+  severity: "critical",
+  maps: ["soc2:CC6.1", "gdpr:art32", "iso:8.12", "iso:5.17"],
+  run: (ctx) => guarded("repo.files", async () => {
+    const files = await src(ctx).files();
+    const hits = files.filter((f) => ENV_PATH.test(f) && !ENV_ALLOWED.test(f));
+    const observed = { tracked: files.length, envFiles: hits };
+    return hits.length === 0 ? pass(observed, { envFiles: hits }) : fail(observed, { envFiles: hits });
+  })
+};
+var gitignoreEnv = {
+  code: "repo.gitignore_env",
+  provider: "repo",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:8.12"],
+  run: (ctx) => guarded("repo.files", async () => {
+    const text2 = await src(ctx).read(".gitignore");
+    if (text2 === null) return fail({ gitignore: false, coversEnv: false }, { gitignore: null });
+    const lines = text2.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+    const covers = lines.some((l) => /^(\*\*\/)?\.env(\*|\.\*|\.local)?$|^\.env\*$|^\*\.env$/.test(l.replace(/^\//, "")));
+    const observed = { gitignore: true, coversEnv: covers };
+    return covers ? pass(observed, { lines: lines.filter((l) => /env/i.test(l)) }) : fail(observed, { lines: lines.slice(0, 50) });
+  })
+};
+var secretsInHistory = {
+  code: "repo.secrets_in_history",
+  provider: "repo",
+  version: 1,
+  severity: "critical",
+  maps: ["soc2:CC6.1", "gdpr:art32", "iso:8.12", "iso:8.28"],
+  run: (ctx) => guarded("repo.history", async () => {
+    const { text: text2, truncated } = await src(ctx).history(ctx.historyCap ?? HISTORY_CAP);
+    const found = {};
+    for (const { name, re } of SECRET_PATTERNS) {
+      const global = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
+      const n = (text2.match(global) ?? []).length;
+      if (n) found[name] = n;
+    }
+    const observed = { historyBytes: text2.length, truncated, shapesFound: found };
+    if (Object.keys(found).length) return fail(observed, { shapes: Object.keys(found) });
+    if (truncated) return unknown("repo.history_truncated", observed);
+    return pass(observed, { shapes: [] });
+  })
+};
+var lockfile = {
+  code: "repo.lockfile",
+  provider: "repo",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC8.1", "iso:8.28", "iso:8.8"],
+  run: (ctx) => guarded("repo.files", async () => {
+    const files = await src(ctx).files();
+    const set = new Set(files);
+    const missing = [];
+    const evidence = {};
+    let manifests = 0;
+    for (const f of files) {
+      for (const m of MANIFESTS) {
+        if (!m.manifest.test(f)) continue;
+        manifests++;
+        const dir = f.includes("/") ? f.slice(0, f.lastIndexOf("/") + 1) : "";
+        const has = m.lockfiles.some((l) => set.has(dir + l));
+        evidence[f] = { lockfile: has };
+        if (!has) missing.push(f);
+      }
+    }
+    if (manifests === 0) return unknown("repo.no_manifest", { tracked: files.length });
+    const observed = { manifests, withoutLockfile: missing };
+    return missing.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var hygiene = {
+  code: "repo.hygiene",
+  provider: "repo",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC2.3", "iso:5.24", "iso:8.32"],
+  run: (ctx) => guarded("repo.files", async () => {
+    const files = await src(ctx).files();
+    const has = (re) => files.some((f) => re.test(f));
+    const missing = [];
+    if (!has(/^(\.github\/|docs\/)?SECURITY\.md$/i)) missing.push("SECURITY.md");
+    if (!has(/^(\.github\/|docs\/)?CODEOWNERS$/)) missing.push("CODEOWNERS");
+    const observed = { missing };
+    return missing.length === 0 ? pass(observed, { checked: ["SECURITY.md", "CODEOWNERS"] }) : fail(observed, { checked: ["SECURITY.md", "CODEOWNERS"] });
+  })
+};
+var dependencyUpdates = {
+  code: "repo.dependency_updates",
+  provider: "repo",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
+  run: (ctx) => guarded("repo.files", async () => {
+    const files = await src(ctx).files();
+    const configs = files.filter((f) => /^\.github\/dependabot\.ya?ml$|^(\.github\/)?renovate\.json5?$|^\.renovaterc(\.json)?$/.test(f));
+    const observed = { configured: configs.length > 0, configs };
+    return configs.length > 0 ? pass(observed, { configs }) : fail(observed, { configs });
+  })
+};
+var vulnerableDependencies = {
+  code: "repo.vulnerable_dependencies",
+  provider: "repo",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
+  run: (ctx) => guarded("repo.audit", async () => {
+    const s = src(ctx);
+    if (!s.audit) return unknown("repo.no_auditor");
+    const counts = await s.audit();
+    if (!counts) return unknown("repo.audit_unavailable");
+    const open = counts.critical + counts.high;
+    const observed = { ...counts, criticalOrHigh: open };
+    return open === 0 ? pass(observed, counts) : fail(observed, counts);
+  })
+};
+var REPO_CHECKS = [envCommitted, gitignoreEnv, secretsInHistory, lockfile, hygiene, dependencyUpdates, vulnerableDependencies];
+async function runRepoChecks(ctx) {
+  const out = [];
+  for (const c of REPO_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// src/index.ts
+import { execFile, spawn } from "node:child_process";
+import { readFile, stat } from "node:fs/promises";
+import { resolve, join } from "node:path";
 
 // ../lib/copy.ts
 var COPY = {
@@ -2011,6 +2408,122 @@ var COPY = {
   "check.render.service.notify_on_fail.pass": "No service has deploy-failure notifications switched off.",
   "check.render.service.notify_on_fail.fail": "At least one service ignores deploy failures, so a broken production deploy can go unnoticed.",
   "check.render.service.notify_on_fail.fix": "Service \u2192 Settings \u2192 Notifications: set deploy failure notifications to notify (or the workspace default), and make sure the workspace default sends to a channel someone reads.",
+  "provider.repo": "Repository",
+  "check.repo.env_committed.title": "No .env file committed",
+  "check.repo.env_committed.pass": "No .env file is tracked in the repository. Example files are fine.",
+  "check.repo.env_committed.fail": "At least one .env file is tracked, so its values are in the history of every clone.",
+  "check.repo.env_committed.fix": "git rm --cached the file, add it to .gitignore, rotate every value it held, then purge it from history with git filter-repo if the repository is shared.",
+  "check.repo.gitignore_env.title": ".gitignore covers .env",
+  "check.repo.gitignore_env.pass": "The .gitignore ignores .env files, so a local secrets file cannot be committed by accident.",
+  "check.repo.gitignore_env.fail": "There is no .gitignore rule for .env files, so one git add . commits your secrets.",
+  "check.repo.gitignore_env.fix": "Add .env and .env.* to .gitignore (keep !.env.example if you ship an example).",
+  "check.repo.secrets_in_history.title": "No credential shape anywhere in the history",
+  "check.repo.secrets_in_history.pass": "No line in the full git history matches a known credential shape (AWS, GitHub, GitLab, Stripe, Slack, Google, OpenAI, Supabase, private key blocks, Resend, Vercel, npm).",
+  "check.repo.secrets_in_history.fail": "The git history contains at least one line matching a known credential shape. A rotated secret is still a leak if the history is public or shared.",
+  "check.repo.secrets_in_history.fix": "Rotate the credential first, then rewrite the history with git filter-repo and force-push, and ask every collaborator to re-clone. The result names the shape found, never the value.",
+  "check.repo.lockfile.title": "Dependencies pinned by a lockfile",
+  "check.repo.lockfile.pass": "Every package manifest has a lockfile next to it, so a build installs exactly what was reviewed.",
+  "check.repo.lockfile.fail": "At least one package manifest has no lockfile, so each install may pull different versions than the last review.",
+  "check.repo.lockfile.fix": "Run the package manager once (npm install, pnpm install, poetry lock, cargo build, go mod tidy) and commit the lockfile it writes.",
+  "check.repo.hygiene.title": "SECURITY.md and CODEOWNERS present",
+  "check.repo.hygiene.pass": "The repository carries a security contact and a code owner file.",
+  "check.repo.hygiene.fail": "The repository is missing a SECURITY.md, a CODEOWNERS file, or both.",
+  "check.repo.hygiene.fix": "Add SECURITY.md with how to report a vulnerability and CODEOWNERS naming who reviews what. A reviewer reads both as evidence of ownership.",
+  "check.repo.dependency_updates.title": "Automated dependency updates configured",
+  "check.repo.dependency_updates.pass": "Dependabot or Renovate is configured, so vulnerable dependencies are raised as pull requests.",
+  "check.repo.dependency_updates.fail": "No Dependabot or Renovate configuration was found, so vulnerable dependencies wait for someone to notice.",
+  "check.repo.dependency_updates.fix": "Add .github/dependabot.yml (or renovate.json) with a weekly schedule for your package ecosystem.",
+  "check.repo.vulnerable_dependencies.title": "No open critical or high vulnerability in dependencies",
+  "check.repo.vulnerable_dependencies.pass": "The dependency audit reports no critical or high vulnerability.",
+  "check.repo.vulnerable_dependencies.fail": "The dependency audit reports at least one critical or high vulnerability in an installed dependency.",
+  "check.repo.vulnerable_dependencies.fix": "Run npm audit fix (or update the affected package) and commit the lockfile. If a fix is not available, record the accepted risk with a review date.",
+  "provider.heroku": "Heroku",
+  "check.heroku.app.managed_certs.title": "Every custom domain serves a certificate",
+  "check.heroku.app.managed_certs.pass": "Every custom domain on every app has an issued certificate.",
+  "check.heroku.app.managed_certs.fail": "At least one custom domain has no certificate or one still pending, so it serves a certificate error or the wrong site.",
+  "check.heroku.app.managed_certs.fix": "heroku certs:auto:enable -a <app> (Automated Certificate Management is free on paid dynos), then check the DNS target Heroku shows for the domain.",
+  "check.heroku.app.maintenance_off.title": "No app left in maintenance mode",
+  "check.heroku.app.maintenance_off.pass": "No app is in maintenance mode.",
+  "check.heroku.app.maintenance_off.fail": "At least one app is in maintenance mode, serving the maintenance page to every visitor.",
+  "check.heroku.app.maintenance_off.fix": "heroku maintenance:off -a <app> once the work is done, or remove the app if it is no longer used.",
+  "check.heroku.app.stack_supported.title": "Every app on a supported stack",
+  "check.heroku.app.stack_supported.pass": "Every app runs on a stack Heroku still patches (heroku-22, heroku-24 or container).",
+  "check.heroku.app.stack_supported.fail": "At least one app runs on a stack Heroku no longer patches; its OS libraries receive no security updates.",
+  "check.heroku.app.stack_supported.fix": "heroku stack:set heroku-24 -a <app> and redeploy. heroku-20 reached end of life in April 2025.",
+  "check.heroku.formation.web_redundant.title": "Web tier survives one dyno",
+  "check.heroku.formation.web_redundant.pass": "Every app that serves web traffic runs at least two web dynos.",
+  "check.heroku.formation.web_redundant.fail": "At least one app serves web traffic from a single dyno, so a dyno restart is an outage.",
+  "check.heroku.formation.web_redundant.fix": "heroku ps:scale web=2 -a <app> on Standard dynos or above. Low severity: a solo project may accept this with a review date.",
+  "provider.clerk": "Clerk",
+  "check.clerk.redirect_urls.https_only.title": "Redirect URLs are HTTPS and not local",
+  "check.clerk.redirect_urls.https_only.pass": "Every allowed redirect URL is HTTPS and points at a real host.",
+  "check.clerk.redirect_urls.https_only.fail": "At least one allowed redirect URL is plain HTTP or a local address, so a sign-in can be redirected to a page an attacker controls.",
+  "check.clerk.redirect_urls.https_only.fix": "Clerk Dashboard \u2192 Configure \u2192 Paths / Redirect URLs (or the Backend API): remove localhost and http:// entries from the production instance; keep them on the development instance only.",
+  "check.clerk.jwt_templates.short_lifetime.title": "JWT templates expire within an hour",
+  "check.clerk.jwt_templates.short_lifetime.pass": "Every JWT template issues tokens that live an hour or less, or there are no templates.",
+  "check.clerk.jwt_templates.short_lifetime.fail": "At least one JWT template issues tokens that live longer than an hour, so a leaked token stays valid for that long.",
+  "check.clerk.jwt_templates.short_lifetime.fix": "Clerk Dashboard \u2192 Configure \u2192 JWT templates: set Token lifetime to 3600 seconds or less. Refresh through Clerk's session, not through long-lived tokens.",
+  "check.clerk.users.dormant.title": "No dormant account able to sign in",
+  "check.clerk.users.dormant.pass": "Every active account has signed in within ninety days, or was created within the last month.",
+  "check.clerk.users.dormant.fail": "At least one account that can still sign in has not been active for ninety days, or never signed in and is older than a month.",
+  "check.clerk.users.dormant.fix": "Clerk Dashboard \u2192 Users: ban or delete the dormant accounts, or accept the risk with a review date if this is a consumer product where dormancy is normal. Instances with more than five hundred users are not judged here.",
+  "provider.atlas": "MongoDB Atlas",
+  "check.atlas.project.ip_access_list.title": "Database reachable only from listed addresses",
+  "check.atlas.project.ip_access_list.pass": "The project's IP access list names specific addresses; nothing admits the whole internet.",
+  "check.atlas.project.ip_access_list.fail": "The project's IP access list admits every address (0.0.0.0/0) or is empty, so the password is the only barrier, or nothing can connect at all.",
+  "check.atlas.project.ip_access_list.fix": "Atlas \u2192 Network Access: replace 0.0.0.0/0 with your application's egress addresses, or use private endpoints and peering. For a serverless host with changing addresses, use a static egress IP or a private endpoint.",
+  "check.atlas.cluster.backups_enabled.title": "Backups on every cluster",
+  "check.atlas.cluster.backups_enabled.pass": "Every cluster has cloud backup enabled.",
+  "check.atlas.cluster.backups_enabled.fail": "At least one cluster has backups off, so a bad migration or deletion cannot be undone.",
+  "check.atlas.cluster.backups_enabled.fix": "Atlas \u2192 cluster \u2192 Backup: enable Cloud Backup with continuous backup if the tier allows. Shared tiers (M0, M2, M5) cannot; move production to M10 or above.",
+  "check.atlas.cluster.version_supported.title": "Every cluster on a supported MongoDB version",
+  "check.atlas.cluster.version_supported.pass": "Every cluster runs a MongoDB version that still receives patches.",
+  "check.atlas.cluster.version_supported.fail": "At least one cluster runs a MongoDB version past its end of life; it no longer receives security patches.",
+  "check.atlas.cluster.version_supported.fix": "Atlas \u2192 cluster \u2192 Edit configuration \u2192 MongoDB version: upgrade one major at a time to a supported release (8.0 as of 2026). Test against a restored copy first.",
+  "check.atlas.cluster.termination_protection.title": "Termination protection on every cluster",
+  "check.atlas.cluster.termination_protection.pass": "Every cluster has termination protection on, so it cannot be deleted by a stray click or script.",
+  "check.atlas.cluster.termination_protection.fail": "At least one cluster can be deleted without a second step.",
+  "check.atlas.cluster.termination_protection.fix": "Atlas \u2192 cluster \u2192 Edit configuration \u2192 Additional settings \u2192 Termination protection: on.",
+  "check.atlas.db_users.least_privilege.title": "No database user holds an admin role",
+  "check.atlas.db_users.least_privilege.pass": "Every database user holds only database-scoped roles.",
+  "check.atlas.db_users.least_privilege.fail": "At least one database user holds an admin role (atlasAdmin, root, readWriteAnyDatabase, dbAdminAnyDatabase, userAdminAnyDatabase or clusterAdmin), so a leaked application credential is a full takeover.",
+  "check.atlas.db_users.least_privilege.fix": "Atlas \u2192 Database Access: give application users readWrite on their own database only; keep admin roles for people, protected by Atlas login and MFA.",
+  "stack.blurb.atlas": "MongoDB: IP access list, backups, version, termination protection, roles",
+  "conn.atlas.title": "Connect MongoDB Atlas",
+  "conn.atlas.intro": "Create a service account with the Project Read Only role (Atlas \u2192 Access Manager \u2192 Service Accounts) and paste its client id and secret with the project id. Snoopios exchanges them for one-hour tokens and only ever reads. Atlas gives no way to read the role back, so the connection shows as read-only requested; every request is limited to reads by code.",
+  "conn.atlas.project.label": "Project ID",
+  "conn.atlas.project.placeholder": "24 hex characters, from Project Settings",
+  "conn.atlas.client.label": "Service account client ID",
+  "conn.atlas.secret.label": "Service account client secret",
+  "conn.atlas.secret.hint": "Shown once by Atlas. Rotate it from Access Manager \u2192 Service Accounts; the connection then needs re-entering.",
+  "conn.atlas.cta": "Connect read-only",
+  "conn.atlas.error.project": "A project id is 24 hex characters (Atlas \u2192 Project Settings \u2192 Project ID).",
+  "conn.atlas.error.credentials": "The client id and secret look wrong. Both come from Access Manager \u2192 Service Accounts.",
+  "provider.digitalocean": "DigitalOcean",
+  "check.do.droplet.firewall.title": "Every public droplet behind a cloud firewall",
+  "check.do.droplet.firewall.pass": "Every active droplet with a public address is attached to a cloud firewall, directly or by tag.",
+  "check.do.droplet.firewall.fail": "At least one active droplet with a public address has no cloud firewall, so every port its software opens is reachable from the internet.",
+  "check.do.droplet.firewall.fix": "Networking \u2192 Firewalls \u2192 create or edit a firewall allowing only 22 from your addresses and 80/443 from anywhere, and attach it to the droplet or its tag.",
+  "check.do.droplet.backups.title": "Backups on every droplet",
+  "check.do.droplet.backups.pass": "Every active droplet has automated backups enabled.",
+  "check.do.droplet.backups.fail": "At least one active droplet has no automated backups, so a disk failure or a bad deploy loses it.",
+  "check.do.droplet.backups.fix": "Droplet \u2192 Backups \u2192 Enable backups (weekly, 20% of the droplet price), or move state off the droplet to a managed database and object storage and accept the risk with a review date.",
+  "check.do.database.trusted_sources.title": "Managed databases reachable only from trusted sources",
+  "check.do.database.trusted_sources.pass": "Every managed database has at least one trusted-source rule, so it is not open to the whole internet.",
+  "check.do.database.trusted_sources.fail": "At least one managed database has no trusted-source rules, so any address on the internet can attempt to connect.",
+  "check.do.database.trusted_sources.fix": "Database \u2192 Settings \u2192 Trusted sources: add the droplets, apps, tags or addresses that need access. Databases with no rules accept connections from anywhere.",
+  "check.do.database.version_supported.title": "Every managed database on a supported version",
+  "check.do.database.version_supported.pass": "Every managed database runs an engine version that has not reached end of life.",
+  "check.do.database.version_supported.fail": "At least one managed database runs an engine version past its end of life, so it no longer receives security patches.",
+  "check.do.database.version_supported.fix": "Database \u2192 Settings \u2192 Version: upgrade to a supported release. DigitalOcean lists the end-of-life date on the cluster page.",
+  "stack.blurb.digitalocean": "Droplets and managed databases: firewalls, backups, trusted sources, versions",
+  "conn.digitalocean.title": "Connect DigitalOcean",
+  "conn.digitalocean.intro": "Create a personal access token with the Read Only scope (API \u2192 Tokens \u2192 Generate new token \u2192 Read Only) and paste it. DigitalOcean gives no way to read a token's scopes back, so the connection shows as read-only requested; every request is limited to reads by code.",
+  "conn.digitalocean.token.label": "Read-only personal access token",
+  "conn.digitalocean.token.placeholder": "dop_v1_\u2026",
+  "conn.digitalocean.token.hint": "Set an expiry. Revoke from API \u2192 Tokens.",
+  "conn.digitalocean.cta": "Connect read-only",
+  "conn.digitalocean.error.token": "That isn't a DigitalOcean personal access token (dop_v1_ followed by 64 hex characters).",
   "conn.fly.title": "Connect Fly.io",
   "conn.fly.intro": "Run fly tokens create readonly -o <org> and paste the token. Fly's read-only org token cannot create, deploy or modify anything. Fly tokens are sealed macaroons that Snoopios cannot open to prove the restriction, so this connection shows as read-only requested; every Snoopios request is still limited to reads by code.",
   "conn.fly.org.label": "Organisation slug",
@@ -2446,28 +2959,35 @@ var ESPS = ["resend", "postmark", "mailgun", "ses", "other"];
 var LOCAL = {
   netlify: { env: "NETLIFY_AUTH_TOKEN", label: "Netlify", run: (t) => runNetlifyChecks({ api: netlifyApi(t) }) },
   neon: { env: "NEON_API_KEY", label: "Neon", run: (t) => runNeonChecks({ api: neonApi(t) }) },
-  render: { env: "RENDER_API_KEY", label: "Render", run: (t) => runRenderChecks({ api: renderApi(t) }) }
+  render: { env: "RENDER_API_KEY", label: "Render", run: (t) => runRenderChecks({ api: renderApi(t) }) },
+  heroku: { env: "HEROKU_API_KEY", label: "Heroku", run: (t) => runHerokuChecks({ api: herokuApi(t) }) },
+  clerk: { env: "CLERK_SECRET_KEY", label: "Clerk", run: (t) => runClerkChecks({ api: clerkApi(t) }) }
 };
 function text(key) {
   return COPY[key] ?? key;
 }
 function usage() {
   return [
-    `snoopios ${"0.2.1"} \u2014 continuous compliance for small software teams`,
+    `snoopios ${"0.3.0"} \u2014 continuous compliance for small software teams`,
     "",
     "Usage:",
     "  snoopios scan <domain> [--email <resend|postmark|mailgun|ses|other>] [--json]",
-    "  snoopios run <netlify|neon|render> [--json]",
+    "  snoopios run <netlify|neon|render|heroku|clerk> [--json]",
     "  snoopios doctor <postgres-connection-string> [--json]",
+    "  snoopios repo [path] [--json]",
     "",
     "scan    the domain checks (HTTPS, HSTS, CSP, TLS, SPF, DMARC, CAA, security.txt, privacy",
     "        page); --email adds the sending-domain checks with that provider's defaults",
     "run     a provider whose token cannot be made read-only, so it runs here instead of on",
-    "        Snoopios's servers. Reads NETLIFY_AUTH_TOKEN, NEON_API_KEY or RENDER_API_KEY",
+    "        Snoopios's servers. Reads NETLIFY_AUTH_TOKEN, NEON_API_KEY, RENDER_API_KEY or",
+    "        HEROKU_API_KEY or CLERK_SECRET_KEY",
     "        from the environment. The token never leaves this machine.",
     "doctor  the Supabase SQL checks (RLS on every table, no anon writes, private schema",
     "        closed, SECURITY DEFINER search_path, anon-callable definers) against any",
     "        Postgres connection string. Runs SELECT statements only.",
+    "repo    a local git checkout: .env committed, .gitignore, credential shapes anywhere in",
+    "        the history, lockfiles, SECURITY.md and CODEOWNERS, Dependabot or Renovate, and",
+    "        npm audit. Works for any git host. Only the audit touches the network.",
     "",
     "Every check is pass, fail or unknown; unknown is never a pass. Exit code 1 on any fail.",
     "Nothing is sent to Snoopios. Keep it checked hourly with evidence: https://snoopios.com"
@@ -2503,7 +3023,7 @@ ${heading}
 }
 function emit(heading, subject, results, json) {
   if (json) {
-    console.log(JSON.stringify({ subject, version: "0.2.1", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
+    console.log(JSON.stringify({ subject, version: "0.3.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
   } else {
     print(heading, rows(results));
   }
@@ -2591,6 +3111,73 @@ ${usage()}`);
     await client.end();
   }
 }
+function git(cwd, args) {
+  return new Promise((res, rej) => {
+    execFile("git", args, { cwd, maxBuffer: 64 * 1024 * 1024, windowsHide: true }, (err, stdout) => err ? rej(err) : res(String(stdout)));
+  });
+}
+function gitHistory(cwd, maxBytes) {
+  return new Promise((res, rej) => {
+    const child = spawn("git", ["log", "-p", "--all", "--no-color", "--format=commit %H"], { cwd, windowsHide: true });
+    const chunks = [];
+    let size = 0;
+    let truncated = false;
+    child.stdout.on("data", (b) => {
+      if (truncated) return;
+      if (size + b.length > maxBytes) {
+        chunks.push(b.subarray(0, maxBytes - size));
+        size = maxBytes;
+        truncated = true;
+        child.kill();
+        return;
+      }
+      chunks.push(b);
+      size += b.length;
+    });
+    child.on("error", rej);
+    child.on("close", () => res({ text: Buffer.concat(chunks).toString("utf8"), truncated }));
+  });
+}
+function npmAudit(cwd) {
+  return new Promise((res) => {
+    execFile(process.platform === "win32" ? "npm.cmd" : "npm", ["audit", "--json", "--audit-level=none"], { cwd, maxBuffer: 32 * 1024 * 1024, windowsHide: true, shell: process.platform === "win32" }, (_err, stdout) => {
+      try {
+        const j = JSON.parse(String(stdout));
+        const v = j.metadata?.vulnerabilities;
+        if (!v) return res(null);
+        res({ critical: v.critical ?? 0, high: v.high ?? 0, moderate: v.moderate ?? 0, low: v.low ?? 0 });
+      } catch {
+        res(null);
+      }
+    });
+  });
+}
+async function repo(rest) {
+  const { positional, json, error } = parse(rest);
+  if (error) {
+    console.error(`${error}
+
+${usage()}`);
+    return 2;
+  }
+  const root = resolve(positional[0] ?? ".");
+  try {
+    await git(root, ["rev-parse", "--is-inside-work-tree"]);
+  } catch {
+    console.error(`${root} is not inside a git repository. Example: snoopios repo .`);
+    return 2;
+  }
+  const top = (await git(root, ["rev-parse", "--show-toplevel"])).trim();
+  const hasLock = await stat(join(top, "package-lock.json")).then(() => true, () => false);
+  const source = {
+    files: async () => (await git(top, ["ls-files", "-z"])).split("\0").filter(Boolean).map((f) => f.replace(/\\/g, "/")),
+    read: async (p) => readFile(join(top, p), "utf8").catch(() => null),
+    history: (max) => gitHistory(top, max),
+    audit: hasLock ? () => npmAudit(top) : void 0
+  };
+  const results = await runRepoChecks({ source });
+  return emit(`snoopios repo ${top}`, top, results, json);
+}
 async function main(argv) {
   const [cmd, ...rest] = argv;
   if (!cmd || cmd === "--help" || cmd === "-h" || cmd === "help") {
@@ -2598,12 +3185,13 @@ async function main(argv) {
     return 0;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log("0.2.1");
+    console.log("0.3.0");
     return 0;
   }
   if (cmd === "scan") return scan(rest);
   if (cmd === "run") return run(rest);
   if (cmd === "doctor") return doctor(rest);
+  if (cmd === "repo") return repo(rest);
   console.error(`Unknown command "${cmd}".
 
 ${usage()}`);

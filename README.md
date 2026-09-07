@@ -23,9 +23,11 @@ return path, DMARC enforcement and reporting, MTA-STS and TLS-RPT.
 NETLIFY_AUTH_TOKEN=… npx snoopios run netlify
 NEON_API_KEY=…       npx snoopios run neon
 RENDER_API_KEY=…     npx snoopios run render
+HEROKU_API_KEY=…     npx snoopios run heroku
+CLERK_SECRET_KEY=…   npx snoopios run clerk
 ```
 
-Netlify, Neon and Render tokens are all-or-nothing, so Snoopios never holds them. The
+Netlify, Neon, Render, Heroku and Clerk tokens are all-or-nothing, so Snoopios never holds them. The
 CLI reads the token from your environment, runs the checks here and prints the report.
 The token never leaves your machine, and every request is a read.
 
@@ -35,6 +37,21 @@ The token never leaves your machine, and every request is a read.
   at least seven days of point-in-time restore, no preview branch older than thirty days.
 - **Render**: a health check on every web service, every custom domain verified, deploy
   failures not ignored.
+- **Heroku**: a certificate on every custom domain, no app left in maintenance mode, every
+  app on a supported stack, the web tier on more than one dyno.
+- **Clerk**: redirect URLs HTTPS and not local, JWT templates expiring within an hour, no
+  dormant account able to sign in.
+
+## check a git checkout
+
+```bash
+npx snoopios repo .
+```
+
+No token, any git host. Tracked .env files, .gitignore coverage, credential shapes anywhere
+in the full history (the result names the shape, never the value), a lockfile beside every
+manifest, SECURITY.md and CODEOWNERS, Dependabot or Renovate configuration, and `npm audit`
+for critical or high findings. Only the audit touches the network.
 
 ## doctor a Postgres database
 

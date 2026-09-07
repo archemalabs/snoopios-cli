@@ -54,4 +54,7 @@ only. Also reads `DATABASE_URL` when no argument is given.
 it all checked every hour, with stored evidence, accepted risks and a public trust page,
 connect at https://snoopios.com.
 
+Source of the published bundle, changelog and security policy:
+https://github.com/archemalabs/snoopios-cli
+
 MIT © Archema Labs Ltd

@@ -2453,7 +2453,7 @@ function text(key) {
 }
 function usage() {
   return [
-    `snoopios ${"0.2.0"} \u2014 continuous compliance for small software teams`,
+    `snoopios ${"0.2.1"} \u2014 continuous compliance for small software teams`,
     "",
     "Usage:",
     "  snoopios scan <domain> [--email <resend|postmark|mailgun|ses|other>] [--json]",
@@ -2503,7 +2503,7 @@ ${heading}
 }
 function emit(heading, subject, results, json) {
   if (json) {
-    console.log(JSON.stringify({ subject, version: "0.2.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
+    console.log(JSON.stringify({ subject, version: "0.2.1", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
   } else {
     print(heading, rows(results));
   }
@@ -2598,7 +2598,7 @@ async function main(argv) {
     return 0;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log("0.2.0");
+    console.log("0.2.1");
     return 0;
   }
   if (cmd === "scan") return scan(rest);

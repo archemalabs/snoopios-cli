@@ -1,0 +1,47 @@
+{
+  "name": "snoopios",
+  "version": "0.2.1",
+  "description": "Check a domain, a Netlify, Neon or Render account, or a Postgres database the way a compliance reviewer would. Read-only, runs on your machine, sends nothing anywhere.",
+  "license": "MIT",
+  "author": "Archema Labs Ltd <hello@snoopios.com> (https://snoopios.com)",
+  "homepage": "https://snoopios.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/archemalabs/snoopios-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/archemalabs/snoopios-cli/issues"
+  },
+  "keywords": [
+    "compliance",
+    "security",
+    "headers",
+    "hsts",
+    "csp",
+    "spf",
+    "dmarc",
+    "tls",
+    "soc2",
+    "iso27001",
+    "cyber-essentials",
+    "gdpr"
+  ],
+  "type": "module",
+  "bin": {
+    "snoopios": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepublishOnly": "node build.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  }
+}

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0 — 8 September 2026
+- `snoopios run upstash` (UPSTASH_EMAIL and UPSTASH_API_KEY): TLS on every Redis database,
+  daily backups on paid ones, nothing suspended. Database credentials in the API response
+  are dropped before anything is printed.
+- `snoopios run betterstack` (BETTERSTACK_API_TOKEN): monitors present and none paused,
+  certificate checks on HTTPS monitors, checks at least every five minutes, every monitor
+  alerting somebody.
+- `snoopios run railway` (RAILWAY_TOKEN, a project token): health check on every public
+  service, restart policy not Never, more than one replica, custom domains pointing at
+  Railway. Variables are never read.
+
 ## 0.3.1 — 8 September 2026
 - `repo`: a credential shape inside a test path (`*.test.*`, `*.spec.*`, `fixtures/`,
   `__tests__/` and the like) is listed by path and shape but no longer fails the check on

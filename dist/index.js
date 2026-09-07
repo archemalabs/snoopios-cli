@@ -34,6 +34,8 @@ var READ_ONLY_POST = [
   /^https:\/\/oauth2\.googleapis\.com\/token$/,
   /^https:\/\/login\.microsoftonline\.com\/[^/]+\/oauth2\/v2\.0\/token$/,
   /^https:\/\/api\.supabase\.com\/v1\/oauth\/token$/,
+  // Auth0 machine-to-machine application: client credentials for a Management API token.
+  /^https:\/\/[a-z0-9-]+(\.(us|eu|au|jp|uk|ca))?\.auth0\.com\/oauth\/token$/,
   // MongoDB Atlas service account: client credentials for a one-hour token.
   /^https:\/\/cloud\.mongodb\.com\/api\/oauth\/token$/,
   // Supabase's read-only SQL endpoint: the server refuses anything but a read.
@@ -41,7 +43,7 @@ var READ_ONLY_POST = [
   // UptimeRobot's API is POST-only; these two methods read.
   /^https:\/\/api\.uptimerobot\.com\/v2\/(getMonitors|getAccountDetails)$/
 ];
-var GRAPHQL_READ = [/^https:\/\/api\.fly\.io\/graphql$/];
+var GRAPHQL_READ = [/^https:\/\/api\.fly\.io\/graphql$/, /^https:\/\/backboard\.railway\.com\/graphql\/v2$/];
 function isReadQueryBody(body) {
   if (typeof body !== "string") return false;
   try {
@@ -1107,6 +1109,345 @@ var CLERK_CHECKS = [redirectUrlsHttps, jwtLifetime, dormantUsers];
 async function runClerkChecks(ctx) {
   const out = [];
   for (const c of CLERK_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/upstash.ts
+function upstashApi(email, apiKey, fetchImpl = readOnlyFetch) {
+  const basic = Buffer.from(`${email}:${apiKey}`).toString("base64");
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://api.upstash.com/v2${path}`, {
+        headers: { authorization: `Basic ${basic}`, accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401 || res.status === 403) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+function slim(d) {
+  return { database_id: d.database_id, database_name: d.database_name, region: d.region, state: d.state, tls: d.tls, type: d.type, daily_backup_enabled: d.daily_backup_enabled };
+}
+async function databases(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const r = await ctx.api.get("/redis/databases?credentials=hide");
+  if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.databases");
+  return r.json.map(slim);
+}
+var tlsEverywhere = {
+  code: "upstash.redis.tls",
+  provider: "upstash",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.7", "iso:8.24", "gdpr:art32"],
+  run: (ctx) => guarded("api.databases", async () => {
+    const dbs = await databases(ctx);
+    if (dbs.length === 0) return unknown("api.no_databases");
+    const plain = dbs.filter((d) => d.tls !== true).map((d) => d.database_name ?? d.database_id ?? "?");
+    const observed = { databases: dbs.length, withoutTls: plain };
+    const evidence = dbs.map((d) => ({ name: d.database_name ?? null, region: d.region ?? null, tls: d.tls ?? null }));
+    return plain.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var dailyBackup = {
+  code: "upstash.redis.daily_backup",
+  provider: "upstash",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:A1.2", "iso:8.13", "gdpr:art32"],
+  run: (ctx) => guarded("api.databases", async () => {
+    const dbs = await databases(ctx);
+    if (dbs.length === 0) return unknown("api.no_databases");
+    const paid = dbs.filter((d) => (d.type ?? "free") !== "free");
+    if (paid.length === 0) return unknown("api.free_only", { databases: dbs.length });
+    const off = paid.filter((d) => d.daily_backup_enabled !== true).map((d) => d.database_name ?? d.database_id ?? "?");
+    const observed = { databases: dbs.length, paid: paid.length, withoutBackup: off };
+    const evidence = paid.map((d) => ({ name: d.database_name ?? null, type: d.type ?? null, dailyBackup: d.daily_backup_enabled ?? null }));
+    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var noneSuspended = {
+  code: "upstash.redis.none_suspended",
+  provider: "upstash",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
+  run: (ctx) => guarded("api.databases", async () => {
+    const dbs = await databases(ctx);
+    if (dbs.length === 0) return unknown("api.no_databases");
+    const suspended = dbs.filter((d) => d.state === "suspended").map((d) => d.database_name ?? d.database_id ?? "?");
+    const observed = { databases: dbs.length, suspended };
+    const evidence = dbs.map((d) => ({ name: d.database_name ?? null, state: d.state ?? null }));
+    return suspended.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var UPSTASH_CHECKS = [tlsEverywhere, dailyBackup, noneSuspended];
+async function runUpstashChecks(ctx) {
+  const out = [];
+  for (const c of UPSTASH_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/betterstack.ts
+function betterStackApi(token, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://uptime.betterstack.com/api/v2${path}`, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401 || res.status === 403) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+var MAX_PAGES = 10;
+var MAX_FREQUENCY_SECONDS = 300;
+var HTTP_TYPES = /* @__PURE__ */ new Set(["status", "expected_status_code", "keyword", "keyword_absence", "playwright"]);
+async function monitors(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const out = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const r = await ctx.api.get(`/monitors?per_page=250&page=${page}`);
+    if (r.status !== 200) throw new Error("scope:api.monitors");
+    const body = r.json;
+    for (const m of body?.data ?? []) out.push({ id: m.id, ...m.attributes ?? {} });
+    if (!body?.pagination?.next) break;
+  }
+  return out;
+}
+var label = (m) => m.pronounceable_name || m.url || m.id;
+var active = (m) => !m.paused_at;
+var monitorsActive = {
+  code: "betterstack.monitors.active",
+  provider: "betterstack",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
+  run: (ctx) => guarded("api.monitors", async () => {
+    const all = await monitors(ctx);
+    const paused = all.filter((m) => !active(m)).map(label);
+    const observed = { monitors: all.length, paused };
+    const evidence = all.map((m) => ({ name: label(m), type: m.monitor_type ?? null, status: m.status ?? null, pausedAt: m.paused_at ?? null }));
+    return all.length > 0 && paused.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var sslVerified = {
+  code: "betterstack.monitors.ssl_verified",
+  provider: "betterstack",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
+  run: (ctx) => guarded("api.monitors", async () => {
+    const https = (await monitors(ctx)).filter((m) => active(m) && HTTP_TYPES.has(m.monitor_type ?? "") && (m.url ?? "").toLowerCase().startsWith("https://"));
+    if (https.length === 0) return unknown("api.no_https_monitors");
+    const weak = https.filter((m) => m.verify_ssl !== true || !(typeof m.ssl_expiration === "number" && m.ssl_expiration > 0)).map(label);
+    const observed = { httpsMonitors: https.length, withoutSslChecks: weak };
+    const evidence = https.map((m) => ({ name: label(m), verifySsl: m.verify_ssl ?? null, sslExpirationDays: m.ssl_expiration ?? null }));
+    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var checkFrequency = {
+  code: "betterstack.monitors.frequency",
+  provider: "betterstack",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:CC7.2", "iso:8.16"],
+  run: (ctx) => guarded("api.monitors", async () => {
+    const live = (await monitors(ctx)).filter(active);
+    if (live.length === 0) return unknown("api.no_active_monitors");
+    const slow = live.filter((m) => !(typeof m.check_frequency === "number" && m.check_frequency <= MAX_FREQUENCY_SECONDS)).map(label);
+    const observed = { monitors: live.length, slowerThanSeconds: MAX_FREQUENCY_SECONDS, slow };
+    const evidence = live.map((m) => ({ name: label(m), checkFrequencySeconds: m.check_frequency ?? null }));
+    return slow.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var alerting = {
+  code: "betterstack.monitors.alerting",
+  provider: "betterstack",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.3", "soc2:A1.1", "iso:8.16"],
+  run: (ctx) => guarded("api.monitors", async () => {
+    const live = (await monitors(ctx)).filter(active);
+    if (live.length === 0) return unknown("api.no_active_monitors");
+    const silent = live.filter((m) => !(m.policy_id || m.call || m.sms || m.email || m.push)).map(label);
+    const observed = { monitors: live.length, withoutAlerts: silent };
+    const evidence = live.map((m) => ({ name: label(m), policy: Boolean(m.policy_id), call: m.call ?? false, sms: m.sms ?? false, email: m.email ?? false, push: m.push ?? false }));
+    return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var BETTERSTACK_CHECKS = [monitorsActive, sslVerified, checkFrequency, alerting];
+async function runBetterStackChecks(ctx) {
+  const out = [];
+  for (const c of BETTERSTACK_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/railway.ts
+function railwayApi(projectToken, fetchImpl = readOnlyFetch) {
+  return {
+    async query(query, variables = {}) {
+      const res = await fetchImpl("https://backboard.railway.com/graphql/v2", {
+        method: "POST",
+        headers: { "project-access-token": projectToken, "content-type": "application/json", accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        body: JSON.stringify({ query, variables }),
+        signal: AbortSignal.timeout(2e4)
+      });
+      if (res.status === 401 || res.status === 403) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+async function gql(api, query, variables, scope) {
+  const r = await api.query(query, variables);
+  const body = r.json;
+  if (body?.errors?.some((e) => /unauthori[sz]ed|not authorized|forbidden/i.test(e.message ?? "") || e.extensions?.code === "UNAUTHENTICATED")) throw new Error("scope:auth");
+  if (r.status !== 200 || !body?.data || body.errors?.length) throw new Error(`scope:${scope}`);
+  return body.data;
+}
+var Q_TOKEN = "query snoopiosToken { projectToken { projectId environmentId } }";
+var Q_PROJECT = "query snoopiosProject($id: String!) { project(id: $id) { id name services { edges { node { id name } } } } }";
+var Q_INSTANCE = "query snoopiosInstance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { healthcheckPath numReplicas restartPolicyType } }";
+var Q_DOMAINS = "query snoopiosDomains($projectId: String!, $environmentId: String!, $serviceId: String!) { domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) { serviceDomains { domain } customDomains { domain status { dnsRecords { hostlabel requiredValue currentValue status } } } } }";
+var MAX_SERVICES = 50;
+async function load(api) {
+  const tok = await gql(api, Q_TOKEN, {}, "api.project_token");
+  const projectId = tok.projectToken?.projectId ?? "";
+  const environmentId = tok.projectToken?.environmentId ?? "";
+  if (!projectId || !environmentId) throw new Error("scope:api.project_token");
+  const proj = await gql(api, Q_PROJECT, { id: projectId }, "api.project");
+  const nodes = (proj.project?.services?.edges ?? []).map((e) => e.node).filter((n) => Boolean(n?.id)).slice(0, MAX_SERVICES);
+  const services2 = [];
+  for (const n of nodes) {
+    const inst = await gql(api, Q_INSTANCE, { serviceId: n.id, environmentId }, "api.service_instance");
+    const dom = await gql(api, Q_DOMAINS, { projectId, environmentId, serviceId: n.id }, "api.domains");
+    services2.push({
+      id: n.id,
+      name: n.name ?? n.id,
+      healthcheckPath: inst.serviceInstance?.healthcheckPath ?? null,
+      numReplicas: inst.serviceInstance?.numReplicas ?? null,
+      restartPolicyType: inst.serviceInstance?.restartPolicyType ?? null,
+      serviceDomains: (dom.domains?.serviceDomains ?? []).map((d) => d.domain ?? "").filter(Boolean),
+      customDomains: (dom.domains?.customDomains ?? []).filter((d) => d.domain).map((d) => ({ domain: d.domain, records: d.status?.dnsRecords ?? [] }))
+    });
+  }
+  return { projectId, environmentId, services: services2 };
+}
+function inventory(ctx) {
+  if (!ctx.api) return Promise.reject(new Error("scope:api.not_connected"));
+  ctx.inventory ??= load(ctx.api);
+  return ctx.inventory;
+}
+var isPublic = (s) => s.serviceDomains.length + s.customDomains.length > 0;
+var norm = (v) => (v ?? "").trim().toLowerCase().replace(/\.$/, "");
+var healthcheck = {
+  code: "railway.service.healthcheck",
+  provider: "railway",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
+  run: (ctx) => guarded("api.services", async () => {
+    const pub = (await inventory(ctx)).services.filter(isPublic);
+    if (pub.length === 0) return unknown("api.no_public_services");
+    const none = pub.filter((s) => !(s.healthcheckPath ?? "").trim()).map((s) => s.name);
+    const observed = { publicServices: pub.length, withoutHealthcheck: none };
+    const evidence = pub.map((s) => ({ name: s.name, healthcheckPath: s.healthcheckPath ?? null, domains: [...s.serviceDomains, ...s.customDomains.map((d) => d.domain)] }));
+    return none.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var restartPolicy = {
+  code: "railway.service.restart_policy",
+  provider: "railway",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:A1.1", "iso:8.14"],
+  run: (ctx) => guarded("api.services", async () => {
+    const all = (await inventory(ctx)).services;
+    if (all.length === 0) return unknown("api.no_services");
+    const never = all.filter((s) => (s.restartPolicyType ?? "").toUpperCase() === "NEVER").map((s) => s.name);
+    const observed = { services: all.length, neverRestart: never };
+    const evidence = all.map((s) => ({ name: s.name, restartPolicy: s.restartPolicyType ?? null }));
+    return never.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var replicas = {
+  code: "railway.service.replicas",
+  provider: "railway",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:A1.1", "iso:8.14"],
+  run: (ctx) => guarded("api.services", async () => {
+    const pub = (await inventory(ctx)).services.filter(isPublic);
+    if (pub.length === 0) return unknown("api.no_public_services");
+    const single = pub.filter((s) => (s.numReplicas ?? 1) < 2).map((s) => s.name);
+    const observed = { publicServices: pub.length, singleReplica: single };
+    const evidence = pub.map((s) => ({ name: s.name, replicas: s.numReplicas ?? null }));
+    return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var customDomainsValid = {
+  code: "railway.domain.dns_valid",
+  provider: "railway",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.7", "iso:8.20", "ce:secure-config"],
+  run: (ctx) => guarded("api.domains", async () => {
+    const domains = (await inventory(ctx)).services.flatMap((s) => s.customDomains.map((d) => ({ service: s.name, ...d })));
+    if (domains.length === 0) return unknown("api.no_custom_domains");
+    const stale = domains.filter((d) => d.records.length === 0 || d.records.some((r) => norm(r.currentValue) !== norm(r.requiredValue))).map((d) => d.domain);
+    const observed = { customDomains: domains.length, notPointingAtRailway: stale };
+    const evidence = domains.map((d) => ({ domain: d.domain, service: d.service, records: d.records.map((r) => ({ host: r.hostlabel ?? null, status: r.status ?? null, matches: norm(r.currentValue) === norm(r.requiredValue) })) }));
+    return stale.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var RAILWAY_CHECKS = [healthcheck, restartPolicy, replicas, customDomainsValid];
+async function runRailwayChecks(ctx) {
+  const out = [];
+  for (const c of RAILWAY_CHECKS) {
     let result;
     try {
       result = await c.run(ctx);
@@ -2541,6 +2882,154 @@ var COPY = {
   "conn.digitalocean.token.hint": "Set an expiry. Revoke from API \u2192 Tokens.",
   "conn.digitalocean.cta": "Connect read-only",
   "conn.digitalocean.error.token": "That isn't a DigitalOcean personal access token (dop_v1_ followed by 64 hex characters).",
+  "provider.upstash": "Upstash",
+  "check.upstash.redis.tls.title": "TLS on every Redis database",
+  "check.upstash.redis.tls.pass": "Every Upstash Redis database accepts encrypted connections only.",
+  "check.upstash.redis.tls.fail": "At least one Upstash Redis database accepts unencrypted connections, so credentials and data cross the network in the clear.",
+  "check.upstash.redis.tls.fix": "Upstash Console \u2192 the database \u2192 Details: TLS cannot be switched on after creation. Create a new database with TLS enabled, migrate with the console's backup and restore, and update the connection string.",
+  "check.upstash.redis.daily_backup.title": "Daily backups on every paid Redis database",
+  "check.upstash.redis.daily_backup.pass": "Every paid Upstash Redis database has daily backups enabled. Free databases cannot and are not judged.",
+  "check.upstash.redis.daily_backup.fail": "At least one paid Upstash Redis database has daily backups off, so a bad deploy or a flush cannot be undone.",
+  "check.upstash.redis.daily_backup.fix": "Upstash Console \u2192 the database \u2192 Backups \u2192 enable Daily Backup. If the database is a pure cache, accept the risk with a review date and say so.",
+  "check.upstash.redis.none_suspended.title": "No Redis database suspended",
+  "check.upstash.redis.none_suspended.pass": "Every Upstash Redis database is active.",
+  "check.upstash.redis.none_suspended.fail": "At least one Upstash Redis database is suspended (usually a billing hold or a quota breach), so the application is failing or about to.",
+  "check.upstash.redis.none_suspended.fix": "Upstash Console \u2192 Account \u2192 Billing: settle the hold or raise the quota, or delete the database if it is no longer used.",
+  "provider.betterstack": "Better Stack",
+  "check.betterstack.monitors.active.title": "Monitors exist and none is paused",
+  "check.betterstack.monitors.active.pass": "The Better Stack team has at least one monitor and every monitor is running.",
+  "check.betterstack.monitors.active.fail": "The Better Stack team has no monitors, or at least one monitor is paused, so an outage there goes unnoticed.",
+  "check.betterstack.monitors.active.fix": "Better Stack \u2192 Monitors: resume the paused monitors or delete them; make sure the production host has a monitor of its own.",
+  "check.betterstack.monitors.ssl_verified.title": "Certificate checks on every HTTPS monitor",
+  "check.betterstack.monitors.ssl_verified.pass": "Every running HTTPS monitor verifies the certificate and alerts before it expires.",
+  "check.betterstack.monitors.ssl_verified.fail": "At least one running HTTPS monitor skips certificate verification or has no expiry alert, so an expired or bad certificate goes unnoticed until users see it.",
+  "check.betterstack.monitors.ssl_verified.fix": "Better Stack \u2192 the monitor \u2192 Advanced settings: turn on Verify SSL and set an SSL expiration alert (14 days is a sensible floor).",
+  "check.betterstack.monitors.frequency.title": "Every monitor checks at least every five minutes",
+  "check.betterstack.monitors.frequency.pass": "Every running monitor checks its target at least every five minutes.",
+  "check.betterstack.monitors.frequency.fail": "At least one running monitor checks less often than every five minutes, so an outage can run unnoticed for longer than that.",
+  "check.betterstack.monitors.frequency.fix": "Better Stack \u2192 the monitor \u2192 Check frequency: three minutes or less for production; the default plans allow thirty seconds.",
+  "check.betterstack.monitors.alerting.title": "Every monitor alerts somebody",
+  "check.betterstack.monitors.alerting.pass": "Every running monitor has an escalation policy or at least one alert channel (call, SMS, email or push).",
+  "check.betterstack.monitors.alerting.fail": "At least one running monitor has no escalation policy and no alert channel, so it records outages without telling anyone.",
+  "check.betterstack.monitors.alerting.fix": "Better Stack \u2192 the monitor \u2192 On-call and escalation: attach an escalation policy, or turn on at least email and push alerts.",
+  "provider.railway": "Railway",
+  "check.railway.service.healthcheck.title": "Health check on every public service",
+  "check.railway.service.healthcheck.pass": "Every Railway service with a domain has a health check path, so a deploy that does not answer is rolled back instead of going live.",
+  "check.railway.service.healthcheck.fail": "At least one Railway service with a domain has no health check path, so a broken deploy replaces the working one.",
+  "check.railway.service.healthcheck.fix": "Railway \u2192 the service \u2192 Settings \u2192 Deploy \u2192 Healthcheck Path: point it at an endpoint that returns 200 only when the service can serve, such as /healthz.",
+  "check.railway.service.restart_policy.title": "Every service restarts on failure",
+  "check.railway.service.restart_policy.pass": "Every Railway service has a restart policy of On Failure or Always.",
+  "check.railway.service.restart_policy.fail": "At least one Railway service has its restart policy set to Never, so a crash stays down until someone notices.",
+  "check.railway.service.restart_policy.fix": "Railway \u2192 the service \u2192 Settings \u2192 Deploy \u2192 Restart Policy: On Failure, with a retry limit.",
+  "check.railway.service.replicas.title": "More than one replica behind every public service",
+  "check.railway.service.replicas.pass": "Every Railway service with a domain runs at least two replicas.",
+  "check.railway.service.replicas.fail": "At least one Railway service with a domain runs a single replica, so one crash or a region incident takes it offline.",
+  "check.railway.service.replicas.fix": "Railway \u2192 the service \u2192 Settings \u2192 Deploy \u2192 Replicas: two or more, or accept the risk with a review date for a low-stakes service.",
+  "check.railway.domain.dns_valid.title": "Every custom domain points at Railway",
+  "check.railway.domain.dns_valid.pass": "Every custom domain's DNS records match what Railway requires.",
+  "check.railway.domain.dns_valid.fail": "At least one custom domain has a DNS record that does not match what Railway requires, so the site is unreachable or served by something else.",
+  "check.railway.domain.dns_valid.fix": "Railway \u2192 the service \u2192 Settings \u2192 Networking \u2192 Custom Domains: copy the required record into your DNS provider and remove stale ones. Wait for propagation, then re-run.",
+  "provider.auth0": "Auth0",
+  "check.auth0.attack_protection.enabled.title": "Attack protection on",
+  "check.auth0.attack_protection.enabled.pass": "Brute-force protection, breached-password detection and suspicious IP throttling are all enabled.",
+  "check.auth0.attack_protection.enabled.fail": "At least one of brute-force protection, breached-password detection and suspicious IP throttling is off, so credential stuffing against your users goes unhindered.",
+  "check.auth0.attack_protection.enabled.fix": "Auth0 Dashboard \u2192 Security \u2192 Attack Protection: enable all three. Breached-password detection and suspicious IP throttling are available on every plan.",
+  "check.auth0.mfa.enforced.title": "Multi-factor authentication enforced",
+  "check.auth0.mfa.enforced.pass": "MFA is required for all applications (or adaptively by risk) and at least one factor is enabled.",
+  "check.auth0.mfa.enforced.fail": "MFA is not enforced, or no factor is enabled, so a stolen password is enough to sign in.",
+  "check.auth0.mfa.enforced.fix": "Auth0 Dashboard \u2192 Security \u2192 Multi-factor Auth: enable at least one factor (one-time password or WebAuthn) and set the policy to Always, or Adaptive on plans that have it.",
+  "check.auth0.clients.callbacks_https.title": "Every callback and origin is HTTPS and not local",
+  "check.auth0.clients.callbacks_https.pass": "Every application's callback, logout and web-origin URL is HTTPS and points at a real host (native app schemes are allowed).",
+  "check.auth0.clients.callbacks_https.fail": "At least one application allows an HTTP or local callback, logout or origin URL, so a sign-in can be redirected somewhere an attacker controls.",
+  "check.auth0.clients.callbacks_https.fix": "Auth0 Dashboard \u2192 Applications \u2192 the application \u2192 Settings: remove http:// and localhost entries from production applications; keep them on a separate development tenant.",
+  "check.auth0.clients.refresh_token_rotation.title": "Refresh tokens rotate and expire for public applications",
+  "check.auth0.clients.refresh_token_rotation.pass": "Every single-page or native application that issues refresh tokens uses rotating, expiring refresh tokens.",
+  "check.auth0.clients.refresh_token_rotation.fail": "At least one single-page or native application issues refresh tokens that neither rotate nor expire, so one leaked token is a permanent session.",
+  "check.auth0.clients.refresh_token_rotation.fix": "Auth0 Dashboard \u2192 Applications \u2192 the application \u2192 Settings \u2192 Refresh Token Rotation: on, with expiration set (absolute and inactivity).",
+  "check.auth0.tenant.session_lifetime.title": "Session lifetimes bounded",
+  "check.auth0.tenant.session_lifetime.pass": "The tenant's absolute session lifetime is thirty days or less and the idle lifetime seven days or less.",
+  "check.auth0.tenant.session_lifetime.fail": "The tenant lets sessions live longer than thirty days, or idle sessions longer than seven, so a forgotten browser stays signed in for months.",
+  "check.auth0.tenant.session_lifetime.fix": "Auth0 Dashboard \u2192 Settings \u2192 Advanced \u2192 Login Session Management: idle session lifetime 72 hours (the default), absolute lifetime 168 hours or, at most, thirty days.",
+  "check.auth0.connections.password_policy.title": "Strong password policy on every database connection",
+  "check.auth0.connections.password_policy.pass": "Every username-password connection enforces a Good or Excellent password policy.",
+  "check.auth0.connections.password_policy.fail": "At least one username-password connection allows weak passwords (policy Fair, Low or None).",
+  "check.auth0.connections.password_policy.fix": "Auth0 Dashboard \u2192 Authentication \u2192 Database \u2192 the connection \u2192 Password Policy: Good or Excellent, with the password dictionary and personal-data rules on. Reading the policy needs the read:connections_options scope on the Snoopios application.",
+  "stack.blurb.auth0": "Identity: attack protection, MFA, callbacks, refresh tokens, sessions, passwords",
+  "conn.auth0.title": "Connect Auth0",
+  "conn.auth0.intro": "Create a Machine to Machine application authorised for the Auth0 Management API with these read scopes only: read:clients, read:connections, read:connections_options, read:tenant_settings, read:attack_protection, read:guardian_factors, read:mfa_policies. Snoopios exchanges its credentials for a token on every run; Auth0 reports the token's scopes back, and a grant that could write is refused before any check runs.",
+  "conn.auth0.domain.label": "Tenant domain",
+  "conn.auth0.domain.placeholder": "acme.eu.auth0.com",
+  "conn.auth0.domain.hint": "The Auth0 domain, not a custom domain.",
+  "conn.auth0.client.label": "Client ID",
+  "conn.auth0.secret.label": "Client secret",
+  "conn.auth0.secret.hint": "Rotate from Applications \u2192 the application \u2192 Settings; the connection then needs re-entering.",
+  "conn.auth0.cta": "Connect read-only",
+  "conn.auth0.error.domain": "That isn't an Auth0 tenant domain (tenant.auth0.com or tenant.eu.auth0.com and similar). Custom domains are not accepted.",
+  "conn.auth0.error.credentials": "The client id and secret look wrong. Both come from Applications \u2192 the application \u2192 Settings.",
+  "provider.bitbucket": "Bitbucket",
+  "check.bitbucket.repos.private.title": "Every repository private",
+  "check.bitbucket.repos.private.pass": "Every repository in the workspace is private.",
+  "check.bitbucket.repos.private.fail": "At least one repository in the workspace is public. If that is deliberate (open source), accept the risk and say so.",
+  "check.bitbucket.repos.private.fix": "Bitbucket \u2192 the repository \u2192 Repository settings \u2192 Repository details \u2192 Access level: Private.",
+  "check.bitbucket.repos.fork_policy.title": "No public forks of private repositories",
+  "check.bitbucket.repos.fork_policy.pass": "Every private repository forbids public forks.",
+  "check.bitbucket.repos.fork_policy.fail": "At least one private repository allows public forks, so a member can copy it into the open with one click.",
+  "check.bitbucket.repos.fork_policy.fix": "Bitbucket \u2192 the repository \u2192 Repository settings \u2192 Repository details \u2192 Forking: No public forks, or No forks.",
+  "check.bitbucket.repos.default_reviewers.title": "Default reviewers on every repository",
+  "check.bitbucket.repos.default_reviewers.pass": "Every repository has at least one effective default reviewer, so every pull request starts with a reviewer assigned.",
+  "check.bitbucket.repos.default_reviewers.fail": "At least one repository has no default reviewer, so a pull request can be raised and merged with nobody asked to look.",
+  "check.bitbucket.repos.default_reviewers.fix": "Bitbucket \u2192 the repository \u2192 Repository settings \u2192 Default reviewers: add at least one person other than the usual author. Workspace-level defaults count.",
+  "check.bitbucket.deploy_keys.recent.title": "Deploy keys in use",
+  "check.bitbucket.deploy_keys.recent.pass": "Every deploy key was used in the last ninety days or added in the last thirty.",
+  "check.bitbucket.deploy_keys.recent.fail": "At least one deploy key has not been used for ninety days, so it is a standing credential nobody is watching.",
+  "check.bitbucket.deploy_keys.recent.fix": "Bitbucket \u2192 the repository \u2192 Repository settings \u2192 Access keys: delete the stale keys. Prefer short-lived pipeline credentials to standing keys.",
+  "check.bitbucket.pipelines.secured_variables.title": "Pipeline secrets marked secured",
+  "check.bitbucket.pipelines.secured_variables.pass": "Every pipeline variable named like a credential is marked secured, so its value is never shown in logs or the API.",
+  "check.bitbucket.pipelines.secured_variables.fail": "At least one pipeline variable named like a credential is not secured, so its value is readable by anyone with pipeline access and can appear in logs.",
+  "check.bitbucket.pipelines.secured_variables.fix": "Bitbucket \u2192 the repository \u2192 Repository settings \u2192 Pipelines \u2192 Repository variables: delete the variable and re-add it with Secured ticked. Rotate the value first.",
+  "check.bitbucket.account.two_factor.title": "Two-step verification on the connecting account",
+  "check.bitbucket.account.two_factor.pass": "The Atlassian account whose token Snoopios holds has two-step verification on.",
+  "check.bitbucket.account.two_factor.fail": "The Atlassian account whose token Snoopios holds has no two-step verification, so a phished password reaches every repository it can see.",
+  "check.bitbucket.account.two_factor.fix": "Atlassian account \u2192 Security \u2192 Two-step verification: enable it with an authenticator app or a security key.",
+  "stack.blurb.bitbucket": "Bitbucket Cloud: private repos, forks, reviewers, deploy keys, pipeline secrets",
+  "conn.bitbucket.title": "Connect Bitbucket",
+  "conn.bitbucket.intro": "Create an Atlassian API token with scopes (Account settings \u2192 Security \u2192 API tokens \u2192 Create API token with scopes \u2192 Bitbucket) and tick only read:repository, read:pullrequest, read:pipeline, read:ssh-key, read:user and read:workspace. Bitbucket sometimes reports a token's scopes back; when it does, a write scope is refused. Otherwise the connection shows as read-only requested and every request is limited to reads by code.",
+  "conn.bitbucket.workspace.label": "Workspace ID",
+  "conn.bitbucket.workspace.placeholder": "acme",
+  "conn.bitbucket.token.label": "API token",
+  "conn.bitbucket.token.placeholder": "ATATT\u2026",
+  "conn.bitbucket.token.hint": "Set an expiry. Revoke from Account settings \u2192 Security \u2192 API tokens.",
+  "conn.bitbucket.cta": "Connect read-only",
+  "conn.bitbucket.error.workspace": "A workspace ID is the slug in bitbucket.org/<workspace>/ (letters, digits, hyphens, underscores).",
+  "conn.bitbucket.error.token": "That isn't an Atlassian API token (they start with ATATT). App passwords were withdrawn in 2026.",
+  "provider.hetzner": "Hetzner Cloud",
+  "check.hetzner.server.firewall.title": "Every public server behind a firewall",
+  "check.hetzner.server.firewall.pass": "Every server with a public address has a Hetzner firewall applied.",
+  "check.hetzner.server.firewall.fail": "At least one server with a public address has no firewall applied, so every port its software opens is reachable from the internet.",
+  "check.hetzner.server.firewall.fix": "Hetzner Console \u2192 Firewalls: create a firewall allowing only 22 from your addresses and 80/443 from anywhere, and apply it to the server or its label.",
+  "check.hetzner.server.backups.title": "Backups on every server",
+  "check.hetzner.server.backups.pass": "Every server has automated backups enabled.",
+  "check.hetzner.server.backups.fail": "At least one server has no automated backups, so a disk failure or a bad deploy loses it.",
+  "check.hetzner.server.backups.fix": "Hetzner Console \u2192 the server \u2192 Backups \u2192 Enable (20% of the server price), or move state to a managed service and accept the risk with a review date.",
+  "check.hetzner.server.delete_protection.title": "Delete protection on every server",
+  "check.hetzner.server.delete_protection.pass": "Every server has delete protection on, so it cannot be removed by a stray click or script.",
+  "check.hetzner.server.delete_protection.fail": "At least one server can be deleted without a second step.",
+  "check.hetzner.server.delete_protection.fix": "Hetzner Console \u2192 the server \u2192 Overview \u2192 Protection: enable delete and rebuild protection.",
+  "check.hetzner.firewall.admin_ports_restricted.title": "Admin ports closed to the internet",
+  "check.hetzner.firewall.admin_ports_restricted.pass": "No applied firewall opens SSH, RDP, VNC, Docker or a database port to the whole internet.",
+  "check.hetzner.firewall.admin_ports_restricted.fail": "At least one applied firewall opens an admin or database port (22, 3389, 5900, 2375, 3306, 5432, 6379, 27017, 9200, 11211) to every address, so it is one weak password away from a takeover.",
+  "check.hetzner.firewall.admin_ports_restricted.fix": "Hetzner Console \u2192 Firewalls \u2192 the firewall \u2192 Rules: restrict those ports to your own addresses or a VPN, and keep only 80 and 443 open to anywhere.",
+  "check.hetzner.load_balancer.https.title": "Load balancers terminate TLS and redirect HTTP",
+  "check.hetzner.load_balancer.https.pass": "Every public load balancer has an HTTPS service with a certificate and redirects plain HTTP to it.",
+  "check.hetzner.load_balancer.https.fail": "At least one public load balancer serves plain HTTP, has no HTTPS service, or lacks a certificate or the HTTP redirect.",
+  "check.hetzner.load_balancer.https.fix": "Hetzner Console \u2192 the load balancer \u2192 Services: add an HTTPS service with a managed certificate, enable Redirect HTTP, and remove any separate plain-HTTP service on port 80.",
+  "stack.blurb.hetzner": "Servers and load balancers: firewalls, backups, protection, admin ports, TLS",
+  "conn.hetzner.title": "Connect Hetzner Cloud",
+  "conn.hetzner.intro": "In the Hetzner Cloud project, go to Security \u2192 API tokens \u2192 Generate API token and choose the Read permission. Hetzner gives no way to read a token's permission back, so the connection shows as read-only requested; every request is limited to reads by code.",
+  "conn.hetzner.token.label": "Read-only API token",
+  "conn.hetzner.token.hint": "One token per project. Revoke from Security \u2192 API tokens.",
+  "conn.hetzner.cta": "Connect read-only",
+  "conn.hetzner.error.token": "That isn't a Hetzner Cloud API token (64 letters and digits).",
   "conn.fly.title": "Connect Fly.io",
   "conn.fly.intro": "Run fly tokens create readonly -o <org> and paste the token. Fly's read-only org token cannot create, deploy or modify anything. Fly tokens are sealed macaroons that Snoopios cannot open to prove the restriction, so this connection shows as read-only requested; every Snoopios request is still limited to reads by code.",
   "conn.fly.org.label": "Organisation slug",
@@ -2978,27 +3467,31 @@ var LOCAL = {
   neon: { env: "NEON_API_KEY", label: "Neon", run: (t) => runNeonChecks({ api: neonApi(t) }) },
   render: { env: "RENDER_API_KEY", label: "Render", run: (t) => runRenderChecks({ api: renderApi(t) }) },
   heroku: { env: "HEROKU_API_KEY", label: "Heroku", run: (t) => runHerokuChecks({ api: herokuApi(t) }) },
-  clerk: { env: "CLERK_SECRET_KEY", label: "Clerk", run: (t) => runClerkChecks({ api: clerkApi(t) }) }
+  clerk: { env: "CLERK_SECRET_KEY", label: "Clerk", run: (t) => runClerkChecks({ api: clerkApi(t) }) },
+  upstash: { env: "UPSTASH_API_KEY", extra: "UPSTASH_EMAIL", label: "Upstash", run: (t, email) => runUpstashChecks({ api: upstashApi(email, t) }) },
+  betterstack: { env: "BETTERSTACK_API_TOKEN", label: "Better Stack", run: (t) => runBetterStackChecks({ api: betterStackApi(t) }) },
+  railway: { env: "RAILWAY_TOKEN", label: "Railway", run: (t) => runRailwayChecks({ api: railwayApi(t) }) }
 };
 function text(key) {
   return COPY[key] ?? key;
 }
 function usage() {
   return [
-    `snoopios ${"0.3.1"} \u2014 continuous compliance for small software teams`,
+    `snoopios ${"0.4.0"} \u2014 continuous compliance for small software teams`,
     "",
     "Usage:",
     "  snoopios scan <domain> [--email <resend|postmark|mailgun|ses|other>] [--json]",
-    "  snoopios run <netlify|neon|render|heroku|clerk> [--json]",
+    "  snoopios run <netlify|neon|render|heroku|clerk|upstash|betterstack|railway> [--json]",
     "  snoopios doctor <postgres-connection-string> [--json]",
     "  snoopios repo [path] [--json]",
     "",
     "scan    the domain checks (HTTPS, HSTS, CSP, TLS, SPF, DMARC, CAA, security.txt, privacy",
     "        page); --email adds the sending-domain checks with that provider's defaults",
     "run     a provider whose token cannot be made read-only, so it runs here instead of on",
-    "        Snoopios's servers. Reads NETLIFY_AUTH_TOKEN, NEON_API_KEY, RENDER_API_KEY or",
-    "        HEROKU_API_KEY or CLERK_SECRET_KEY",
-    "        from the environment. The token never leaves this machine.",
+    "        Snoopios's servers. Reads NETLIFY_AUTH_TOKEN, NEON_API_KEY, RENDER_API_KEY,",
+    "        HEROKU_API_KEY, CLERK_SECRET_KEY, UPSTASH_API_KEY with UPSTASH_EMAIL,",
+    "        BETTERSTACK_API_TOKEN or RAILWAY_TOKEN (a project token) from the environment.",
+    "        The token never leaves this machine.",
     "doctor  the Supabase SQL checks (RLS on every table, no anon writes, private schema",
     "        closed, SECURITY DEFINER search_path, anon-callable definers) against any",
     "        Postgres connection string. Runs SELECT statements only.",
@@ -3040,7 +3533,7 @@ ${heading}
 }
 function emit(heading, subject, results, json) {
   if (json) {
-    console.log(JSON.stringify({ subject, version: "0.3.1", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
+    console.log(JSON.stringify({ subject, version: "0.4.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
   } else {
     print(heading, rows(results));
   }
@@ -3098,7 +3591,12 @@ ${usage()}`);
     console.error(`${p.env} is not set. Put your ${p.label} token in that environment variable; it is read here and never leaves this machine.`);
     return 2;
   }
-  const results = await p.run(token);
+  const extra = p.extra ? (process.env[p.extra] ?? "").trim() : "";
+  if (p.extra && !extra) {
+    console.error(`${p.extra} is not set. ${p.label} needs it beside ${p.env}; both are read here and never leave this machine.`);
+    return 2;
+  }
+  const results = await p.run(token, extra);
   return emit(`snoopios run ${name}`, name, results, json);
 }
 async function doctor(rest) {
@@ -3204,7 +3702,7 @@ async function main(argv) {
     return 0;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log("0.3.1");
+    console.log("0.4.0");
     return 0;
   }
   if (cmd === "scan") return scan(rest);

@@ -25,9 +25,13 @@ NEON_API_KEY=…       npx snoopios run neon
 RENDER_API_KEY=…     npx snoopios run render
 HEROKU_API_KEY=…     npx snoopios run heroku
 CLERK_SECRET_KEY=…   npx snoopios run clerk
+UPSTASH_EMAIL=… UPSTASH_API_KEY=… npx snoopios run upstash
+BETTERSTACK_API_TOKEN=… npx snoopios run betterstack
+RAILWAY_TOKEN=…      npx snoopios run railway
 ```
 
-Netlify, Neon, Render, Heroku and Clerk tokens are all-or-nothing, so Snoopios never holds them. The
+These providers' tokens cannot be scoped read-only (Upstash's can, but nothing reads that
+back and its API returns database credentials), so Snoopios never holds them. The
 CLI reads the token from your environment, runs the checks here and prints the report.
 The token never leaves your machine, and every request is a read.
 
@@ -41,6 +45,13 @@ The token never leaves your machine, and every request is a read.
   app on a supported stack, the web tier on more than one dyno.
 - **Clerk**: redirect URLs HTTPS and not local, JWT templates expiring within an hour, no
   dormant account able to sign in.
+- **Upstash**: TLS on every Redis database, daily backups on paid ones, nothing suspended.
+  Credentials in the API response are dropped before anything is printed.
+- **Better Stack**: monitors present and none paused, certificate checks on HTTPS monitors,
+  checks at least every five minutes, every monitor alerting somebody.
+- **Railway** (project token): health check on every public service, restart policy not
+  Never, more than one replica, custom domains pointing at Railway. Variables are never
+  read.
 
 ## check a git checkout
 

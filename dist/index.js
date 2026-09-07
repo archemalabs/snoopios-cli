@@ -1436,24 +1436,40 @@ var gitignoreEnv = {
     return covers ? pass(observed, { lines: lines.filter((l) => /env/i.test(l)) }) : fail(observed, { lines: lines.slice(0, 50) });
   })
 };
+var TEST_PATH = /(^|\/)(__tests__|__fixtures__|__mocks__|fixtures?|tests?|specs?|testdata)\/|\.(test|spec|fixture)\.[cm]?[jt]sx?$|\.(test|spec)\.(py|rb|go|rs|java|kt|php|cs)$/i;
 var secretsInHistory = {
   code: "repo.secrets_in_history",
   provider: "repo",
-  version: 1,
+  version: 2,
   severity: "critical",
   maps: ["soc2:CC6.1", "gdpr:art32", "iso:8.12", "iso:8.28"],
   run: (ctx) => guarded("repo.history", async () => {
     const { text: text2, truncated } = await src(ctx).history(ctx.historyCap ?? HISTORY_CAP);
     const found = {};
-    for (const { name, re } of SECRET_PATTERNS) {
-      const global = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
-      const n = (text2.match(global) ?? []).length;
-      if (n) found[name] = n;
+    const inTests = {};
+    const testPaths = /* @__PURE__ */ new Set();
+    const parts = text2.split(/^diff --git a\/.+? b\/(.+)$/m);
+    for (let i = -1; i < parts.length; i += 2) {
+      const path = i < 0 ? "" : parts[i];
+      const body = parts[i + 1] ?? "";
+      const isTest = path !== "" && TEST_PATH.test(path);
+      for (const { name, re } of SECRET_PATTERNS) {
+        const global = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
+        const n = (body.match(global) ?? []).length;
+        if (!n) continue;
+        if (isTest) {
+          inTests[name] = (inTests[name] ?? 0) + n;
+          testPaths.add(path);
+        } else {
+          found[name] = (found[name] ?? 0) + n;
+        }
+      }
     }
-    const observed = { historyBytes: text2.length, truncated, shapesFound: found };
-    if (Object.keys(found).length) return fail(observed, { shapes: Object.keys(found) });
+    const observed = { historyBytes: text2.length, truncated, shapesFound: found, inTestFiles: { shapes: inTests, paths: [...testPaths].sort() } };
+    const evidence = { shapes: Object.keys(found), testFileShapes: Object.keys(inTests), testFilePaths: [...testPaths].sort() };
+    if (Object.keys(found).length) return fail(observed, evidence);
     if (truncated) return unknown("repo.history_truncated", observed);
-    return pass(observed, { shapes: [] });
+    return pass(observed, evidence);
   })
 };
 var lockfile = {
@@ -1546,7 +1562,8 @@ async function runRepoChecks(ctx) {
 // src/index.ts
 import { execFile, spawn } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
-import { resolve, join } from "node:path";
+import { existsSync } from "node:fs";
+import { resolve, join, dirname } from "node:path";
 
 // ../lib/copy.ts
 var COPY = {
@@ -2418,8 +2435,8 @@ var COPY = {
   "check.repo.gitignore_env.fail": "There is no .gitignore rule for .env files, so one git add . commits your secrets.",
   "check.repo.gitignore_env.fix": "Add .env and .env.* to .gitignore (keep !.env.example if you ship an example).",
   "check.repo.secrets_in_history.title": "No credential shape anywhere in the history",
-  "check.repo.secrets_in_history.pass": "No line in the full git history matches a known credential shape (AWS, GitHub, GitLab, Stripe, Slack, Google, OpenAI, Supabase, private key blocks, Resend, Vercel, npm).",
-  "check.repo.secrets_in_history.fail": "The git history contains at least one line matching a known credential shape. A rotated secret is still a leak if the history is public or shared.",
+  "check.repo.secrets_in_history.pass": "No line in the full git history matches a known credential shape (AWS, GitHub, GitLab, Stripe, Slack, Google, OpenAI, Supabase, private key blocks, Resend, Vercel, npm) outside test fixtures. Shapes inside test files are listed by path for you to confirm they are placeholders.",
+  "check.repo.secrets_in_history.fail": "The git history contains at least one line outside test fixtures matching a known credential shape. A rotated secret is still a leak if the history is public or shared.",
   "check.repo.secrets_in_history.fix": "Rotate the credential first, then rewrite the history with git filter-repo and force-push, and ask every collaborator to re-clone. The result names the shape found, never the value.",
   "check.repo.lockfile.title": "Dependencies pinned by a lockfile",
   "check.repo.lockfile.pass": "Every package manifest has a lockfile next to it, so a build installs exactly what was reviewed.",
@@ -2968,7 +2985,7 @@ function text(key) {
 }
 function usage() {
   return [
-    `snoopios ${"0.3.0"} \u2014 continuous compliance for small software teams`,
+    `snoopios ${"0.3.1"} \u2014 continuous compliance for small software teams`,
     "",
     "Usage:",
     "  snoopios scan <domain> [--email <resend|postmark|mailgun|ses|other>] [--json]",
@@ -3023,7 +3040,7 @@ ${heading}
 }
 function emit(heading, subject, results, json) {
   if (json) {
-    console.log(JSON.stringify({ subject, version: "0.3.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
+    console.log(JSON.stringify({ subject, version: "0.3.1", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
   } else {
     print(heading, rows(results));
   }
@@ -3140,7 +3157,9 @@ function gitHistory(cwd, maxBytes) {
 }
 function npmAudit(cwd) {
   return new Promise((res) => {
-    execFile(process.platform === "win32" ? "npm.cmd" : "npm", ["audit", "--json", "--audit-level=none"], { cwd, maxBuffer: 32 * 1024 * 1024, windowsHide: true, shell: process.platform === "win32" }, (_err, stdout) => {
+    const npmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+    const [file, args] = existsSync(npmCli) ? [process.execPath, [npmCli, "audit", "--json", "--audit-level=none"]] : [process.platform === "win32" ? "npm.cmd" : "npm", ["audit", "--json", "--audit-level=none"]];
+    execFile(file, args, { cwd, maxBuffer: 32 * 1024 * 1024, windowsHide: true, shell: file !== process.execPath && process.platform === "win32" }, (_err, stdout) => {
       try {
         const j = JSON.parse(String(stdout));
         const v = j.metadata?.vulnerabilities;
@@ -3185,7 +3204,7 @@ async function main(argv) {
     return 0;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log("0.3.0");
+    console.log("0.3.1");
     return 0;
   }
   if (cmd === "scan") return scan(rest);

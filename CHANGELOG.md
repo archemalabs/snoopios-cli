@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 — 8 September 2026
+- `repo`: a credential shape inside a test path (`*.test.*`, `*.spec.*`, `fixtures/`,
+  `__tests__/` and the like) is listed by path and shape but no longer fails the check on
+  its own. The verdict rests on the rest of the history. Check version 2.
+- `repo`: `npm audit` runs through npm's own entry point beside node, without a shell.
+
 ## 0.3.0 — 8 September 2026
 - `snoopios repo [path]`: seven checks on a git checkout with no token and on any host:
   tracked .env files, .gitignore coverage, credential shapes in the full history (the

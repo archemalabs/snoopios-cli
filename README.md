@@ -53,6 +53,53 @@ The token never leaves your machine, and every request is a read.
   Never, more than one replica, custom domains pointing at Railway. Variables are never
   read.
 
+## push results to your Snoopios project (`--push`)
+
+`run` and `repo` keep everything on your machine by default. Add `--push` and the results
+(check, status, what was observed, the evidence) go to your project; the provider token
+still never leaves the machine. On the project page, open **Run locally and push** and
+create a key; it is shown once and stored hashed.
+
+```bash
+SNOOPIOS_INGEST_KEY=snpi_… NETLIFY_AUTH_TOKEN=… npx snoopios run netlify --push
+```
+
+Pushed results are labelled **Run by you** on the check page, in every generated document
+and on the trust page. They never render as observed by Snoopios. Add `--ci` (or run
+under GitHub Actions or GitLab CI, which are detected) and they are labelled **Run in CI**
+with the run URL recorded, which is stronger evidence because a third party attests when
+and where it ran.
+
+### hourly, from GitHub Actions
+
+```yaml
+name: snoopios
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npx snoopios@latest repo . --push --ci
+        env:
+          SNOOPIOS_INGEST_KEY: ${{ secrets.SNOOPIOS_INGEST_KEY }}
+      - run: npx snoopios@latest run netlify --push --ci
+        env:
+          SNOOPIOS_INGEST_KEY: ${{ secrets.SNOOPIOS_INGEST_KEY }}
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+```
+
+### hourly, from a machine you keep on
+
+```
+17 * * * * cd /path/to/checkout && SNOOPIOS_INGEST_KEY=snpi_… npx snoopios@latest repo . --push
+```
+
+The key can only post results. Revoke it from the project page at any time.
+
 ## check a git checkout
 
 ```bash

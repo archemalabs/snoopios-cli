@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 — 8 September 2026
+- `--push` on `run` and `repo`: posts the results (check, status, observed values,
+  evidence) to your Snoopios project with the key in `SNOOPIOS_INGEST_KEY`, created on the
+  project page under Run locally and push. The provider token still never leaves the
+  machine. Results are labelled Run by you on the check page, in every document and on
+  the trust page; `--ci` (or GitHub Actions / GitLab CI, detected) labels them Run in CI
+  and records the run URL.
+- README: an hourly GitHub Actions workflow and a cron line.
+
 ## 0.4.0 — 8 September 2026
 - `snoopios run upstash` (UPSTASH_EMAIL and UPSTASH_API_KEY): TLS on every Redis database,
   daily backups on paid ones, nothing suspended. Database credentials in the API response

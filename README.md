@@ -28,6 +28,10 @@ CLERK_SECRET_KEY=…   npx snoopios run clerk
 UPSTASH_EMAIL=… UPSTASH_API_KEY=… npx snoopios run upstash
 BETTERSTACK_API_TOKEN=… npx snoopios run betterstack
 RAILWAY_TOKEN=…      npx snoopios run railway
+CIRCLECI_TOKEN=… CIRCLECI_PROJECT=gh/org/repo npx snoopios run circleci
+CHECKLY_API_KEY=… CHECKLY_ACCOUNT_ID=… npx snoopios run checkly
+TURSO_API_TOKEN=… TURSO_ORG=… npx snoopios run turso
+WORKOS_API_KEY=…     npx snoopios run workos
 ```
 
 These providers' tokens cannot be scoped read-only (Upstash's can, but nothing reads that
@@ -52,6 +56,13 @@ The token never leaves your machine, and every request is a read.
 - **Railway** (project token): health check on every public service, restart policy not
   Never, more than one replica, custom domains pointing at Railway. Variables are never
   read.
+- **CircleCI** (one project): builds hidden from the public, settings changed by admins
+  only, forks do not receive secrets.
+- **Checkly**: checks present and none muted, every check alerts somebody, certificate
+  expiry alerts on, checks from more than one location.
+- **Turso**: delete protection on every database and group, owners held by few.
+- **WorkOS**: SSO connections live, directory syncs healthy, customer domains verified,
+  user emails verified.
 
 ## push results to your Snoopios project (`--push`)
 

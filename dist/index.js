@@ -103,10 +103,10 @@ async function head(ctx, url, redirect = "manual") {
   });
   return { status: res.status, headers, url: res.url };
 }
-async function dohTxt(ctx, name3, type = "TXT") {
+async function dohTxt(ctx, name4, type = "TXT") {
   const f = ctx.fetch ?? readOnlyFetch;
   const res = await f(
-    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name3)}&type=${type}`,
+    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name4)}&type=${type}`,
     { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(TIMEOUT_MS) }
   );
   const json = await res.json();
@@ -386,9 +386,9 @@ var ESP_DEFAULTS = {
   other: {}
 };
 var TIMEOUT_MS2 = 1e4;
-async function doh(ctx, name3, type = "TXT") {
+async function doh(ctx, name4, type = "TXT") {
   const f = ctx.fetch ?? readOnlyFetch;
-  const res = await f(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name3)}&type=${type}`, {
+  const res = await f(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name4)}&type=${type}`, {
     headers: { accept: "application/dns-json" },
     signal: AbortSignal.timeout(TIMEOUT_MS2)
   });
@@ -401,8 +401,8 @@ function selectorFor(ctx) {
   return ctx.selector?.trim() || ESP_DEFAULTS[ctx.esp].selector || null;
 }
 function returnPathHost(ctx) {
-  const sub = ctx.returnPath?.trim() || ESP_DEFAULTS[ctx.esp].returnPath;
-  return sub ? `${sub}.${ctx.domain}` : ctx.domain;
+  const sub2 = ctx.returnPath?.trim() || ESP_DEFAULTS[ctx.esp].returnPath;
+  return sub2 ? `${sub2}.${ctx.domain}` : ctx.domain;
 }
 var dkimPresent = {
   code: "email.dkim.present",
@@ -545,9 +545,9 @@ async function sites(ctx) {
   const r = await ctx.api.get("/sites?per_page=100");
   if (r.status === 403) throw new Error("scope:sites.read");
   if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.sites");
-  let list4 = r.json.filter((s) => s && s.id && s.name);
-  if (ctx.sites?.length) list4 = list4.filter((s) => ctx.sites.includes(s.name));
-  return list4.slice(0, max);
+  let list9 = r.json.filter((s) => s && s.id && s.name);
+  if (ctx.sites?.length) list9 = list9.filter((s) => ctx.sites.includes(s.name));
+  return list9.slice(0, max);
 }
 var SECRET_KEY = /(SECRET|TOKEN|PASSWORD|PRIVATE|API_KEY|_KEY$|^KEY_)/i;
 var PUBLIC_KEY = /^(NEXT_PUBLIC_|PUBLIC_|VITE_|EXPO_PUBLIC_|REACT_APP_|GATSBY_)|_PUBLIC_KEY$|PUBLISHABLE/i;
@@ -558,11 +558,11 @@ var forceHttps = {
   severity: "high",
   maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
   run: (ctx) => guarded("api.sites", async () => {
-    const list4 = await sites(ctx);
-    if (list4.length === 0) return unknown("api.no_sites");
-    const off = list4.filter((s) => s.ssl !== true || s.force_ssl !== true).map((s) => s.name);
-    const observed = { sites: list4.length, notForced: off };
-    const evidence = list4.map((s) => ({ name: s.name, ssl: s.ssl ?? null, force_ssl: s.force_ssl ?? null }));
+    const list9 = await sites(ctx);
+    if (list9.length === 0) return unknown("api.no_sites");
+    const off = list9.filter((s) => s.ssl !== true || s.force_ssl !== true).map((s) => s.name);
+    const observed = { sites: list9.length, notForced: off };
+    const evidence = list9.map((s) => ({ name: s.name, ssl: s.ssl ?? null, force_ssl: s.force_ssl ?? null }));
     return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -573,12 +573,12 @@ var siteProtected = {
   severity: "medium",
   maps: ["soc2:CC6.1", "iso:8.3"],
   run: (ctx) => guarded("api.sites", async () => {
-    const list4 = await sites(ctx);
-    if (list4.length === 0) return unknown("api.no_sites");
-    if (list4.every((s) => s.password === void 0)) return unknown("api.protection_hidden", { sites: list4.length });
-    const open = list4.filter((s) => !s.password).map((s) => s.name);
-    const observed = { sites: list4.length, unprotected: open };
-    const evidence = list4.map((s) => ({ name: s.name, passwordSet: Boolean(s.password) }));
+    const list9 = await sites(ctx);
+    if (list9.length === 0) return unknown("api.no_sites");
+    if (list9.every((s) => s.password === void 0)) return unknown("api.protection_hidden", { sites: list9.length });
+    const open = list9.filter((s) => !s.password).map((s) => s.name);
+    const observed = { sites: list9.length, unprotected: open };
+    const evidence = list9.map((s) => ({ name: s.name, passwordSet: Boolean(s.password) }));
     return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -589,9 +589,9 @@ var envSecretsMarked = {
   severity: "high",
   maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("api.env", async () => {
-    const list4 = await sites(ctx);
-    if (list4.length === 0) return unknown("api.no_sites");
-    const accounts = [...new Set(list4.map((s) => s.account_slug).filter((a) => Boolean(a)))];
+    const list9 = await sites(ctx);
+    if (list9.length === 0) return unknown("api.no_sites");
+    const accounts = [...new Set(list9.map((s) => s.account_slug).filter((a) => Boolean(a)))];
     if (accounts.length === 0) return unknown("api.no_account");
     const unmarked = {};
     const evidence = {};
@@ -617,12 +617,12 @@ var liveHeaders = {
   severity: "medium",
   maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("site.headers", async () => {
-    const list4 = await sites(ctx);
-    if (list4.length === 0) return unknown("api.no_sites");
+    const list9 = await sites(ctx);
+    if (list9.length === 0) return unknown("api.no_sites");
     const f = ctx.fetch ?? readOnlyFetch;
     const missing = {};
     const evidence = {};
-    for (const s of list4) {
+    for (const s of list9) {
       const url = s.ssl_url ?? s.url;
       if (!url) continue;
       const res = await f(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(1e4) });
@@ -635,7 +635,7 @@ var liveHeaders = {
       evidence[s.name] = { url, status: res.status, xFrameOptions: h("x-frame-options"), nosniff: h("x-content-type-options"), referrerPolicy: h("referrer-policy"), cspFrameAncestors: /frame-ancestors/i.test(csp) };
       if (gaps.length) missing[s.name] = gaps;
     }
-    const observed = { sites: list4.length, missing };
+    const observed = { sites: list9.length, missing };
     return Object.keys(missing).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -706,11 +706,11 @@ var ipAllowlist = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list4 = await projects(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
-    const open = list4.filter((p) => !p.settings?.allowed_ips?.ips?.length && p.settings?.block_public_connections !== true).map((p) => p.name);
-    const observed = { projects: list4.length, openToAnyAddress: open };
-    const evidence = list4.map((p) => ({ name: p.name, allowedIps: p.settings?.allowed_ips?.ips?.length ?? 0, protectedBranchesOnly: p.settings?.allowed_ips?.protected_branches_only ?? null, blockPublic: p.settings?.block_public_connections ?? null }));
+    const list9 = await projects(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
+    const open = list9.filter((p) => !p.settings?.allowed_ips?.ips?.length && p.settings?.block_public_connections !== true).map((p) => p.name);
+    const observed = { projects: list9.length, openToAnyAddress: open };
+    const evidence = list9.map((p) => ({ name: p.name, allowedIps: p.settings?.allowed_ips?.ips?.length ?? 0, protectedBranchesOnly: p.settings?.allowed_ips?.protected_branches_only ?? null, blockPublic: p.settings?.block_public_connections ?? null }));
     return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -721,17 +721,17 @@ var defaultProtected = {
   severity: "high",
   maps: ["soc2:CC6.1", "soc2:A1.2", "iso:8.13"],
   run: (ctx) => guarded("api.branches", async () => {
-    const list4 = await projects(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
+    const list9 = await projects(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
     const unprotected = [];
     const evidence = {};
-    for (const p of list4) {
+    for (const p of list9) {
       const bs = await branches(ctx, p.id);
       const main2 = bs.find((b) => b.default);
       evidence[p.name] = main2 ? { branch: main2.name, protected: main2.protected ?? false } : null;
       if (!main2 || main2.protected !== true) unprotected.push(p.name);
     }
-    const observed = { projects: list4.length, defaultUnprotected: unprotected };
+    const observed = { projects: list9.length, defaultUnprotected: unprotected };
     return unprotected.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -742,11 +742,11 @@ var historyRetention = {
   severity: "high",
   maps: ["soc2:A1.2", "iso:8.13", "gdpr:art32"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list4 = await projects(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
-    const short = list4.filter((p) => (p.history_retention_seconds ?? 0) < WEEK).map((p) => p.name);
-    const observed = { projects: list4.length, underSevenDays: short, requiredSeconds: WEEK };
-    const evidence = list4.map((p) => ({ name: p.name, historyRetentionSeconds: p.history_retention_seconds ?? null }));
+    const list9 = await projects(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
+    const short = list9.filter((p) => (p.history_retention_seconds ?? 0) < WEEK).map((p) => p.name);
+    const observed = { projects: list9.length, underSevenDays: short, requiredSeconds: WEEK };
+    const evidence = list9.map((p) => ({ name: p.name, historyRetentionSeconds: p.history_retention_seconds ?? null }));
     return short.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -757,18 +757,18 @@ var stalePreviews = {
   severity: "medium",
   maps: ["soc2:CC6.5", "gdpr:art5", "iso:8.10"],
   run: (ctx) => guarded("api.branches", async () => {
-    const list4 = await projects(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
+    const list9 = await projects(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
     const stale = {};
     const evidence = {};
-    for (const p of list4) {
+    for (const p of list9) {
       const bs = await branches(ctx, p.id);
       const old = bs.filter((b) => !b.default && b.parent_id && b.created_at && now - Date.parse(b.created_at) > STALE_DAYS * 24 * 3600 * 1e3).map((b) => b.name);
       evidence[p.name] = bs.map((b) => ({ name: b.name, default: b.default ?? false, parent: b.parent_id ?? null, createdAt: b.created_at ?? null }));
       if (old.length) stale[p.name] = old;
     }
-    const observed = { projects: list4.length, staleDays: STALE_DAYS, stale };
+    const observed = { projects: list9.length, staleDays: STALE_DAYS, stale };
     return Object.keys(stale).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -822,8 +822,8 @@ async function services(ctx) {
     cursor = items[items.length - 1]?.cursor ?? "";
     if (!cursor) break;
   }
-  const list4 = ctx.services?.length ? out.filter((s) => ctx.services.includes(s.name)) : out;
-  return list4.slice(0, max);
+  const list9 = ctx.services?.length ? out.filter((s) => ctx.services.includes(s.name)) : out;
+  return list9.slice(0, max);
 }
 var healthCheck = {
   code: "render.service.health_check",
@@ -832,11 +832,11 @@ var healthCheck = {
   severity: "medium",
   maps: ["soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.services", async () => {
-    const list4 = (await services(ctx)).filter((s) => s.type === "web_service" && s.suspended !== "suspended");
-    if (list4.length === 0) return unknown("api.no_web_services");
-    const without = list4.filter((s) => !s.serviceDetails?.healthCheckPath).map((s) => s.name);
-    const observed = { webServices: list4.length, withoutHealthCheck: without };
-    const evidence = list4.map((s) => ({ name: s.name, healthCheckPath: s.serviceDetails?.healthCheckPath ?? null, region: s.serviceDetails?.region ?? null }));
+    const list9 = (await services(ctx)).filter((s) => s.type === "web_service" && s.suspended !== "suspended");
+    if (list9.length === 0) return unknown("api.no_web_services");
+    const without = list9.filter((s) => !s.serviceDetails?.healthCheckPath).map((s) => s.name);
+    const observed = { webServices: list9.length, withoutHealthCheck: without };
+    const evidence = list9.map((s) => ({ name: s.name, healthCheckPath: s.serviceDetails?.healthCheckPath ?? null, region: s.serviceDetails?.region ?? null }));
     return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -847,12 +847,12 @@ var customDomainsVerified = {
   severity: "medium",
   maps: ["soc2:CC6.7", "iso:8.24"],
   run: (ctx) => guarded("api.domains", async () => {
-    const list4 = (await services(ctx)).filter((s) => WEB.has(s.type) && s.suspended !== "suspended");
-    if (list4.length === 0) return unknown("api.no_web_services");
+    const list9 = (await services(ctx)).filter((s) => WEB.has(s.type) && s.suspended !== "suspended");
+    if (list9.length === 0) return unknown("api.no_web_services");
     const pending = {};
     const evidence = {};
     let domains = 0;
-    for (const s of list4) {
+    for (const s of list9) {
       const r = await ctx.api.get(`/services/${encodeURIComponent(s.id)}/custom-domains?limit=100`);
       if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.domains");
       const items = r.json.map((i) => i.customDomain).filter((d) => Boolean(d));
@@ -861,7 +861,7 @@ var customDomainsVerified = {
       evidence[s.name] = items.map((d) => ({ name: d.name ?? null, verificationStatus: d.verificationStatus ?? null }));
       if (bad.length) pending[s.name] = bad;
     }
-    const observed = { services: list4.length, customDomains: domains, unverified: pending };
+    const observed = { services: list9.length, customDomains: domains, unverified: pending };
     return Object.keys(pending).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -872,11 +872,11 @@ var notifyOnFail = {
   severity: "low",
   maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
   run: (ctx) => guarded("api.services", async () => {
-    const list4 = (await services(ctx)).filter((s) => s.suspended !== "suspended");
-    if (list4.length === 0) return unknown("api.no_services");
-    const silent = list4.filter((s) => s.notifyOnFail === "ignore").map((s) => s.name);
-    const observed = { services: list4.length, deployFailuresIgnored: silent };
-    const evidence = list4.map((s) => ({ name: s.name, type: s.type, notifyOnFail: s.notifyOnFail ?? null }));
+    const list9 = (await services(ctx)).filter((s) => s.suspended !== "suspended");
+    if (list9.length === 0) return unknown("api.no_services");
+    const silent = list9.filter((s) => s.notifyOnFail === "ignore").map((s) => s.name);
+    const observed = { services: list9.length, deployFailuresIgnored: silent };
+    const evidence = list9.map((s) => ({ name: s.name, type: s.type, notifyOnFail: s.notifyOnFail ?? null }));
     return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -921,9 +921,9 @@ async function apps(ctx) {
   const r = await ctx.api.get("/apps");
   if (r.status === 403) throw new Error("scope:apps.read");
   if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.apps");
-  let list4 = r.json.filter((a) => a && a.id && a.name);
-  if (ctx.apps?.length) list4 = list4.filter((a) => ctx.apps.includes(a.name));
-  return list4.slice(0, max);
+  let list9 = r.json.filter((a) => a && a.id && a.name);
+  if (ctx.apps?.length) list9 = list9.filter((a) => ctx.apps.includes(a.name));
+  return list9.slice(0, max);
 }
 var managedCerts = {
   code: "heroku.app.managed_certs",
@@ -932,12 +932,12 @@ var managedCerts = {
   severity: "high",
   maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
   run: (ctx) => guarded("api.domains", async () => {
-    const list4 = await apps(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
+    const list9 = await apps(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
     const bad = {};
     const evidence = {};
     let custom = 0;
-    for (const a of list4) {
+    for (const a of list9) {
       const r = await ctx.api.get(`/apps/${encodeURIComponent(a.id)}/domains`);
       if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.domains");
       const domains = r.json.filter((d) => d.kind === "custom");
@@ -946,7 +946,7 @@ var managedCerts = {
       evidence[a.name] = { acm: a.acm ?? null, customDomains: domains.map((d) => ({ hostname: d.hostname ?? null, status: d.status ?? null, cert: Boolean(d.sni_endpoint) })) };
       if (without.length) bad[a.name] = without;
     }
-    const observed = { apps: list4.length, customDomains: custom, withoutCertificate: bad };
+    const observed = { apps: list9.length, customDomains: custom, withoutCertificate: bad };
     return Object.keys(bad).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -957,11 +957,11 @@ var maintenanceOff = {
   severity: "medium",
   maps: ["soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.apps", async () => {
-    const list4 = await apps(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
-    const on = list4.filter((a) => a.maintenance === true).map((a) => a.name);
-    const observed = { apps: list4.length, inMaintenance: on };
-    return on.length === 0 ? pass(observed, list4.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false }))) : fail(observed, list4.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false })));
+    const list9 = await apps(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
+    const on = list9.filter((a) => a.maintenance === true).map((a) => a.name);
+    const observed = { apps: list9.length, inMaintenance: on };
+    return on.length === 0 ? pass(observed, list9.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false }))) : fail(observed, list9.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false })));
   })
 };
 var stackSupported = {
@@ -971,11 +971,11 @@ var stackSupported = {
   severity: "high",
   maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
   run: (ctx) => guarded("api.apps", async () => {
-    const list4 = await apps(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
-    const old = list4.filter((a) => !SUPPORTED_STACKS.has(a.stack?.name ?? "")).map((a) => `${a.name} (${a.stack?.name ?? "unknown"})`);
-    const observed = { apps: list4.length, unsupportedStack: old, supported: [...SUPPORTED_STACKS] };
-    const evidence = list4.map((a) => ({ name: a.name, stack: a.stack?.name ?? null, buildStack: a.build_stack?.name ?? null }));
+    const list9 = await apps(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
+    const old = list9.filter((a) => !SUPPORTED_STACKS.has(a.stack?.name ?? "")).map((a) => `${a.name} (${a.stack?.name ?? "unknown"})`);
+    const observed = { apps: list9.length, unsupportedStack: old, supported: [...SUPPORTED_STACKS] };
+    const evidence = list9.map((a) => ({ name: a.name, stack: a.stack?.name ?? null, buildStack: a.build_stack?.name ?? null }));
     return old.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -986,12 +986,12 @@ var webRedundancy = {
   severity: "low",
   maps: ["soc2:A1.2", "iso:8.14"],
   run: (ctx) => guarded("api.formation", async () => {
-    const list4 = await apps(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
+    const list9 = await apps(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
     const single = [];
     const evidence = {};
     let withWeb = 0;
-    for (const a of list4) {
+    for (const a of list9) {
       const r = await ctx.api.get(`/apps/${encodeURIComponent(a.id)}/formation`);
       if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.formation");
       const web = r.json.find((f) => f.type === "web");
@@ -1000,7 +1000,7 @@ var webRedundancy = {
       withWeb++;
       if ((web.quantity ?? 0) < 2) single.push(a.name);
     }
-    if (withWeb === 0) return unknown("api.no_web_dynos", { apps: list4.length });
+    if (withWeb === 0) return unknown("api.no_web_dynos", { apps: list9.length });
     const observed = { appsWithWeb: withWeb, singleWebDyno: single };
     return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
@@ -1342,8 +1342,8 @@ function railwayApi(projectToken, fetchImpl = readOnlyFetch) {
     }
   };
 }
-async function gql(api, query, variables, scope) {
-  const r = await api.query(query, variables);
+async function gql(api4, query, variables, scope) {
+  const r = await api4.query(query, variables);
   const body = r.json;
   if (body?.errors?.some((e) => /unauthori[sz]ed|not authorized|forbidden/i.test(e.message ?? "") || e.extensions?.code === "UNAUTHENTICATED")) throw new Error("scope:auth");
   if (r.status !== 200 || !body?.data || body.errors?.length) throw new Error(`scope:${scope}`);
@@ -1354,17 +1354,17 @@ var Q_PROJECT = "query snoopiosProject($id: String!) { project(id: $id) { id nam
 var Q_INSTANCE = "query snoopiosInstance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { healthcheckPath numReplicas restartPolicyType } }";
 var Q_DOMAINS = "query snoopiosDomains($projectId: String!, $environmentId: String!, $serviceId: String!) { domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) { serviceDomains { domain } customDomains { domain status { dnsRecords { hostlabel requiredValue currentValue status } } } } }";
 var MAX_SERVICES = 50;
-async function load(api) {
-  const tok = await gql(api, Q_TOKEN, {}, "api.project_token");
+async function load(api4) {
+  const tok = await gql(api4, Q_TOKEN, {}, "api.project_token");
   const projectId = tok.projectToken?.projectId ?? "";
   const environmentId = tok.projectToken?.environmentId ?? "";
   if (!projectId || !environmentId) throw new Error("scope:api.project_token");
-  const proj = await gql(api, Q_PROJECT, { id: projectId }, "api.project");
+  const proj = await gql(api4, Q_PROJECT, { id: projectId }, "api.project");
   const nodes = (proj.project?.services?.edges ?? []).map((e) => e.node).filter((n) => Boolean(n?.id)).slice(0, MAX_SERVICES);
   const services2 = [];
   for (const n of nodes) {
-    const inst = await gql(api, Q_INSTANCE, { serviceId: n.id, environmentId }, "api.service_instance");
-    const dom = await gql(api, Q_DOMAINS, { projectId, environmentId, serviceId: n.id }, "api.domains");
+    const inst = await gql(api4, Q_INSTANCE, { serviceId: n.id, environmentId }, "api.service_instance");
+    const dom = await gql(api4, Q_DOMAINS, { projectId, environmentId, serviceId: n.id }, "api.domains");
     services2.push({
       id: n.id,
       name: n.name ?? n.id,
@@ -1448,6 +1448,404 @@ var RAILWAY_CHECKS = [healthcheck, restartPolicy, replicas, customDomainsValid];
 async function runRailwayChecks(ctx) {
   const out = [];
   for (const c of RAILWAY_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/circleci.ts
+var CIRCLECI_PROJECT = /^(gh|bb|github|bitbucket|circleci)\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+function circleCiApi(token, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://circleci.com/api/v2${path}`, {
+        headers: { "circle-token": token, accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+async function settings(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const [vcs, org, repo2] = ctx.project.split("/");
+  const r = await ctx.api.get(`/project/${encodeURIComponent(vcs)}/${encodeURIComponent(org)}/${encodeURIComponent(repo2)}/settings`);
+  if (r.status === 403) throw new Error("scope:scope.settings");
+  if (r.status === 404) throw new Error("scope:api.project_not_found");
+  if (r.status !== 200) throw new Error("scope:api.settings");
+  return r.json?.advanced ?? {};
+}
+var buildsPrivate = {
+  code: "circleci.project.builds_private",
+  provider: "circleci",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:8.3"],
+  run: (ctx) => guarded("api.settings", async () => {
+    const s = await settings(ctx);
+    const observed = { project: ctx.project, oss: s.oss ?? null };
+    return s.oss === false ? pass(observed, observed) : fail(observed, observed);
+  })
+};
+var settingsAdminOnly = {
+  code: "circleci.project.settings_admin_only",
+  provider: "circleci",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC8.1", "iso:8.32"],
+  run: (ctx) => guarded("api.settings", async () => {
+    const s = await settings(ctx);
+    const observed = { project: ctx.project, writeSettingsRequiresAdmin: s.write_settings_requires_admin ?? null };
+    return s.write_settings_requires_admin === true ? pass(observed, observed) : fail(observed, observed);
+  })
+};
+var forksNoSecrets = {
+  code: "circleci.project.forks_no_secrets",
+  provider: "circleci",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "iso:8.12", "iso:8.28"],
+  run: (ctx) => guarded("api.settings", async () => {
+    const s = await settings(ctx);
+    const observed = { project: ctx.project, buildForkPrs: s.build_fork_prs ?? null, forksReceiveSecrets: s.forks_receive_secret_env_vars ?? null };
+    const ok = s.forks_receive_secret_env_vars !== true;
+    return ok ? pass(observed, observed) : fail(observed, observed);
+  })
+};
+var CIRCLECI_CHECKS = [buildsPrivate, settingsAdminOnly, forksNoSecrets];
+async function runCircleCiChecks(ctx) {
+  const out = [];
+  for (const c of CIRCLECI_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/checkly.ts
+function checklyApi(apiKey, accountId, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://api.checklyhq.com${path}`, {
+        headers: { authorization: `Bearer ${apiKey}`, "x-checkly-account": accountId, accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401 || res.status === 403) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+var LIMIT = 100;
+async function list(ctx, path, scope) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const out = [];
+  for (let page = 1; page <= 10; page++) {
+    const sep = path.includes("?") ? "&" : "?";
+    const r = await ctx.api.get(`${path}${sep}limit=${LIMIT}&page=${page}`);
+    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error(`scope:api.${scope}`);
+    out.push(...r.json);
+    if (r.json.length < LIMIT) break;
+  }
+  return out;
+}
+var label2 = (c) => c.name ?? c.id ?? "?";
+var checksActive = {
+  code: "checkly.checks.active",
+  provider: "checkly",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
+  run: (ctx) => guarded("api.checks", async () => {
+    const all = await list(ctx, "/v1/checks?applyGroupSettings=true", "checks");
+    const off = all.filter((c) => c.activated === false || c.muted === true).map(label2);
+    const observed = { checks: all.length, deactivatedOrMuted: off };
+    const evidence = all.map((c) => ({ check: label2(c), type: c.checkType ?? null, activated: c.activated ?? null, muted: c.muted ?? null }));
+    return all.length > 0 && off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var checksAlert = {
+  code: "checkly.checks.alerting",
+  provider: "checkly",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.3", "soc2:A1.1", "iso:8.16"],
+  run: (ctx) => guarded("api.checks", async () => {
+    const live2 = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
+    if (live2.length === 0) return unknown("api.no_active_checks");
+    const silent = live2.filter((c) => !(c.alertChannelSubscriptions ?? []).some((s) => s.activated !== false)).map(label2);
+    const observed = { activeChecks: live2.length, withoutAlertChannel: silent };
+    const evidence = live2.map((c) => ({ check: label2(c), channels: (c.alertChannelSubscriptions ?? []).filter((s) => s.activated !== false).length }));
+    return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var sslExpiryWatched = {
+  code: "checkly.alert_channels.ssl_expiry",
+  provider: "checkly",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
+  run: (ctx) => guarded("api.alert_channels", async () => {
+    const channels = await list(ctx, "/v1/alert-channels", "alert_channels");
+    if (channels.length === 0) return fail({ alertChannels: 0, sslExpiryChannels: [] }, []);
+    const ssl = channels.filter((c) => c.sslExpiry === true).map((c) => `${c.type ?? "?"} (${c.sslExpiryThreshold ?? "?"} days)`);
+    const observed = { alertChannels: channels.length, sslExpiryChannels: ssl };
+    const evidence = channels.map((c) => ({ type: c.type ?? null, sslExpiry: c.sslExpiry ?? null, thresholdDays: c.sslExpiryThreshold ?? null }));
+    return ssl.length > 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var multiLocation = {
+  code: "checkly.checks.multi_location",
+  provider: "checkly",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:A1.1", "iso:8.16"],
+  run: (ctx) => guarded("api.checks", async () => {
+    const live2 = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
+    if (live2.length === 0) return unknown("api.no_active_checks");
+    const single = live2.filter((c) => (c.locations ?? []).length < 2).map(label2);
+    const observed = { activeChecks: live2.length, singleLocation: single };
+    const evidence = live2.map((c) => ({ check: label2(c), locations: c.locations ?? [] }));
+    return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var CHECKLY_CHECKS = [checksActive, checksAlert, sslExpiryWatched, multiLocation];
+async function runChecklyChecks(ctx) {
+  const out = [];
+  for (const c of CHECKLY_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/turso.ts
+var TURSO_ORG = /^[a-z0-9][a-z0-9-]{0,63}$/;
+function tursoApi(token, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://api.turso.tech/v1${path}`, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401 || res.status === 403) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+async function get(ctx, path, key, scope) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const r = await ctx.api.get(`/organizations/${encodeURIComponent(ctx.org)}${path}`);
+  if (r.status !== 200) throw new Error(`scope:api.${scope}`);
+  const items = r.json?.[key];
+  if (!Array.isArray(items)) throw new Error(`scope:api.${scope}`);
+  return items;
+}
+var dbName = (d) => d.Name ?? d.name ?? "?";
+var databasesProtected = {
+  code: "turso.databases.delete_protection",
+  provider: "turso",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:A1.2", "soc2:CC6.1", "iso:8.13"],
+  run: (ctx) => guarded("api.databases", async () => {
+    const dbs = await get(ctx, "/databases", "databases", "databases");
+    if (dbs.length === 0) return unknown("api.no_databases");
+    const off = dbs.filter((d) => d.delete_protection !== true).map(dbName);
+    const observed = { databases: dbs.length, deletable: off };
+    const evidence = dbs.map((d) => ({ database: dbName(d), group: d.group ?? null, deleteProtection: d.delete_protection ?? null, blocked: Boolean(d.block_reads || d.block_writes) }));
+    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var groupsProtected = {
+  code: "turso.groups.delete_protection",
+  provider: "turso",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:A1.2", "iso:8.13"],
+  run: (ctx) => guarded("api.groups", async () => {
+    const groups = await get(ctx, "/groups", "groups", "groups");
+    if (groups.length === 0) return unknown("api.no_groups");
+    const off = groups.filter((g) => g.delete_protection !== true).map((g) => g.name ?? "?");
+    const observed = { groups: groups.length, deletable: off };
+    const evidence = groups.map((g) => ({ group: g.name ?? null, primary: g.primary ?? null, deleteProtection: g.delete_protection ?? null }));
+    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var MAX_OWNERS = 3;
+var ownersLimited = {
+  code: "turso.members.owners_limited",
+  provider: "turso",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
+  run: (ctx) => guarded("api.members", async () => {
+    const members2 = await get(ctx, "/members", "members", "members");
+    if (members2.length === 0) return unknown("api.no_members");
+    const owners = members2.filter((m) => m.role === "owner").length;
+    const admins = members2.filter((m) => m.role === "admin").length;
+    const observed = { members: members2.length, owners, admins, max: MAX_OWNERS };
+    const evidence = { roles: members2.reduce((acc, m) => ({ ...acc, [m.role ?? "?"]: (acc[m.role ?? "?"] ?? 0) + 1 }), {}) };
+    return owners > 0 && owners <= MAX_OWNERS ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var TURSO_CHECKS = [databasesProtected, groupsProtected, ownersLimited];
+async function runTursoChecks(ctx) {
+  const out = [];
+  for (const c of TURSO_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/workos.ts
+function workOsApi(key, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`https://api.workos.com${path}`, {
+        headers: { authorization: `Bearer ${key}`, accept: "application/json", "user-agent": "snoopios-cli (+https://snoopios.com)" },
+        signal: AbortSignal.timeout(15e3)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      let json = null;
+      try {
+        json = await res.json();
+      } catch {
+        json = null;
+      }
+      return { status: res.status, json };
+    }
+  };
+}
+var LIMIT2 = 100;
+var MAX_PAGES2 = 5;
+async function list2(ctx, path, scope) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const out = [];
+  let after = null;
+  for (let i = 0; i < MAX_PAGES2; i++) {
+    const sep = path.includes("?") ? "&" : "?";
+    const r = await ctx.api.get(`${path}${sep}limit=${LIMIT2}${after ? `&after=${encodeURIComponent(after)}` : ""}`);
+    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
+    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
+    const body = r.json;
+    out.push(...body?.data ?? []);
+    after = body?.list_metadata?.after ?? null;
+    if (!after) return { items: out, truncated: false };
+  }
+  return { items: out, truncated: true };
+}
+var connectionsActive = {
+  code: "workos.connections.active",
+  provider: "workos",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:5.16", "iso:8.5"],
+  run: (ctx) => guarded("api.connections", async () => {
+    const { items } = await list2(ctx, "/connections", "connections");
+    if (items.length === 0) return unknown("api.no_connections");
+    const inactive = items.filter((c) => c.state !== "active").map((c) => `${c.name ?? c.id} (${c.state ?? "?"})`);
+    const observed = { connections: items.length, notActive: inactive };
+    const evidence = items.map((c) => ({ connection: c.name ?? c.id, type: c.connection_type ?? null, state: c.state ?? null }));
+    return inactive.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var directoriesLinked = {
+  code: "workos.directories.linked",
+  provider: "workos",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.2", "soc2:CC6.3", "iso:5.18"],
+  run: (ctx) => guarded("api.directories", async () => {
+    const { items } = await list2(ctx, "/directories", "directories");
+    if (items.length === 0) return unknown("api.no_directories");
+    const broken = items.filter((d) => d.state !== "linked").map((d) => `${d.name ?? d.id} (${d.state ?? "?"})`);
+    const observed = { directories: items.length, notLinked: broken };
+    const evidence = items.map((d) => ({ directory: d.name ?? d.id, type: d.type ?? null, state: d.state ?? null }));
+    return broken.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var domainsVerified = {
+  code: "workos.organizations.domains_verified",
+  provider: "workos",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:5.16"],
+  run: (ctx) => guarded("api.organizations", async () => {
+    const { items } = await list2(ctx, "/organizations", "organizations");
+    const withDomains = items.filter((o) => (o.domains ?? []).length > 0);
+    if (withDomains.length === 0) return unknown("api.no_organization_domains");
+    const unverified = withDomains.flatMap((o) => (o.domains ?? []).filter((d) => d.state !== "verified").map((d) => `${o.name ?? o.id}: ${d.domain ?? "?"} (${d.state ?? "?"})`));
+    const observed = { organizations: withDomains.length, unverifiedDomains: unverified };
+    const evidence = withDomains.map((o) => ({ organization: o.name ?? o.id, domains: (o.domains ?? []).map((d) => ({ domain: d.domain ?? null, state: d.state ?? null })) }));
+    return unverified.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+function mask(email) {
+  if (!email) return "?";
+  const [local, domain] = email.split("@");
+  return domain ? `${local.slice(0, 1)}\u2026@${domain}` : `${local.slice(0, 1)}\u2026`;
+}
+var usersVerified = {
+  code: "workos.users.email_verified",
+  provider: "workos",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:CC6.1", "iso:5.16"],
+  run: (ctx) => guarded("api.users", async () => {
+    const { items, truncated } = await list2(ctx, "/user_management/users", "users");
+    if (truncated) return unknown("api.users.too_many");
+    if (items.length === 0) return unknown("api.no_users");
+    const unverified = items.filter((u) => u.email_verified !== true).map((u) => mask(u.email));
+    const observed = { users: items.length, unverifiedEmails: unverified };
+    const evidence = { unverified };
+    return unverified.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var WORKOS_CHECKS = [connectionsActive, directoriesLinked, domainsVerified, usersVerified];
+async function runWorkOsChecks(ctx) {
+  const out = [];
+  for (const c of WORKOS_CHECKS) {
     let result;
     try {
       result = await c.run(ctx);
@@ -1794,15 +2192,15 @@ var secretsInHistory = {
       const path = i < 0 ? "" : parts[i];
       const body = parts[i + 1] ?? "";
       const isTest = path !== "" && TEST_PATH.test(path);
-      for (const { name: name3, re } of SECRET_PATTERNS) {
+      for (const { name: name4, re } of SECRET_PATTERNS) {
         const global = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
         const n = (body.match(global) ?? []).length;
         if (!n) continue;
         if (isTest) {
-          inTests[name3] = (inTests[name3] ?? 0) + n;
+          inTests[name4] = (inTests[name4] ?? 0) + n;
           testPaths.add(path);
         } else {
-          found[name3] = (found[name3] ?? 0) + n;
+          found[name4] = (found[name4] ?? 0) + n;
         }
       }
     }
@@ -3030,6 +3428,214 @@ var COPY = {
   "conn.hetzner.token.hint": "One token per project. Revoke from Security \u2192 API tokens.",
   "conn.hetzner.cta": "Connect read-only",
   "conn.hetzner.error.token": "That isn't a Hetzner Cloud API token (64 letters and digits).",
+  "provider.azure": "Azure",
+  "check.azure.storage.locked_down.title": "Storage accounts closed to the public",
+  "check.azure.storage.locked_down.pass": "Every storage account forbids public blob access, requires HTTPS and accepts TLS 1.2 or newer only.",
+  "check.azure.storage.locked_down.fail": "At least one storage account allows public blob access, plain HTTP, or TLS older than 1.2, so data in it can be read from the internet or in transit.",
+  "check.azure.storage.locked_down.fix": "Azure Portal \u2192 the storage account \u2192 Configuration: set Allow Blob anonymous access to Disabled, Secure transfer required to Enabled, Minimum TLS version to 1.2. Under Networking, restrict public access to selected networks.",
+  "check.azure.nsg.admin_ports_restricted.title": "Admin ports closed to the internet",
+  "check.azure.nsg.admin_ports_restricted.pass": "No attached network security group allows SSH, RDP, VNC, Docker or a database port inbound from any address.",
+  "check.azure.nsg.admin_ports_restricted.fail": "At least one attached network security group allows an admin or database port (22, 3389, 5900, 2375, 1433, 3306, 5432, 6379, 27017, 9200, 11211) inbound from the whole internet.",
+  "check.azure.nsg.admin_ports_restricted.fix": "Azure Portal \u2192 the network security group \u2192 Inbound security rules: restrict the source of those rules to your own addresses or a VPN, or use Just-in-time VM access or Azure Bastion, and keep only 80 and 443 open to Any.",
+  "check.azure.sql.hardened.title": "SQL servers audited, TLS 1.2, not open to the internet",
+  "check.azure.sql.hardened.pass": "Every Azure SQL server has auditing enabled, requires TLS 1.2, and has no firewall rule spanning every address.",
+  "check.azure.sql.hardened.fail": "At least one Azure SQL server has auditing off, accepts TLS older than 1.2, or has a firewall rule from 0.0.0.0 to 255.255.255.255.",
+  "check.azure.sql.hardened.fix": "Azure Portal \u2192 the SQL server \u2192 Auditing: on, to a storage account or Log Analytics. Networking: Minimum TLS version 1.2, delete any rule spanning all addresses, use private endpoints or specific client addresses.",
+  "check.azure.keyvault.protected.title": "Key Vaults protected from deletion",
+  "check.azure.keyvault.protected.pass": "Every Key Vault has soft delete and purge protection on, so a deleted secret or the vault itself can be recovered.",
+  "check.azure.keyvault.protected.fail": "At least one Key Vault lacks purge protection or soft delete, so a deleted key or secret can be gone for good.",
+  "check.azure.keyvault.protected.fix": "Azure Portal \u2192 the Key Vault \u2192 Properties: enable Soft-delete and Purge protection. Purge protection cannot be turned off once on, which is the point.",
+  "check.azure.appservice.https_only.title": "Web apps HTTPS only, TLS 1.2, no plain FTP",
+  "check.azure.appservice.https_only.pass": "Every running App Service web app redirects HTTP to HTTPS, requires TLS 1.2 or newer, and does not allow plain FTP deployment.",
+  "check.azure.appservice.https_only.fail": "At least one running web app accepts plain HTTP, TLS older than 1.2, or plain FTP for deployments.",
+  "check.azure.appservice.https_only.fix": "Azure Portal \u2192 the web app \u2192 Configuration \u2192 General settings: HTTPS Only on, Minimum TLS version 1.2, FTP state Disabled or FTPS only.",
+  "check.azure.rbac.owners_limited.title": "Subscription owners held by few",
+  "check.azure.rbac.owners_limited.pass": "The subscription has between one and three Owner assignments at subscription scope.",
+  "check.azure.rbac.owners_limited.fail": "The subscription has more than three Owner assignments at subscription scope, or none, so either too many people can do anything or nobody is accountable.",
+  "check.azure.rbac.owners_limited.fix": "Azure Portal \u2192 the subscription \u2192 Access control (IAM): keep Owner for at most three people or one break-glass group, give everyone else Contributor or a narrower role, and use Privileged Identity Management for temporary elevation where the licence allows.",
+  "stack.blurb.azure": "Azure: storage, network security groups, SQL, Key Vault, App Service, owners",
+  "conn.azure.title": "Connect Azure",
+  "conn.azure.intro": `Snoopios reads your subscription as its own Entra application holding the built-in Reader role, so there is no secret to paste. Two steps in Azure: create the application's service principal in your tenant (Cloud Shell: az ad sp create --id fb9fe616-787b-402a-b684-0b29d54d1a90, or connect Microsoft 365 above, which does the same), then on the subscription's Access control (IAM) page assign the Reader role to "Snoopios 365 connector". Every run reads the role assignments first and stops if anything beyond Reader is present, so the connection shows as read-only verified.`,
+  "conn.azure.tenant.label": "Tenant ID",
+  "conn.azure.tenant.placeholder": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "conn.azure.subscription.label": "Subscription ID",
+  "conn.azure.subscription.hint": "Azure Portal \u2192 Subscriptions. One connection per subscription.",
+  "conn.azure.cta": "Connect read-only",
+  "conn.azure.error.tenant": "A tenant id is 36 characters: eight, four, four, four and twelve hex digits separated by hyphens.",
+  "conn.azure.error.subscription": "A subscription id is 36 characters: eight, four, four, four and twelve hex digits separated by hyphens.",
+  "provider.pagerduty": "PagerDuty",
+  "check.pagerduty.oncall.covered.title": "Someone on call all of next week",
+  "check.pagerduty.oncall.covered.pass": "Every escalation policy has a level-one on-call shift covering the whole of the next seven days.",
+  "check.pagerduty.oncall.covered.fail": "At least one escalation policy has a gap in level-one on-call cover during the next seven days, so a page in that window reaches nobody.",
+  "check.pagerduty.oncall.covered.fix": "PagerDuty \u2192 People \u2192 Schedules: fill the gap with a layer or an override, and put the schedule on the policy's first level. Point every policy's first level at a schedule, not a single person.",
+  "check.pagerduty.services.escalation_wired.title": "Every service pages a real escalation policy",
+  "check.pagerduty.services.escalation_wired.pass": "Every active service has an escalation policy with at least one target.",
+  "check.pagerduty.services.escalation_wired.fail": "At least one active service has no escalation policy, or a policy with no targets, so its incidents page nobody.",
+  "check.pagerduty.services.escalation_wired.fix": "PagerDuty \u2192 Services \u2192 the service \u2192 Settings \u2192 Escalation policy: assign a policy whose first level targets a schedule or a person.",
+  "check.pagerduty.escalation.backup_level.title": "Unanswered pages escalate",
+  "check.pagerduty.escalation.backup_level.pass": "Every escalation policy has a second level or repeats, so an unanswered page reaches somebody else.",
+  "check.pagerduty.escalation.backup_level.fail": "At least one escalation policy has a single level and never repeats, so an unanswered page stops there.",
+  "check.pagerduty.escalation.backup_level.fix": "PagerDuty \u2192 People \u2192 Escalation policies \u2192 the policy: add a second level (another schedule, a manager) or set the policy to repeat at least once.",
+  "check.pagerduty.incidents.none_stale.title": "No incident open for more than a day",
+  "check.pagerduty.incidents.none_stale.pass": "No triggered or acknowledged incident is older than twenty-four hours.",
+  "check.pagerduty.incidents.none_stale.fail": "At least one incident has been triggered or acknowledged for more than a day without being resolved.",
+  "check.pagerduty.incidents.none_stale.fix": "PagerDuty \u2192 Incidents: resolve or reassign the stale incidents, and set an acknowledgement timeout on the service so an acknowledged incident re-pages when it is forgotten.",
+  "stack.blurb.pagerduty": "On-call: coverage next week, escalation wired, backup levels, stale incidents",
+  "conn.pagerduty.title": "Connect PagerDuty",
+  "conn.pagerduty.intro": "Create a general access REST API key with the Read-only box ticked (Integrations \u2192 API Access Keys \u2192 Create New API Key). PagerDuty gives no way to read a key's access level back, so the connection shows as read-only requested; every request is limited to reads by code. A user token also works and is checked against its user's role: only a read-only user is accepted.",
+  "conn.pagerduty.token.label": "REST API key",
+  "conn.pagerduty.token.hint": "Twenty characters. Revoke from Integrations \u2192 API Access Keys.",
+  "conn.pagerduty.cta": "Connect read-only",
+  "conn.pagerduty.error.token": "That isn't a PagerDuty REST API key (twenty characters).",
+  "provider.datadog": "Datadog",
+  "check.datadog.monitors.notify_someone.title": "Every monitor tells somebody",
+  "check.datadog.monitors.notify_someone.pass": "There is at least one monitor and every monitor's message carries a notification handle.",
+  "check.datadog.monitors.notify_someone.fail": "There are no monitors, or at least one monitor's message has no @-handle, so it changes colour on a dashboard and tells nobody.",
+  "check.datadog.monitors.notify_someone.fix": "Datadog \u2192 Monitors \u2192 the monitor \u2192 Notify your team: add an @-handle (a Slack channel, PagerDuty service or email) to every monitor. Use a monitor tag and a notification template so new monitors inherit it.",
+  "check.datadog.monitors.none_muted_forever.title": "No monitor muted indefinitely",
+  "check.datadog.monitors.none_muted_forever.pass": "No monitor is muted without an expiry.",
+  "check.datadog.monitors.none_muted_forever.fail": "At least one monitor is muted with no expiry, so it will never alert again unless someone remembers it.",
+  "check.datadog.monitors.none_muted_forever.fix": "Datadog \u2192 Monitors \u2192 Manage downtimes: replace indefinite mutes with downtimes that have an end date, and delete monitors that are no longer wanted.",
+  "check.datadog.monitors.no_data_alerts.title": "Silence is noticed",
+  "check.datadog.monitors.no_data_alerts.pass": "Every metric monitor alerts when its data stops arriving.",
+  "check.datadog.monitors.no_data_alerts.fail": "At least one metric monitor stays quiet when its data stops, so a dead host or agent looks healthy.",
+  "check.datadog.monitors.no_data_alerts.fix": "Datadog \u2192 Monitors \u2192 the monitor \u2192 Advanced options: Notify if data is missing, with a sensible window (10 to 30 minutes).",
+  "check.datadog.users.mfa.title": "Every user signs in with a second factor",
+  "check.datadog.users.mfa.pass": "Every active human user has multi-factor authentication enabled, or the org enforces SAML.",
+  "check.datadog.users.mfa.fail": "At least one active user signs in to Datadog with a password alone.",
+  "check.datadog.users.mfa.fix": "Datadog \u2192 Organization Settings \u2192 Login Methods: require SAML or enforce MFA; ask the remaining users to enable it under Personal Settings \u2192 Password & Authentication.",
+  "check.datadog.logs.retention.title": "Logs kept at least fifteen days",
+  "check.datadog.logs.retention.pass": "Every log index retains logs for at least fifteen days.",
+  "check.datadog.logs.retention.fail": "At least one log index retains logs for fewer than fifteen days, so an incident from last week may already be gone.",
+  "check.datadog.logs.retention.fix": "Datadog \u2192 Logs \u2192 Configuration \u2192 Indexes: set retention to fifteen days or more on production indexes, or add an archive to cheap storage for the long tail.",
+  "stack.blurb.datadog": "Monitoring: monitors notify, no permanent mutes, no-data alerts, MFA, log retention",
+  "conn.datadog.title": "Connect Datadog",
+  "conn.datadog.intro": "Create a scoped application key (Organization Settings \u2192 Application Keys \u2192 New Key) with exactly these scopes: monitors_read, user_access_read, logs_read_config and user_app_keys, from a user or service account holding the Datadog Read Only Role. Paste it with an API key and choose your site. Datadog reports the key's scopes back, so every run reads them first and refuses an unscoped key or any write scope: the connection shows as read-only verified.",
+  "conn.datadog.site.label": "Datadog site",
+  "conn.datadog.apikey.label": "API key",
+  "conn.datadog.appkey.label": "Scoped application key",
+  "conn.datadog.appkey.hint": "Revoke from Organization Settings \u2192 Application Keys.",
+  "conn.datadog.cta": "Connect read-only",
+  "conn.datadog.error.site": "Choose the Datadog site your organisation lives on (the host in your browser: datadoghq.com, datadoghq.eu, us3, us5, ap1, ap2 or uk1).",
+  "conn.datadog.error.keys": "The keys look wrong: an API key is 32 hex characters and an application key is 40.",
+  "provider.okta": "Okta",
+  "check.okta.signon.mfa_required.title": "Second factor required at sign-in",
+  "check.okta.signon.mfa_required.pass": "Every active sign-on policy rule that allows access requires a factor.",
+  "check.okta.signon.mfa_required.fail": "At least one active sign-on policy rule allows access without a second factor, so a password alone can be enough.",
+  "check.okta.signon.mfa_required.fix": "Okta Admin \u2192 Security \u2192 Authentication policies (or Global session policy): edit each Allow rule to require multifactor authentication. Keep the default rule strict and add exceptions only by network zone.",
+  "check.okta.users.mfa_enrolled.title": "Every active user has enrolled a factor",
+  "check.okta.users.mfa_enrolled.pass": "Every active user has at least one active factor enrolled.",
+  "check.okta.users.mfa_enrolled.fail": "At least one active user has no active factor, so a required-factor policy cannot apply to them at sign-in.",
+  "check.okta.users.mfa_enrolled.fix": "Okta Admin \u2192 Security \u2192 Authenticators: make enrollment required at first sign-in; Directory \u2192 People: reset factors for anyone stuck. Instances with more than two hundred users are not judged here.",
+  "check.okta.admins.limited.title": "Super admins held by few",
+  "check.okta.admins.limited.pass": "Between one and three active users hold the Super Administrator role.",
+  "check.okta.admins.limited.fail": "More than three active users hold Super Administrator, or none does, so either too many people can do anything or nobody can recover the org.",
+  "check.okta.admins.limited.fix": "Okta Admin \u2192 Security \u2192 Administrators: keep Super Administrator for at most three people, give everyone else a narrower role (Org, Group, Help Desk or Read-only Administrator).",
+  "check.okta.users.dormant.title": "No dormant account still active",
+  "check.okta.users.dormant.pass": "Every active user has signed in within ninety days, or was created within the last month.",
+  "check.okta.users.dormant.fail": "At least one active user has not signed in for ninety days, or never signed in and is older than a month.",
+  "check.okta.users.dormant.fix": "Okta Admin \u2192 Directory \u2192 People: suspend or deactivate the dormant accounts, or set up a lifecycle rule that suspends after ninety days without sign-in.",
+  "check.okta.signon.sessions_bounded.title": "Sessions end",
+  "check.okta.signon.sessions_bounded.pass": "Every Allow rule on an active sign-on policy limits idle sessions to a day and total sessions to thirty days.",
+  "check.okta.signon.sessions_bounded.fail": "At least one Allow rule leaves the session idle limit above a day or the lifetime unlimited or above thirty days, so a forgotten browser stays signed in.",
+  "check.okta.signon.sessions_bounded.fix": "Okta Admin \u2192 Security \u2192 Global session policy \u2192 the rule \u2192 Session management: Maximum idle time 24 hours or less, Maximum lifetime set (30 days is generous), and expire on browser close where the app allows.",
+  "stack.blurb.okta": "Workforce identity: MFA required and enrolled, super admins, dormant users, sessions",
+  "conn.okta.title": "Connect Okta",
+  "conn.okta.intro": "Create a dedicated user, give it only the Read-only Administrator role, sign in as that user and create an API token (Security \u2192 API \u2192 Tokens). Okta tokens inherit their creator's role and cannot be scoped, so every run reads the token's own user and roles first and stops if any role could write: the connection shows as read-only verified. Note that Okta revokes a token unused for thirty days; Snoopios uses it hourly.",
+  "conn.okta.org.label": "Okta org domain",
+  "conn.okta.org.placeholder": "acme.okta.com",
+  "conn.okta.token.label": "API token",
+  "conn.okta.token.hint": "Revoke from Security \u2192 API \u2192 Tokens.",
+  "conn.okta.cta": "Connect read-only",
+  "conn.okta.error.org": "That isn't an Okta org domain (acme.okta.com, acme.okta-emea.com or acme.oktapreview.com). Custom domains are not accepted.",
+  "conn.okta.error.token": "That doesn't look like an Okta API token.",
+  "provider.azuredevops": "Azure DevOps",
+  "check.azuredevops.projects.private.title": "Every project private",
+  "check.azuredevops.projects.private.pass": "Every project in the organisation is private.",
+  "check.azuredevops.projects.private.fail": "At least one project in the organisation is public. If that is deliberate (open source), accept the risk and say so.",
+  "check.azuredevops.projects.private.fix": "Azure DevOps \u2192 Organization settings \u2192 Projects \u2192 the project \u2192 Visibility: Private.",
+  "check.azuredevops.repos.default_branch_reviewed.title": "Default branch needs a review",
+  "check.azuredevops.repos.default_branch_reviewed.pass": "Every enabled repository's default branch has a blocking minimum-reviewers policy of at least one approver, and the author's vote does not count.",
+  "check.azuredevops.repos.default_branch_reviewed.fail": "At least one repository's default branch can be changed without a blocking review from someone other than the author.",
+  "check.azuredevops.repos.default_branch_reviewed.fix": "Azure DevOps \u2192 Repos \u2192 Branches \u2192 the default branch \u2192 Branch policies: Require a minimum number of reviewers (1 or more), Required, and untick 'Allow requestors to approve their own changes'.",
+  "check.azuredevops.pipelines.yaml.title": "Pipelines defined as code",
+  "check.azuredevops.pipelines.yaml.pass": "Every pipeline is a YAML pipeline, so its definition is reviewed like any other change.",
+  "check.azuredevops.pipelines.yaml.fail": "At least one pipeline is a classic designer pipeline, edited outside source control and outside review.",
+  "check.azuredevops.pipelines.yaml.fix": "Azure DevOps \u2192 Pipelines: recreate classic pipelines as YAML in the repository and retire the designer ones.",
+  "check.azuredevops.members.dormant.title": "No dormant member still licensed",
+  "check.azuredevops.members.dormant.pass": "Every active member has signed in within ninety days, or was added within the last month.",
+  "check.azuredevops.members.dormant.fail": "At least one active member has not signed in for ninety days, or never signed in and was added over a month ago.",
+  "check.azuredevops.members.dormant.fix": "Azure DevOps \u2192 Organization settings \u2192 Users: remove the dormant members. Entra-backed organisations can also use group rules so leavers lose access automatically.",
+  "stack.blurb.azuredevops": "Azure DevOps: private projects, reviewed default branches, YAML pipelines, dormant members",
+  "conn.azuredevops.title": "Connect Azure DevOps",
+  "conn.azuredevops.intro": "Create a personal access token (User settings \u2192 Personal access tokens) scoped to this organisation with these Read scopes only: Project and Team, Code, Build, Graph, Member Entitlement Management. Azure DevOps cannot report a token's scopes back to the token itself, so the connection shows as read-only requested; every request is limited to reads by code. Set an expiry and note that Entra-backed organisations deactivate a token unused for ninety days.",
+  "conn.azuredevops.org.label": "Organisation name",
+  "conn.azuredevops.org.placeholder": "the part after dev.azure.com/",
+  "conn.azuredevops.token.label": "Personal access token",
+  "conn.azuredevops.token.hint": "Revoke from User settings \u2192 Personal access tokens.",
+  "conn.azuredevops.cta": "Connect read-only",
+  "conn.azuredevops.error.org": "An organisation name is the segment after dev.azure.com/ (letters, digits and hyphens).",
+  "conn.azuredevops.error.token": "That isn't an Azure DevOps personal access token (52 or 84 letters and digits).",
+  "provider.circleci": "CircleCI",
+  "check.circleci.project.builds_private.title": "Builds hidden from the public",
+  "check.circleci.project.builds_private.pass": "The project's builds are visible only to members.",
+  "check.circleci.project.builds_private.fail": "The project is marked open source, so anyone can read its builds and their output through the web and the API.",
+  "check.circleci.project.builds_private.fix": "CircleCI \u2192 Project Settings \u2192 Advanced: turn off Free and Open Source unless the repository is public on purpose.",
+  "check.circleci.project.settings_admin_only.title": "Project settings changed by admins only",
+  "check.circleci.project.settings_admin_only.pass": "Changing the project's settings requires an organisation administrator.",
+  "check.circleci.project.settings_admin_only.fail": "Any member can change the project's settings, including the ones below.",
+  "check.circleci.project.settings_admin_only.fix": "CircleCI \u2192 Project Settings \u2192 Advanced: turn on 'Only org admins can change project settings'.",
+  "check.circleci.project.forks_no_secrets.title": "Forks do not receive secrets",
+  "check.circleci.project.forks_no_secrets.pass": "Builds of pull requests from forks do not receive the project's secret environment variables.",
+  "check.circleci.project.forks_no_secrets.fail": "Builds of pull requests from forks receive the project's secret environment variables, so anyone who can open a pull request can read them.",
+  "check.circleci.project.forks_no_secrets.fix": "CircleCI \u2192 Project Settings \u2192 Advanced: turn off 'Pass secrets to builds from forked pull requests'.",
+  "provider.checkly": "Checkly",
+  "check.checkly.checks.active.title": "Checks exist and none is muted",
+  "check.checkly.checks.active.pass": "The account has at least one check and every check is activated and unmuted.",
+  "check.checkly.checks.active.fail": "The account has no checks, or at least one check is deactivated or muted, so an outage there goes unnoticed.",
+  "check.checkly.checks.active.fix": "Checkly \u2192 Checks: activate or unmute the checks, or delete the ones no longer wanted; make sure production has a check of its own.",
+  "check.checkly.checks.alerting.title": "Every check alerts somebody",
+  "check.checkly.checks.alerting.pass": "Every active check subscribes to at least one alert channel.",
+  "check.checkly.checks.alerting.fail": "At least one active check has no alert channel subscription, so it records failures without telling anyone.",
+  "check.checkly.checks.alerting.fix": "Checkly \u2192 the check \u2192 Alerting: subscribe it to an alert channel, or set alert channels on its group.",
+  "check.checkly.alert_channels.ssl_expiry.title": "Certificate expiry alerts on",
+  "check.checkly.alert_channels.ssl_expiry.pass": "At least one alert channel sends certificate-expiry alerts.",
+  "check.checkly.alert_channels.ssl_expiry.fail": "No alert channel sends certificate-expiry alerts, so an expiring certificate is noticed by users first.",
+  "check.checkly.alert_channels.ssl_expiry.fix": "Checkly \u2192 Alerts \u2192 the channel \u2192 tick SSL certificate expiry and set the threshold (14 days is a sensible floor).",
+  "check.checkly.checks.multi_location.title": "Checks run from more than one place",
+  "check.checkly.checks.multi_location.pass": "Every active check runs from at least two locations.",
+  "check.checkly.checks.multi_location.fail": "At least one active check runs from a single location, so a regional blip looks like an outage and a real outage can be missed.",
+  "check.checkly.checks.multi_location.fix": "Checkly \u2192 the check \u2192 Locations: add a second region.",
+  "provider.turso": "Turso",
+  "check.turso.databases.delete_protection.title": "Delete protection on every database",
+  "check.turso.databases.delete_protection.pass": "Every database has delete protection on.",
+  "check.turso.databases.delete_protection.fail": "At least one database can be deleted without a second step.",
+  "check.turso.databases.delete_protection.fix": "Turso: `turso db update <name> --delete-protection` or the dashboard's database settings.",
+  "check.turso.groups.delete_protection.title": "Delete protection on every group",
+  "check.turso.groups.delete_protection.pass": "Every group has delete protection on.",
+  "check.turso.groups.delete_protection.fail": "At least one group can be deleted without a second step, taking every database in it.",
+  "check.turso.groups.delete_protection.fix": "Turso: `turso group update <name> --delete-protection` or the dashboard's group settings.",
+  "check.turso.members.owners_limited.title": "Organisation owners held by few",
+  "check.turso.members.owners_limited.pass": "Between one and three members hold the owner role.",
+  "check.turso.members.owners_limited.fail": "More than three members own the organisation, or none does.",
+  "check.turso.members.owners_limited.fix": "Turso dashboard \u2192 Organization \u2192 Members: keep owner for at most three people, give everyone else admin or member.",
+  "provider.workos": "WorkOS",
+  "check.workos.connections.active.title": "SSO connections live",
+  "check.workos.connections.active.pass": "Every SSO connection is active.",
+  "check.workos.connections.active.fail": "At least one SSO connection is a draft or still needs a type, so a customer's single sign-on is not actually working.",
+  "check.workos.connections.active.fix": "WorkOS Dashboard \u2192 Organizations \u2192 the connection: finish the setup, or delete drafts that were never completed.",
+  "check.workos.directories.linked.title": "Directory syncs healthy",
+  "check.workos.directories.linked.pass": "Every directory sync is linked.",
+  "check.workos.directories.linked.fail": "At least one directory sync is unlinked or has invalid credentials, so joiners and leavers at that customer are not being synced.",
+  "check.workos.directories.linked.fix": "WorkOS Dashboard \u2192 the directory: reconnect it or ask the customer to re-authorise the sync.",
+  "check.workos.organizations.domains_verified.title": "Customer domains verified",
+  "check.workos.organizations.domains_verified.pass": "Every organisation domain is verified.",
+  "check.workos.organizations.domains_verified.fail": "At least one organisation domain is unverified, so sign-in could be routed for a domain nobody has proved they own.",
+  "check.workos.organizations.domains_verified.fix": "WorkOS Dashboard \u2192 the organization \u2192 Domains: complete verification or remove the domain.",
+  "check.workos.users.email_verified.title": "User emails verified",
+  "check.workos.users.email_verified.pass": "Every user has a verified email address.",
+  "check.workos.users.email_verified.fail": "At least one user has an unverified email address.",
+  "check.workos.users.email_verified.fix": "WorkOS \u2192 User Management: require email verification at sign-up, and prompt existing users to verify. Environments with more than five hundred users are not judged here.",
   "conn.fly.title": "Connect Fly.io",
   "conn.fly.intro": "Run fly tokens create readonly -o <org> and paste the token. Fly's read-only org token cannot create, deploy or modify anything. Fly tokens are sealed macaroons that Snoopios cannot open to prove the restriction, so this connection shows as read-only requested; every Snoopios request is still limited to reads by code.",
   "conn.fly.org.label": "Organisation slug",
@@ -3093,11 +3699,11 @@ var COPY = {
   "check.cloudflare.pages.preview_protected.fail": "At least one Pages project serves its preview deployments to anyone with the link.",
   "check.cloudflare.pages.preview_protected.fix": "Pages \u2192 the project \u2192 Settings \u2192 General \u2192 Access policy \u2192 Enable. Cloudflare creates the Access application for *.<project>.pages.dev; Zero Trust's free tier covers it.",
   "conn.google.title": "Connect Google Workspace",
-  "conn.google.intro": "A super-admin grants Snoopios two read-only Admin SDK scopes (users and domains). Google returns a refresh token, which is stored encrypted; nothing is written, and a grant with more scopes than asked is refused.",
+  "conn.google.intro": "A super-admin grants Snoopios one read-only Admin SDK scope: the user directory. Google returns a refresh token, which is stored encrypted; nothing is written, and a grant with more scopes than asked is refused.",
   "conn.google.cta": "Grant read-only access on Google",
   "conn.google.label": "Google Workspace",
   "conn.google.connected": "Google Workspace is connected. The first run starts within a minute.",
-  "conn.google.scopes": "Google granted different scopes from the two read-only ones requested, so the connection was refused. Try again and leave the scopes as shown.",
+  "conn.google.scopes": "Google granted different scopes from the single read-only one requested, so the connection was refused. Try again and leave the scope as shown.",
   "conn.google.error": "The Google grant did not complete. Try again from this page; if it repeats, email us.",
   "conn.google.unconfigured": "Google Workspace is not switched on in this deployment yet: the OAuth client has not been registered.",
   "check.google.users.2sv_enforced.title": "Two-step verification enforced for every user",
@@ -3434,18 +4040,20 @@ var COPY = {
   // Every sentence here describes code that exists. Change the code, change
   // the sentence, change the date. In that order.
   "privacy.title": "Privacy notice",
-  "privacy.updated": "Last updated 6 September 2026",
+  "privacy.updated": "Last updated 8 September 2026",
   "privacy.intro": "This notice describes what Snoopios does with personal data today. Every sentence describes code that exists. A solicitor reviews it before launch; until then it is a draft that is nonetheless true.",
   "privacy.s1.h": "Who we are",
   "privacy.s1.p": "Snoopios is a product of Archema Labs, a company in the United Kingdom and the controller for the data described here. Archema Labs is registered with the Information Commissioner's Office.",
   "privacy.s2.h": "Accounts",
   "privacy.s2.p": "When you create an account we hold your email address, the name you give, and a password hash kept by our authentication provider. We use them to sign you in, to send the emails the product needs (confirmation, a check that starts failing, a document access decision), and for nothing else. There is no marketing list.",
   "privacy.s3.h": "Projects and connections",
-  "privacy.s3.p": "The tokens you connect are encrypted before they reach our database with a key that is not stored there, are used only to read configuration from the provider, and are deleted the moment you remove the connection. Each check stores the raw response it read as evidence, kept for the number of months your plan states and then deleted by a nightly job. Documents you attach to a control as your own evidence are stored in a private bucket for your organisation, reviewed by a fixed checklist and never by a model, kept for the life of the account, and included in your export. Evidence can contain identifiers from your own systems; it is never shared with anyone but the members of your organisation. If you confirm a statement about your organisation on a control, we record your name, the time and the words you confirmed, and show them to the members of your organisation. If you ask for written feedback on a document you attached, its text and the review lines are sent once to an AI language model provider, which returns the suggestions; nothing is sent unless you ask, and the feature stays switched off until that provider's agreement, retention and region are recorded in this notice.",
+  "privacy.s3.p": "The tokens you connect are encrypted (AES-256-GCM) before they reach our database with a key that is held only in the application's runtime environment, are used only to read configuration from the provider, are never written to logs or error messages, and are deleted the moment you remove the connection. Everything travels over TLS; the database and file storage are encrypted at rest; every table is protected by row-level security so one organisation can never read another's rows; evidence files live in a private bucket and are reachable only through short-lived signed links minted for a signed-in member; and the encryption key is rotated with both the old and new key proved to work before the old one is retired. Each check stores the raw response it read as evidence, kept for the number of months your plan states and then deleted by a nightly job. Documents you attach to a control as your own evidence are stored in a private bucket for your organisation, reviewed by a fixed checklist and never by a model, kept for the life of the account, and included in your export. Evidence can contain identifiers from your own systems; it is never shared with anyone but the members of your organisation. If you confirm a statement about your organisation on a control, we record your name, the time and the words you confirmed, and show them to the members of your organisation. If you ask for written feedback on a document you attached, its text and the review lines are sent once to an AI language model provider, which returns the suggestions; nothing is sent unless you ask, and the feature stays switched off until that provider's agreement, retention and region are recorded in this notice.",
   "privacy.s4.h": "Visitors to a trust page",
   "privacy.s4.p": "If you request documents from a customer's trust page we hold the name, work email and company you give, the time you accepted the confidentiality undertaking, a keyed hash of your IP address for abuse limits, the decision, and a record of each download. The customer whose page it is sees this register; that customer, not Snoopios, decides your request. Requests are kept for 24 months and then deleted.",
   "privacy.s5.h": "Who else is involved",
-  "privacy.s5.p": "Data is held in a Supabase project in London. The application runs on Vercel and is served through Cloudflare, which see the ordinary technical data any web server sees, such as your IP address, to deliver pages and defend against abuse. Email is sent through Resend. No advertising or analytics scripts run anywhere on the site, so there is no consent banner.",
+  "privacy.s5.p": "Data is held in a Supabase project in London (Supabase Inc., under its data processing addendum). The application runs on Vercel and is served through Cloudflare, which see the ordinary technical data any web server sees, such as your IP address, to deliver pages and defend against abuse. Email is sent through Resend. These four are the only organisations that process data for us, and each acts only on our instructions as a processor. We do not sell personal data, do not share it with advertisers or data brokers, and do not disclose it to anyone else unless the law requires it, in which case we tell you where we lawfully can. No advertising or analytics scripts run anywhere on the site, so there is no consent banner.",
+  "privacy.s8.h": "Data from Google Workspace and other connected providers",
+  "privacy.s8.p": "When an administrator connects Google Workspace, Snoopios asks Google for one read-only permission, the user directory, and reads it to answer four questions: is two-step verification enforced and enrolled, how many super-administrators are there, and has any account been unused for ninety days. The fields read are the email address, administrator flags, two-step verification status, suspension state, creation time and last sign-in time. Email addresses are masked before they are shown. This data is used only to compute and display your organisation's own compliance results and the evidence behind them; it is not used for advertising, is not sold, and is not transferred to anyone except the processors named above, which host the service under contract. It is not used to build user profiles, and no artificial intelligence or machine learning model, ours or a third party's, ever receives it: every check is fixed code, and the only model-assisted feature in the product (written feedback on a document you upload yourself) is switched off in production and never reads provider data. Snoopios's use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements. The same rules apply to every other provider you connect. You can revoke Google's grant at any time from your Google Account permissions page or by removing the connection in Snoopios, and the stored refresh token is deleted at that moment.",
   "privacy.s6.h": "Cookies",
   "privacy.s6.p": "The application sets the cookies that keep you signed in and nothing else. The marketing pages set none.",
   "privacy.s7.h": "Your rights",
@@ -3458,6 +4066,7 @@ var COPY = {
   // iOS never fires beforeinstallprompt, so this is real instructions rather
   // than a button that does nothing. See the pwa-offline skill.
   "pwa.ios.hint": "Tap the share button, then Add to Home Screen.",
+  "conn.datadog.site.placeholder": "datadoghq.com, datadoghq.eu, us3.datadoghq.com, us5.datadoghq.com, ap1.datadoghq.com, ap2.datadoghq.com or uk1.datadoghq.com",
   "conn.local.label": "Run on your machine with the CLI",
   "ingest.title": "Run locally and push",
   "ingest.intro": "For the platforms whose tokens Snoopios will not hold, run the checks yourself with the CLI and push the results here with a project key. The key can only post results: it reads nothing and cannot touch connections or tokens. Every result it posts is labelled as run by you, on the check page, in every document and on the trust page.",
@@ -3495,8 +4104,8 @@ async function listRepos(ctx) {
   const max = ctx.maxRepos ?? 30;
   if (ctx.repos && ctx.repos.length) {
     const out = [];
-    for (const name3 of ctx.repos.slice(0, max)) {
-      const r2 = await ctx.api.get(`/repos/${ctx.org}/${name3}`);
+    for (const name4 of ctx.repos.slice(0, max)) {
+      const r2 = await ctx.api.get(`/repos/${ctx.org}/${name4}`);
       if (r2.status === 200) out.push(r2.json);
     }
     return out;
@@ -3689,9 +4298,9 @@ var outsideCollaborators = {
     if (!ctx.api) return unknown("api.not_connected");
     const r = await ctx.api.get(`/orgs/${ctx.org}/outside_collaborators?per_page=100`);
     if (r.status !== 200) return unknown("api.outside_collaborators");
-    const list4 = r.json.map((x) => x.login);
-    const observed = { count: list4.length, logins: list4 };
-    return list4.length === 0 ? pass(observed, r.json) : fail(observed, r.json);
+    const list9 = r.json.map((x) => x.login);
+    const observed = { count: list9.length, logins: list9 };
+    return list9.length === 0 ? pass(observed, r.json) : fail(observed, r.json);
   })
 };
 var GITHUB_CHECKS = [
@@ -3879,8 +4488,8 @@ var turnstileWidgets = {
     if (r.status === 403) return unknown("api.turnstile_forbidden");
     if (r.status !== 200) return unknown("api.turnstile");
     const widgets = r.json.result ?? [];
-    const covered = new Set(widgets.flatMap((w) => w.domains));
-    const uncovered = zones.map((z) => z.name).filter((n) => ![...covered].some((d) => d === n || d.endsWith(`.${n}`)));
+    const covered2 = new Set(widgets.flatMap((w) => w.domains));
+    const uncovered = zones.map((z) => z.name).filter((n) => ![...covered2].some((d) => d === n || d.endsWith(`.${n}`)));
     const observed = { widgets: widgets.length, zonesWithoutWidget: uncovered };
     return widgets.length > 0 && uncovered.length === 0 ? pass(observed, widgets) : fail(observed, widgets);
   })
@@ -3900,19 +4509,19 @@ var pagesCompatDate = {
   severity: "medium",
   maps: ["ce:patching", "iso:8.8", "soc2:CC7.1"],
   run: (ctx) => guarded("api.pages", async () => {
-    const projects4 = await pagesProjects(ctx);
-    if (projects4 === null) return unknown("pages.readonly");
-    if (projects4.length === 0) return unknown("api.no_pages_projects");
+    const projects5 = await pagesProjects(ctx);
+    if (projects5 === null) return unknown("pages.readonly");
+    if (projects5.length === 0) return unknown("api.no_pages_projects");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
     const stale = {};
     const evidence = {};
-    for (const p of projects4) {
+    for (const p of projects5) {
       const date = p.deployment_configs?.production?.compatibility_date ?? null;
       const age = date ? Math.floor((now - new Date(date).getTime()) / 864e5) : null;
       evidence[p.name] = { compatibilityDate: date, ageDays: age };
       if (age === null || age > COMPAT_MAX_DAYS) stale[p.name] = date;
     }
-    const observed = { projects: projects4.length, maxAgeDays: COMPAT_MAX_DAYS, stale };
+    const observed = { projects: projects5.length, maxAgeDays: COMPAT_MAX_DAYS, stale };
     return Object.keys(stale).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -3923,19 +4532,19 @@ var pagesPreviewProtected = {
   severity: "high",
   maps: ["soc2:CC6.1", "soc2:CC8.1", "iso:8.31"],
   run: (ctx) => guarded("api.pages", async () => {
-    const projects4 = await pagesProjects(ctx);
-    if (projects4 === null) return unknown("pages.readonly");
-    if (projects4.length === 0) return unknown("api.no_pages_projects");
+    const projects5 = await pagesProjects(ctx);
+    if (projects5 === null) return unknown("pages.readonly");
+    if (projects5.length === 0) return unknown("api.no_pages_projects");
     const r = await ctx.api.get(`/accounts/${ctx.accountId}/access/apps?per_page=100`);
     const notEnabled = r.status === 403 && /not_enabled/i.test(JSON.stringify(r.json ?? ""));
     if (r.status === 403 && !notEnabled) return unknown("access.readonly");
     if (r.status !== 200 && !notEnabled) throw new Error("scope:api.access");
     const apps3 = notEnabled ? [] : r.json.result ?? [];
     const domains = apps3.flatMap((a) => [a.domain ?? "", ...a.self_hosted_domains ?? []]).map((d) => d.toLowerCase());
-    const covered = (name3) => domains.some((d) => d === `${name3}.pages.dev` || d === `*.${name3}.pages.dev` || d.endsWith(`.${name3}.pages.dev`));
-    const open = projects4.filter((p) => !covered(p.name)).map((p) => p.name);
-    const observed = { projects: projects4.length, accessApplications: apps3.length, unprotected: open };
-    const evidence = { projects: projects4.map((p) => p.name), accessDomains: domains };
+    const covered2 = (name4) => domains.some((d) => d === `${name4}.pages.dev` || d === `*.${name4}.pages.dev` || d.endsWith(`.${name4}.pages.dev`));
+    const open = projects5.filter((p) => !covered2(p.name)).map((p) => p.name);
+    const observed = { projects: projects5.length, accessApplications: apps3.length, unprotected: open };
+    const evidence = { projects: projects5.map((p) => p.name), accessDomains: domains };
     return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -3963,7 +4572,7 @@ var webhooksHealthy = {
     const r = await ctx.api.get("/v1/webhook_endpoints?limit=100");
     if (r.status === 403) return unknown("api.webhooks_forbidden");
     if (r.status !== 200) return unknown("api.webhook_endpoints");
-    const list4 = (r.json.data ?? []).map((e) => ({
+    const list9 = (r.json.data ?? []).map((e) => ({
       id: e.id,
       url: e.url,
       status: e.status,
@@ -3972,16 +4581,16 @@ var webhooksHealthy = {
       events: e.enabled_events?.length ?? 0
     }));
     const problems = {};
-    for (const e of list4) {
+    for (const e of list9) {
       const p = [];
       if (e.status !== "enabled") p.push("disabled");
       if (!e.api_version) p.push("api version not pinned");
       if (!/^https:\/\//.test(e.url) || /localhost|127\.0\.0\.1|ngrok|trycloudflare\.com|\.vercel\.app|\.netlify\.app|\.local(\/|$)/.test(e.url)) p.push("url not production");
       if (p.length) problems[e.id] = p;
     }
-    const observed = { endpoints: list4.length, problems };
-    const ok = list4.length > 0 && Object.keys(problems).length === 0;
-    return ok ? pass(observed, list4) : fail(observed, list4);
+    const observed = { endpoints: list9.length, problems };
+    const ok = list9.length > 0 && Object.keys(problems).length === 0;
+    return ok ? pass(observed, list9) : fail(observed, list9);
   })
 };
 var noFailedDeliveries = {
@@ -4095,10 +4704,10 @@ var projectScrubbing = {
     await organisation(ctx);
     const r = await ctx.api.get(`/organizations/${encodeURIComponent(ctx.org)}/projects/?per_page=100`);
     if (r.status !== 200) throw new Error("scope:api.projects");
-    const list4 = (r.json ?? []).filter((p) => p && p.slug).slice(0, ctx.maxProjects ?? 30);
+    const list9 = (r.json ?? []).filter((p) => p && p.slug).slice(0, ctx.maxProjects ?? 30);
     const weak = [];
     const evidence = {};
-    for (const p of list4) {
+    for (const p of list9) {
       const d = await ctx.api.get(`/projects/${encodeURIComponent(ctx.org)}/${encodeURIComponent(p.slug)}/`);
       if (d.status !== 200) throw new Error("scope:api.project");
       const proj = d.json;
@@ -4107,7 +4716,7 @@ var projectScrubbing = {
       evidence[p.slug] = { dataScrubber: proj.dataScrubber, scrubIPAddresses: proj.scrubIPAddresses, storeCrashReports: proj.storeCrashReports, scrapeJavaScript: proj.scrapeJavaScript };
       if (!scrubbing || crashDumps) weak.push(p.slug);
     }
-    const observed = { projects: list4.length, weak };
+    const observed = { projects: list9.length, weak };
     return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4155,7 +4764,7 @@ async function members(ctx) {
 }
 var handle = (u) => `${(u.name ?? "?").slice(0, 2)}\u2026`;
 var roleOf = (u) => u.is_primary_owner ? "primary owner" : u.is_owner ? "owner" : u.is_admin ? "admin" : u.is_ultra_restricted ? "single-channel guest" : u.is_restricted ? "guest" : "member";
-var evidenceOf = (list4) => list4.map((u) => ({ handle: handle(u), role: roleOf(u), has_2fa: u.has_2fa ?? null }));
+var evidenceOf = (list9) => list9.map((u) => ({ handle: handle(u), role: roleOf(u), has_2fa: u.has_2fa ?? null }));
 var members2fa2 = {
   code: "slack.members.2fa",
   provider: "slack",
@@ -4163,11 +4772,11 @@ var members2fa2 = {
   severity: "high",
   maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await members(ctx);
-    if (list4.length > 0 && list4.every((u) => u.has_2fa == null)) return unknown("api.2fa_hidden", { members: list4.length });
-    const without = list4.filter((u) => u.has_2fa !== true).map((u) => `${roleOf(u)} ${handle(u)}`);
-    const observed = { members: list4.length, without2fa: without };
-    return without.length === 0 ? pass(observed, evidenceOf(list4)) : fail(observed, evidenceOf(list4));
+    const list9 = await members(ctx);
+    if (list9.length > 0 && list9.every((u) => u.has_2fa == null)) return unknown("api.2fa_hidden", { members: list9.length });
+    const without = list9.filter((u) => u.has_2fa !== true).map((u) => `${roleOf(u)} ${handle(u)}`);
+    const observed = { members: list9.length, without2fa: without };
+    return without.length === 0 ? pass(observed, evidenceOf(list9)) : fail(observed, evidenceOf(list9));
   })
 };
 var adminsLimited = {
@@ -4177,10 +4786,10 @@ var adminsLimited = {
   severity: "medium",
   maps: ["iso:8.2", "soc2:CC6.3", "iso:5.18"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await members(ctx);
-    const admins = list4.filter((u) => u.is_admin || u.is_owner || u.is_primary_owner);
-    const ceiling = Math.max(3, Math.ceil(list4.length * 0.25));
-    const observed = { members: list4.length, admins: admins.length, ceiling, holders: admins.map((u) => `${roleOf(u)} ${handle(u)}`) };
+    const list9 = await members(ctx);
+    const admins = list9.filter((u) => u.is_admin || u.is_owner || u.is_primary_owner);
+    const ceiling = Math.max(3, Math.ceil(list9.length * 0.25));
+    const observed = { members: list9.length, admins: admins.length, ceiling, holders: admins.map((u) => `${roleOf(u)} ${handle(u)}`) };
     const ok = admins.length >= 1 && admins.length <= ceiling;
     return ok ? pass(observed, evidenceOf(admins)) : fail(observed, evidenceOf(admins));
   })
@@ -4192,8 +4801,8 @@ var guestsReviewed = {
   severity: "low",
   maps: ["iso:5.18", "soc2:CC6.2"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await members(ctx);
-    const guests = list4.filter((u) => u.is_restricted || u.is_ultra_restricted);
+    const list9 = await members(ctx);
+    const guests = list9.filter((u) => u.is_restricted || u.is_ultra_restricted);
     const observed = { guests: guests.length, logins: guests.map((u) => `${roleOf(u)} ${handle(u)}`) };
     return guests.length === 0 ? pass(observed, evidenceOf(guests)) : fail(observed, evidenceOf(guests));
   })
@@ -4239,7 +4848,7 @@ function maskEmail2(email) {
   return `${local.slice(0, 1)}\u2026@${domain}`;
 }
 var roleOf2 = (u) => u.isAdmin ? "super admin" : u.isDelegatedAdmin ? "delegated admin" : "user";
-var evidenceOf2 = (list4) => list4.map((u) => ({ email: maskEmail2(u.primaryEmail), role: roleOf2(u), enrolled2sv: u.isEnrolledIn2Sv ?? null, enforced2sv: u.isEnforcedIn2Sv ?? null, lastLogin: u.lastLoginTime ?? null }));
+var evidenceOf2 = (list9) => list9.map((u) => ({ email: maskEmail2(u.primaryEmail), role: roleOf2(u), enrolled2sv: u.isEnrolledIn2Sv ?? null, enforced2sv: u.isEnforcedIn2Sv ?? null, lastLogin: u.lastLoginTime ?? null }));
 var twoStepEnforced = {
   code: "google.users.2sv_enforced",
   provider: "google",
@@ -4247,11 +4856,11 @@ var twoStepEnforced = {
   severity: "high",
   maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await users(ctx);
-    if (list4.length === 0) return unknown("api.no_users");
-    const not = list4.filter((u) => u.isEnforcedIn2Sv !== true).map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`);
-    const observed = { users: list4.length, notEnforced: not };
-    return not.length === 0 ? pass(observed, evidenceOf2(list4)) : fail(observed, evidenceOf2(list4));
+    const list9 = await users(ctx);
+    if (list9.length === 0) return unknown("api.no_users");
+    const not = list9.filter((u) => u.isEnforcedIn2Sv !== true).map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`);
+    const observed = { users: list9.length, notEnforced: not };
+    return not.length === 0 ? pass(observed, evidenceOf2(list9)) : fail(observed, evidenceOf2(list9));
   })
 };
 var twoStepEnrolled = {
@@ -4261,11 +4870,11 @@ var twoStepEnrolled = {
   severity: "high",
   maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await users(ctx);
-    if (list4.length === 0) return unknown("api.no_users");
-    const not = list4.filter((u) => u.isEnrolledIn2Sv !== true).map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`);
-    const observed = { users: list4.length, notEnrolled: not };
-    return not.length === 0 ? pass(observed, evidenceOf2(list4)) : fail(observed, evidenceOf2(list4));
+    const list9 = await users(ctx);
+    if (list9.length === 0) return unknown("api.no_users");
+    const not = list9.filter((u) => u.isEnrolledIn2Sv !== true).map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`);
+    const observed = { users: list9.length, notEnrolled: not };
+    return not.length === 0 ? pass(observed, evidenceOf2(list9)) : fail(observed, evidenceOf2(list9));
   })
 };
 var adminsLimited2 = {
@@ -4275,11 +4884,11 @@ var adminsLimited2 = {
   severity: "medium",
   maps: ["iso:8.2", "soc2:CC6.3", "iso:5.18"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await users(ctx);
-    if (list4.length === 0) return unknown("api.no_users");
-    const admins = list4.filter((u) => u.isAdmin);
-    const ceiling = Math.max(3, Math.ceil(list4.length * 0.25));
-    const observed = { users: list4.length, superAdmins: admins.length, ceiling, holders: admins.map((u) => maskEmail2(u.primaryEmail)) };
+    const list9 = await users(ctx);
+    if (list9.length === 0) return unknown("api.no_users");
+    const admins = list9.filter((u) => u.isAdmin);
+    const ceiling = Math.max(3, Math.ceil(list9.length * 0.25));
+    const observed = { users: list9.length, superAdmins: admins.length, ceiling, holders: admins.map((u) => maskEmail2(u.primaryEmail)) };
     const ok = admins.length >= 1 && admins.length <= ceiling;
     return ok ? pass(observed, evidenceOf2(admins)) : fail(observed, evidenceOf2(admins));
   })
@@ -4292,17 +4901,17 @@ var dormantUsers2 = {
   severity: "medium",
   maps: ["iso:5.18", "iso:6.5", "soc2:CC6.3"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await users(ctx);
-    if (list4.length === 0) return unknown("api.no_users");
+    const list9 = await users(ctx);
+    if (list9.length === 0) return unknown("api.no_users");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
     const days = (iso) => iso ? Math.floor((now - new Date(iso).getTime()) / 864e5) : null;
-    const dormant = list4.filter((u) => {
+    const dormant = list9.filter((u) => {
       const last = u.lastLoginTime && !u.lastLoginTime.startsWith("1970") ? days(u.lastLoginTime) : null;
       const age = days(u.creationTime);
       return last === null ? age !== null && age > 30 : last > DORMANT_DAYS2;
     });
-    const observed = { users: list4.length, dormantDays: DORMANT_DAYS2, dormant: dormant.map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`) };
-    return dormant.length === 0 ? pass(observed, evidenceOf2(list4)) : fail(observed, evidenceOf2(dormant));
+    const observed = { users: list9.length, dormantDays: DORMANT_DAYS2, dormant: dormant.map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`) };
+    return dormant.length === 0 ? pass(observed, evidenceOf2(list9)) : fail(observed, evidenceOf2(dormant));
   })
 };
 var GOOGLE_CHECKS = [twoStepEnforced, twoStepEnrolled, adminsLimited2, dormantUsers2];
@@ -4349,12 +4958,12 @@ var mfaRegistered = {
   severity: "high",
   maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
   run: (ctx) => guarded("api.users", async () => {
-    const list4 = await users2(ctx);
-    if (list4.length === 0) return unknown("api.no_users");
-    if (list4.length > MAX_METHOD_LOOKUPS) return unknown("api.too_many_users");
+    const list9 = await users2(ctx);
+    if (list9.length === 0) return unknown("api.no_users");
+    if (list9.length > MAX_METHOD_LOOKUPS) return unknown("api.too_many_users");
     const evidence = [];
     const not = [];
-    for (const u of list4) {
+    for (const u of list9) {
       const r = await ctx.api.get(`/users/${encodeURIComponent(u.id ?? "")}/authentication/methods`);
       if (r.status === 403) throw new Error("scope:auth_methods.readonly");
       if (r.status !== 200) throw new Error("scope:api.auth_methods");
@@ -4362,7 +4971,7 @@ var mfaRegistered = {
       evidence.push({ email: maskEmail3(u.userPrincipalName), methods: methods.map((m) => m.replace("#microsoft.graph.", "")) });
       if (!methods.some((m) => MFA_METHODS.has(m))) not.push(maskEmail3(u.userPrincipalName));
     }
-    const observed = { users: list4.length, notRegistered: not };
+    const observed = { users: list9.length, notRegistered: not };
     return not.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4396,8 +5005,8 @@ var adminsLimited3 = {
   severity: "medium",
   maps: ["iso:8.2", "soc2:CC6.3", "iso:5.18"],
   run: (ctx) => guarded("api.roles", async () => {
-    const list4 = await users2(ctx);
-    if (list4.length === 0) return unknown("api.no_users");
+    const list9 = await users2(ctx);
+    if (list9.length === 0) return unknown("api.no_users");
     const roles = await ctx.api.get(`/directoryRoles?$filter=roleTemplateId eq '${GLOBAL_ADMIN_TEMPLATE}'`);
     if (roles.status === 403) throw new Error("scope:directory.readonly");
     if (roles.status !== 200) throw new Error("scope:api.roles");
@@ -4409,8 +5018,8 @@ var adminsLimited3 = {
       if (m.status !== 200) throw new Error("scope:api.role_members");
       admins = (m.json.value ?? []).filter((x) => (x["@odata.type"] ?? "#microsoft.graph.user") === "#microsoft.graph.user" && x.accountEnabled !== false);
     }
-    const ceiling = Math.max(3, Math.ceil(list4.length * 0.25));
-    const observed = { users: list4.length, globalAdmins: admins.length, ceiling, holders: admins.map((u) => maskEmail3(u.userPrincipalName)) };
+    const ceiling = Math.max(3, Math.ceil(list9.length * 0.25));
+    const observed = { users: list9.length, globalAdmins: admins.length, ceiling, holders: admins.map((u) => maskEmail3(u.userPrincipalName)) };
     const ok = admins.length >= 1 && admins.length <= ceiling;
     const evidence = admins.map((u) => ({ email: maskEmail3(u.userPrincipalName), type: u.userType ?? null }));
     return ok ? pass(observed, evidence) : fail(observed, evidence);
@@ -4424,23 +5033,23 @@ var dormantUsers3 = {
   severity: "medium",
   maps: ["iso:5.18", "iso:6.5", "soc2:CC6.3"],
   run: (ctx) => guarded("api.users", async () => {
-    let list4;
+    let list9;
     try {
-      list4 = await users2(ctx, `${USER_FIELDS},signInActivity`);
+      list9 = await users2(ctx, `${USER_FIELDS},signInActivity`);
     } catch (e) {
       if (e instanceof Error && e.message === "scope:licence.premium") return unknown("licence.premium");
       throw e;
     }
-    if (list4.length === 0) return unknown("api.no_users");
+    if (list9.length === 0) return unknown("api.no_users");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
     const days = (iso) => iso ? Math.floor((now - new Date(iso).getTime()) / 864e5) : null;
-    const dormant = list4.filter((u) => {
+    const dormant = list9.filter((u) => {
       const last = days(u.signInActivity?.lastSuccessfulSignInDateTime ?? u.signInActivity?.lastSignInDateTime);
       const age = days(u.createdDateTime);
       return last === null ? age !== null && age > 30 : last > DORMANT_DAYS3;
     });
-    const observed = { users: list4.length, dormantDays: DORMANT_DAYS3, dormant: dormant.map((u) => maskEmail3(u.userPrincipalName)) };
-    const evidence = (dormant.length ? dormant : list4).map((u) => ({ email: maskEmail3(u.userPrincipalName), lastSignIn: u.signInActivity?.lastSuccessfulSignInDateTime ?? u.signInActivity?.lastSignInDateTime ?? null, created: u.createdDateTime ?? null }));
+    const observed = { users: list9.length, dormantDays: DORMANT_DAYS3, dormant: dormant.map((u) => maskEmail3(u.userPrincipalName)) };
+    const evidence = (dormant.length ? dormant : list9).map((u) => ({ email: maskEmail3(u.userPrincipalName), lastSignIn: u.signInActivity?.lastSuccessfulSignInDateTime ?? u.signInActivity?.lastSignInDateTime ?? null, created: u.createdDateTime ?? null }));
     return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4467,11 +5076,11 @@ function hostOf(url) {
     return "";
   }
 }
-function productionMonitors(list4, host) {
+function productionMonitors(list9, host) {
   const h = host.toLowerCase().replace(/^www\./, "");
-  return list4.filter((m) => (m.type === 1 || m.type === 2) && [h, `www.${h}`].includes(hostOf(m.url)));
+  return list9.filter((m) => (m.type === 1 || m.type === 2) && [h, `www.${h}`].includes(hostOf(m.url)));
 }
-var summarise = (list4) => list4.map((m) => ({ name: m.friendly_name ?? null, host: hostOf(m.url), type: m.type ?? null, status: m.status ?? null, interval: m.interval ?? null, alertContacts: (m.alert_contacts ?? []).length }));
+var summarise = (list9) => list9.map((m) => ({ name: m.friendly_name ?? null, host: hostOf(m.url), type: m.type ?? null, status: m.status ?? null, interval: m.interval ?? null, alertContacts: (m.alert_contacts ?? []).length }));
 var productionMonitored = {
   code: "uptimerobot.monitor.production",
   provider: "uptimerobot",
@@ -4480,10 +5089,10 @@ var productionMonitored = {
   maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
   run: (ctx) => guarded("api.monitors", async () => {
     if (!ctx.host) return unknown("connection.host");
-    const list4 = await monitors2(ctx);
-    const prod = productionMonitors(list4, ctx.host).filter((m) => m.status !== PAUSED);
-    const observed = { monitors: list4.length, host: ctx.host, productionMonitors: prod.map((m) => m.friendly_name ?? hostOf(m.url)) };
-    return prod.length > 0 ? pass(observed, summarise(prod)) : fail(observed, summarise(list4));
+    const list9 = await monitors2(ctx);
+    const prod = productionMonitors(list9, ctx.host).filter((m) => m.status !== PAUSED);
+    const observed = { monitors: list9.length, host: ctx.host, productionMonitors: prod.map((m) => m.friendly_name ?? hostOf(m.url)) };
+    return prod.length > 0 ? pass(observed, summarise(prod)) : fail(observed, summarise(list9));
   })
 };
 var alertsConfigured = {
@@ -4493,8 +5102,8 @@ var alertsConfigured = {
   severity: "medium",
   maps: ["soc2:CC7.2", "iso:8.16"],
   run: (ctx) => guarded("api.monitors", async () => {
-    const list4 = await monitors2(ctx);
-    const active2 = list4.filter((m) => m.status !== PAUSED);
+    const list9 = await monitors2(ctx);
+    const active2 = list9.filter((m) => m.status !== PAUSED);
     if (active2.length === 0) return unknown("api.no_monitors");
     const silent = active2.filter((m) => (m.alert_contacts ?? []).length === 0).map((m) => m.friendly_name ?? hostOf(m.url));
     const observed = { monitors: active2.length, withoutAlertContact: silent };
@@ -4510,8 +5119,8 @@ var productionInterval = {
   maps: ["soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.monitors", async () => {
     if (!ctx.host) return unknown("connection.host");
-    const list4 = await monitors2(ctx);
-    const prod = productionMonitors(list4, ctx.host).filter((m) => m.status !== PAUSED);
+    const list9 = await monitors2(ctx);
+    const prod = productionMonitors(list9, ctx.host).filter((m) => m.status !== PAUSED);
     if (prod.length === 0) return unknown("api.no_production_monitor");
     const slow = prod.filter((m) => (m.interval ?? Infinity) > MAX_INTERVAL_SECONDS).map((m) => `${m.friendly_name ?? hostOf(m.url)} (${m.interval}s)`);
     const observed = { productionMonitors: prod.length, maxIntervalSeconds: MAX_INTERVAL_SECONDS, slower: slow };
@@ -4584,11 +5193,11 @@ var branchProtection2 = {
   severity: "high",
   maps: ["soc2:CC8.1", "iso:8.32", "iso:8.25"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list4 = await projects2(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
+    const list9 = await projects2(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
     const unprotected = [];
     const evidence = {};
-    for (const p of list4) {
+    for (const p of list9) {
       const r = await ctx.api.get(`/projects/${p.id}/protected_branches`);
       const rules = r.status === 200 && Array.isArray(r.json) ? r.json : [];
       const branch = p.default_branch ?? "main";
@@ -4597,7 +5206,7 @@ var branchProtection2 = {
       evidence[p.path] = { branch, rule: rule ?? null };
       if (!ok) unprotected.push(p.path);
     }
-    const observed = { projects: list4.length, unprotected };
+    const observed = { projects: list9.length, unprotected };
     return unprotected.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4608,18 +5217,18 @@ var noEnvCommitted2 = {
   severity: "critical",
   maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list4 = await projects2(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
+    const list9 = await projects2(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
     const offenders = {};
     const evidence = {};
-    for (const p of list4) {
+    for (const p of list9) {
       const r = await ctx.api.get(`/projects/${p.id}/repository/tree?ref=${encodeURIComponent(p.default_branch ?? "main")}&per_page=100`);
       const names = r.status === 200 && Array.isArray(r.json) ? r.json.filter((e) => e.type === "blob").map((e) => e.name ?? "") : [];
       const envs = names.filter((n) => /^\.env(\..+)?$/.test(n) && !/\.(example|sample|template)$/.test(n));
       evidence[p.path] = { files: names.length, envFiles: envs };
       if (envs.length) offenders[p.path] = envs;
     }
-    const observed = { projects: list4.length, offenders };
+    const observed = { projects: list9.length, offenders };
     return Object.keys(offenders).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4630,11 +5239,11 @@ var hygiene2 = {
   severity: "medium",
   maps: ["iso:5.37", "soc2:CC2.3", "iso:8.24"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list4 = await projects2(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
+    const list9 = await projects2(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
     const missing = {};
     const evidence = {};
-    for (const p of list4) {
+    for (const p of list9) {
       const gaps = [];
       const gi = await file(ctx, p, ".gitignore");
       const ignoresEnv = gi !== null && (/^\s*\.env(\*|\.\*|\.local|$)/m.test(gi) || /^\s*\*\.env/m.test(gi));
@@ -4652,7 +5261,7 @@ var hygiene2 = {
       evidence[p.path] = { ignoresEnv, securityMd: sec !== null, codeowners };
       if (gaps.length) missing[p.path] = gaps;
     }
-    const observed = { projects: list4.length, missing };
+    const observed = { projects: list9.length, missing };
     return Object.keys(missing).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4663,17 +5272,17 @@ var secretDetection = {
   severity: "high",
   maps: ["soc2:CC6.1", "iso:8.24"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list4 = await projects2(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
+    const list9 = await projects2(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
     const without = [];
     const evidence = {};
-    for (const p of list4) {
+    for (const p of list9) {
       const ci = await file(ctx, p, ".gitlab-ci.yml");
       const on = ci !== null && /Security\/Secret-Detection\.gitlab-ci\.yml|Jobs\/Secret-Detection\.gitlab-ci\.yml|components\/secret-detection/i.test(ci);
       evidence[p.path] = { hasPipeline: ci !== null, secretDetection: on };
       if (!on) without.push(p.path);
     }
-    const observed = { projects: list4.length, withoutSecretDetection: without };
+    const observed = { projects: list9.length, withoutSecretDetection: without };
     return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4684,12 +5293,12 @@ var visibility = {
   severity: "medium",
   maps: ["soc2:CC6.1", "iso:5.10"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list4 = await projects2(ctx);
-    if (list4.length === 0) return unknown("api.no_projects");
+    const list9 = await projects2(ctx);
+    if (list9.length === 0) return unknown("api.no_projects");
     const open = (ctx.openSource ?? []).map((s) => s.toLowerCase());
-    const exposed = list4.filter((p) => p.visibility === "public" && !open.includes(p.path.toLowerCase())).map((p) => p.path);
-    const observed = { projects: list4.length, publicUndeclared: exposed, declaredOpenSource: open };
-    const evidence = list4.map((p) => ({ path: p.path, visibility: p.visibility ?? null }));
+    const exposed = list9.filter((p) => p.visibility === "public" && !open.includes(p.path.toLowerCase())).map((p) => p.path);
+    const observed = { projects: list9.length, publicUndeclared: exposed, declaredOpenSource: open };
+    const evidence = list9.map((p) => ({ path: p.path, visibility: p.visibility ?? null }));
     return exposed.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4723,12 +5332,12 @@ var GITLAB_CHECKS = [group2fa, branchProtection2, noEnvCommitted2, hygiene2, sec
 async function apps2(ctx) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const max = ctx.maxApps ?? 30;
-  if (ctx.apps?.length) return ctx.apps.slice(0, max).map((name3) => ({ name: name3 }));
+  if (ctx.apps?.length) return ctx.apps.slice(0, max).map((name4) => ({ name: name4 }));
   const r = await ctx.api.get(`/apps?org_slug=${encodeURIComponent(ctx.org)}`);
   if (r.status === 403) throw new Error("scope:apps.read");
   if (r.status !== 200) throw new Error("scope:api.apps");
-  const list4 = r.json?.apps ?? [];
-  return list4.filter((a) => a && a.name).slice(0, max);
+  const list9 = r.json?.apps ?? [];
+  return list9.filter((a) => a && a.name).slice(0, max);
 }
 async function machines(ctx, app) {
   const r = await ctx.api.get(`/apps/${encodeURIComponent(app)}/machines`);
@@ -4744,11 +5353,11 @@ var forceHttps2 = {
   severity: "high",
   maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
   run: (ctx) => guarded("api.machines", async () => {
-    const list4 = await apps2(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
+    const list9 = await apps2(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
     const open = {};
     const evidence = {};
-    for (const a of list4) {
+    for (const a of list9) {
       const ms = await machines(ctx, a.name);
       const offenders = [];
       for (const m of ms) {
@@ -4762,7 +5371,7 @@ var forceHttps2 = {
       evidence[a.name] = { machines: ms.length, plainHttpPorts: offenders };
       if (offenders.length) open[a.name] = offenders;
     }
-    const observed = { apps: list4.length, plainHttp: open };
+    const observed = { apps: list9.length, plainHttp: open };
     return Object.keys(open).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4773,12 +5382,12 @@ var volumesEncrypted = {
   severity: "high",
   maps: ["soc2:CC6.7", "iso:8.24", "gdpr:art32"],
   run: (ctx) => guarded("api.volumes", async () => {
-    const list4 = await apps2(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
+    const list9 = await apps2(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
     const plain = {};
     const evidence = {};
     let total = 0;
-    for (const a of list4) {
+    for (const a of list9) {
       const r = await ctx.api.get(`/apps/${encodeURIComponent(a.name)}/volumes`);
       if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.volumes");
       const vols = r.json;
@@ -4787,7 +5396,7 @@ var volumesEncrypted = {
       evidence[a.name] = vols.map((v) => ({ name: v.name ?? v.id, encrypted: v.encrypted ?? null, sizeGb: v.size_gb ?? null }));
       if (bad.length) plain[a.name] = bad;
     }
-    const observed = { apps: list4.length, volumes: total, unencrypted: plain };
+    const observed = { apps: list9.length, volumes: total, unencrypted: plain };
     return Object.keys(plain).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4798,18 +5407,18 @@ var noPlaintextSecrets = {
   severity: "high",
   maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("api.machines", async () => {
-    const list4 = await apps2(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
+    const list9 = await apps2(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
     const leaks = {};
     const evidence = {};
-    for (const a of list4) {
+    for (const a of list9) {
       const ms = await machines(ctx, a.name);
       const keys = /* @__PURE__ */ new Set();
       for (const m of ms) for (const k of Object.keys(m.config?.env ?? {})) if (SECRET_KEY3.test(k) && !PUBLIC_KEY2.test(k)) keys.add(k);
       evidence[a.name] = { machines: ms.length, secretLikeEnvKeys: [...keys] };
       if (keys.size) leaks[a.name] = [...keys];
     }
-    const observed = { apps: list4.length, plaintext: leaks };
+    const observed = { apps: list9.length, plaintext: leaks };
     return Object.keys(leaks).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4829,10 +5438,10 @@ var members2fa3 = {
     if (r.status !== 200 || !body?.data?.organization || body.errors?.length) return unknown("api.members");
     const edges = body.data.organization.members?.edges ?? [];
     if (edges.length === 0) return unknown("api.no_members");
-    const mask = (e) => e && e.includes("@") ? `${e[0]}\u2026@${e.split("@")[1]}` : "?";
-    const without = edges.filter((e) => e.node?.twoFactorProtection !== true).map((e) => `${e.role ?? "member"} ${mask(e.node?.email)}`);
+    const mask5 = (e) => e && e.includes("@") ? `${e[0]}\u2026@${e.split("@")[1]}` : "?";
+    const without = edges.filter((e) => e.node?.twoFactorProtection !== true).map((e) => `${e.role ?? "member"} ${mask5(e.node?.email)}`);
     const observed = { members: edges.length, without2fa: without };
-    const evidence = edges.map((e) => ({ role: e.role ?? null, email: mask(e.node?.email), twoFactor: e.node?.twoFactorProtection ?? null }));
+    const evidence = edges.map((e) => ({ role: e.role ?? null, email: mask5(e.node?.email), twoFactor: e.node?.twoFactorProtection ?? null }));
     return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4843,12 +5452,12 @@ var certificates = {
   severity: "medium",
   maps: ["soc2:CC6.7", "iso:8.24"],
   run: (ctx) => guarded("api.graphql", async () => {
-    const list4 = await apps2(ctx);
-    if (list4.length === 0) return unknown("api.no_apps");
+    const list9 = await apps2(ctx);
+    if (list9.length === 0) return unknown("api.no_apps");
     const pending = {};
     const evidence = {};
     let hostnames = 0;
-    for (const a of list4) {
+    for (const a of list9) {
       const r = await ctx.api.graphql("query SnoopiosCerts($name: String!) { app(name: $name) { certificates { nodes { hostname clientStatus } } } }", { name: a.name });
       const body = r.json;
       if (r.status !== 200 || !body?.data?.app || body.errors?.length) return unknown("api.certificates");
@@ -4858,7 +5467,7 @@ var certificates = {
       evidence[a.name] = certs;
       if (bad.length) pending[a.name] = bad;
     }
-    const observed = { apps: list4.length, hostnames, notReady: pending };
+    const observed = { apps: list9.length, hostnames, notReady: pending };
     return Object.keys(pending).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -4868,8 +5477,8 @@ var FLY_CHECKS = [forceHttps2, volumesEncrypted, noPlaintextSecrets, members2fa3
 async function projects3(ctx) {
   const r = await ctx.api.get("/v9/projects?limit=100");
   if (r.status !== 200) throw new Error("scope:projects.list");
-  const list4 = (r.json?.projects ?? []).filter((p) => p && p.id);
-  return { list: list4, raw: r.json };
+  const list9 = (r.json?.projects ?? []).filter((p) => p && p.id);
+  return { list: list9, raw: r.json };
 }
 var SUPPORTED_NODE = /* @__PURE__ */ new Set(["22.x", "24.x"]);
 var previewProtection = {
@@ -4879,10 +5488,10 @@ var previewProtection = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.3", "iso:8.31"],
   run: (ctx) => guarded("projects.list", async () => {
-    const { list: list4, raw } = await projects3(ctx);
-    const unprotected = list4.filter((p) => !p.ssoProtection && !p.passwordProtection).map((p) => p.name);
-    const observed = { projects: list4.length, unprotected };
-    return list4.length > 0 && unprotected.length === 0 ? pass(observed, raw) : fail(observed, raw);
+    const { list: list9, raw } = await projects3(ctx);
+    const unprotected = list9.filter((p) => !p.ssoProtection && !p.passwordProtection).map((p) => p.name);
+    const observed = { projects: list9.length, unprotected };
+    return list9.length > 0 && unprotected.length === 0 ? pass(observed, raw) : fail(observed, raw);
   })
 };
 var forkProtection = {
@@ -4892,8 +5501,8 @@ var forkProtection = {
   severity: "medium",
   maps: ["soc2:CC8.1", "iso:8.32", "iso:8.25"],
   run: (ctx) => guarded("projects.list", async () => {
-    const { list: list4, raw } = await projects3(ctx);
-    const linked = list4.filter((p) => p.link?.type);
+    const { list: list9, raw } = await projects3(ctx);
+    const linked = list9.filter((p) => p.link?.type);
     const unprotected = linked.filter((p) => p.gitForkProtection !== true).map((p) => p.name);
     const observed = { gitLinked: linked.length, unprotected };
     return unprotected.length === 0 ? pass(observed, raw) : fail(observed, raw);
@@ -4906,24 +5515,24 @@ var nodeSupported = {
   severity: "medium",
   maps: ["ce:patching", "iso:8.8", "soc2:CC7.1"],
   run: (ctx) => guarded("projects.list", async () => {
-    const { list: list4, raw } = await projects3(ctx);
-    const outdated = list4.filter((p) => p.nodeVersion && !SUPPORTED_NODE.has(p.nodeVersion)).map((p) => `${p.name} (${p.nodeVersion})`);
-    const observed = { projects: list4.length, supported: [...SUPPORTED_NODE], outdated };
+    const { list: list9, raw } = await projects3(ctx);
+    const outdated = list9.filter((p) => p.nodeVersion && !SUPPORTED_NODE.has(p.nodeVersion)).map((p) => `${p.name} (${p.nodeVersion})`);
+    const observed = { projects: list9.length, supported: [...SUPPORTED_NODE], outdated };
     return outdated.length === 0 ? pass(observed, raw) : fail(observed, raw);
   })
 };
-var domainsVerified = {
+var domainsVerified2 = {
   code: "vercel.domains.verified",
   provider: "vercel",
   version: 1,
   severity: "medium",
   maps: ["iso:8.9", "soc2:CC6.7"],
   run: (ctx) => guarded("projects.domains", async () => {
-    const { list: list4 } = await projects3(ctx);
+    const { list: list9 } = await projects3(ctx);
     const unverified = [];
     let total = 0;
     const evidence = {};
-    for (const p of list4.slice(0, 50)) {
+    for (const p of list9.slice(0, 50)) {
       const r = await ctx.api.get(`/v9/projects/${encodeURIComponent(p.id)}/domains`);
       if (r.status !== 200) throw new Error("scope:projects.domains");
       const domains = r.json?.domains ?? [];
@@ -4947,15 +5556,15 @@ var noRecentErrors = {
     const since = Date.now() - 30 * 864e5;
     const r = await ctx.api.get(`/v6/deployments?limit=100&state=ERROR&target=production&since=${since}`);
     if (r.status !== 200) throw new Error("scope:deployments.list");
-    const list4 = r.json?.deployments ?? [];
-    const observed = { failedProductionDeployments30d: list4.length, projects: [...new Set(list4.map((d) => d.name ?? "?"))].slice(0, 10) };
-    return list4.length === 0 ? pass(observed, r.json) : fail(observed, r.json);
+    const list9 = r.json?.deployments ?? [];
+    const observed = { failedProductionDeployments30d: list9.length, projects: [...new Set(list9.map((d) => d.name ?? "?"))].slice(0, 10) };
+    return list9.length === 0 ? pass(observed, r.json) : fail(observed, r.json);
   })
 };
-var VERCEL_CHECKS = [previewProtection, forkProtection, nodeSupported, domainsVerified, noRecentErrors];
+var VERCEL_CHECKS = [previewProtection, forkProtection, nodeSupported, domainsVerified2, noRecentErrors];
 
 // ../lib/checks/providers/atlas.ts
-async function list(ctx, resource, scope) {
+async function list3(ctx, resource, scope) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const r = await ctx.api.get(`/groups/${encodeURIComponent(ctx.projectId)}/${resource}?itemsPerPage=500`);
   if (r.status === 403) throw new Error(`scope:${scope}.read`);
@@ -4971,7 +5580,7 @@ var ipAccessList = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
   run: (ctx) => guarded("api.access_list", async () => {
-    const entries2 = await list(ctx, "accessList", "access_list");
+    const entries2 = await list3(ctx, "accessList", "access_list");
     const open = entries2.filter((e) => e.cidrBlock === "0.0.0.0/0" || e.cidrBlock === "::/0").map((e) => e.cidrBlock ?? "");
     const observed = { entries: entries2.length, openToInternet: open };
     const evidence = entries2.map((e) => ({ cidr: e.cidrBlock ?? e.ipAddress ?? null, comment: e.comment ?? null }));
@@ -4986,7 +5595,7 @@ var backupsEnabled = {
   severity: "high",
   maps: ["soc2:A1.2", "iso:8.13", "gdpr:art32"],
   run: (ctx) => guarded("api.clusters", async () => {
-    const clusters = await list(ctx, "clusters", "clusters");
+    const clusters = await list3(ctx, "clusters", "clusters");
     if (clusters.length === 0) return unknown("api.no_clusters");
     const off = clusters.filter((c) => c.backupEnabled !== true).map((c) => c.name);
     const observed = { clusters: clusters.length, withoutBackups: off };
@@ -5001,7 +5610,7 @@ var versionSupported = {
   severity: "high",
   maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
   run: (ctx) => guarded("api.clusters", async () => {
-    const clusters = await list(ctx, "clusters", "clusters");
+    const clusters = await list3(ctx, "clusters", "clusters");
     if (clusters.length === 0) return unknown("api.no_clusters");
     const old = clusters.filter((c) => !SUPPORTED_MAJOR.has(c.mongoDBMajorVersion ?? "")).map((c) => `${c.name} (${c.mongoDBMajorVersion ?? "unknown"})`);
     const observed = { clusters: clusters.length, unsupportedVersion: old, supported: [...SUPPORTED_MAJOR] };
@@ -5016,7 +5625,7 @@ var terminationProtection = {
   severity: "medium",
   maps: ["soc2:A1.2", "soc2:CC6.1", "iso:8.13"],
   run: (ctx) => guarded("api.clusters", async () => {
-    const clusters = await list(ctx, "clusters", "clusters");
+    const clusters = await list3(ctx, "clusters", "clusters");
     if (clusters.length === 0) return unknown("api.no_clusters");
     const off = clusters.filter((c) => c.terminationProtectionEnabled !== true).map((c) => c.name);
     const observed = { clusters: clusters.length, deletable: off };
@@ -5031,7 +5640,7 @@ var leastPrivilegeUsers = {
   severity: "high",
   maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
   run: (ctx) => guarded("api.database_users", async () => {
-    const users3 = await list(ctx, "databaseUsers", "database_users");
+    const users3 = await list3(ctx, "databaseUsers", "database_users");
     if (users3.length === 0) return unknown("api.no_database_users");
     const admins = users3.filter((u) => (u.roles ?? []).some((r) => ADMIN_ROLES.has(r.roleName ?? ""))).map((u) => u.username ?? "?");
     const observed = { users: users3.length, withAdminRole: admins };
@@ -5042,7 +5651,7 @@ var leastPrivilegeUsers = {
 var ATLAS_CHECKS = [ipAccessList, backupsEnabled, versionSupported, terminationProtection, leastPrivilegeUsers];
 
 // ../lib/checks/providers/digitalocean.ts
-async function get(ctx, path, key, scope) {
+async function get2(ctx, path, key, scope) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const r = await ctx.api.get(path);
   if (r.status === 403) throw new Error(`scope:${scope}.read`);
@@ -5058,18 +5667,18 @@ var dropletFirewall = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
   run: (ctx) => guarded("api.droplets", async () => {
-    const droplets = publicDroplets(await get(ctx, "/droplets?per_page=200", "droplets", "droplets"));
+    const droplets = publicDroplets(await get2(ctx, "/droplets?per_page=200", "droplets", "droplets"));
     if (droplets.length === 0) return unknown("api.no_public_droplets");
-    const firewalls = await get(ctx, "/firewalls?per_page=200", "firewalls", "firewalls");
-    const covered = /* @__PURE__ */ new Set();
+    const firewalls = await get2(ctx, "/firewalls?per_page=200", "firewalls", "firewalls");
+    const covered2 = /* @__PURE__ */ new Set();
     const taggedFirewalls = /* @__PURE__ */ new Set();
     for (const f of firewalls) {
-      for (const id of f.droplet_ids ?? []) covered.add(id);
+      for (const id of f.droplet_ids ?? []) covered2.add(id);
       for (const t of f.tags ?? []) taggedFirewalls.add(t);
     }
-    const bare = droplets.filter((d) => !covered.has(d.id) && !(d.tags ?? []).some((t) => taggedFirewalls.has(t))).map((d) => d.name);
+    const bare = droplets.filter((d) => !covered2.has(d.id) && !(d.tags ?? []).some((t) => taggedFirewalls.has(t))).map((d) => d.name);
     const observed = { publicDroplets: droplets.length, firewalls: firewalls.length, withoutFirewall: bare };
-    const evidence = droplets.map((d) => ({ name: d.name, covered: covered.has(d.id) || (d.tags ?? []).some((t) => taggedFirewalls.has(t)) }));
+    const evidence = droplets.map((d) => ({ name: d.name, covered: covered2.has(d.id) || (d.tags ?? []).some((t) => taggedFirewalls.has(t)) }));
     return bare.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -5080,7 +5689,7 @@ var dropletBackups = {
   severity: "medium",
   maps: ["soc2:A1.2", "iso:8.13"],
   run: (ctx) => guarded("api.droplets", async () => {
-    const droplets = (await get(ctx, "/droplets?per_page=200", "droplets", "droplets")).filter((d) => d.status === "active");
+    const droplets = (await get2(ctx, "/droplets?per_page=200", "droplets", "droplets")).filter((d) => d.status === "active");
     if (droplets.length === 0) return unknown("api.no_droplets");
     const off = droplets.filter((d) => !(d.features ?? []).includes("backups")).map((d) => d.name);
     const observed = { droplets: droplets.length, withoutBackups: off };
@@ -5095,12 +5704,12 @@ var databaseTrustedSources = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
   run: (ctx) => guarded("api.databases", async () => {
-    const dbs = await get(ctx, "/databases", "databases", "databases");
+    const dbs = await get2(ctx, "/databases", "databases", "databases");
     if (dbs.length === 0) return unknown("api.no_databases");
     const open = [];
     const evidence = {};
     for (const db of dbs) {
-      const rules = await get(ctx, `/databases/${encodeURIComponent(db.id)}/firewall`, "rules", "database_firewall");
+      const rules = await get2(ctx, `/databases/${encodeURIComponent(db.id)}/firewall`, "rules", "database_firewall");
       evidence[db.name] = rules.map((r) => ({ type: r.type ?? null, value: r.type === "ip_addr" ? r.value ?? null : "\u2026" }));
       if (rules.length === 0) open.push(db.name);
     }
@@ -5115,7 +5724,7 @@ var databaseVersionSupported = {
   severity: "high",
   maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
   run: (ctx) => guarded("api.databases", async () => {
-    const dbs = await get(ctx, "/databases", "databases", "databases");
+    const dbs = await get2(ctx, "/databases", "databases", "databases");
     if (dbs.length === 0) return unknown("api.no_databases");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
     const eol = dbs.filter((db) => db.version_end_of_life && Date.parse(db.version_end_of_life) < now).map((db) => `${db.name} (${db.engine ?? "?"} ${db.version ?? "?"})`);
@@ -5127,7 +5736,7 @@ var databaseVersionSupported = {
 var DIGITALOCEAN_CHECKS = [dropletFirewall, dropletBackups, databaseTrustedSources, databaseVersionSupported];
 
 // ../lib/checks/providers/auth0.ts
-async function get2(ctx, path, scope) {
+async function get3(ctx, path, scope) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const r = await ctx.api.get(path);
   if (r.status === 403) throw new Error(`scope:scope.${scope}`);
@@ -5135,11 +5744,11 @@ async function get2(ctx, path, scope) {
   return r.json;
 }
 var PER_PAGE = 100;
-var MAX_PAGES2 = 5;
+var MAX_PAGES3 = 5;
 async function clients(ctx) {
   const out = [];
-  for (let page = 0; page < MAX_PAGES2; page++) {
-    const batch = await get2(ctx, `/clients?page=${page}&per_page=${PER_PAGE}&is_global=false&fields=client_id,name,app_type,callbacks,allowed_logout_urls,web_origins,grant_types,refresh_token`, "clients");
+  for (let page = 0; page < MAX_PAGES3; page++) {
+    const batch = await get3(ctx, `/clients?page=${page}&per_page=${PER_PAGE}&is_global=false&fields=client_id,name,app_type,callbacks,allowed_logout_urls,web_origins,grant_types,refresh_token`, "clients");
     if (!Array.isArray(batch)) throw new Error("scope:api.clients");
     out.push(...batch);
     if (batch.length < PER_PAGE) break;
@@ -5165,9 +5774,9 @@ var attackProtection = {
   maps: ["soc2:CC6.1", "soc2:CC6.6", "iso:8.5", "ce:user-access"],
   run: (ctx) => guarded("api.attack_protection", async () => {
     const [brute, breached, throttle] = await Promise.all([
-      get2(ctx, "/attack-protection/brute-force-protection", "attack_protection"),
-      get2(ctx, "/attack-protection/breached-password-detection", "attack_protection"),
-      get2(ctx, "/attack-protection/suspicious-ip-throttling", "attack_protection")
+      get3(ctx, "/attack-protection/brute-force-protection", "attack_protection"),
+      get3(ctx, "/attack-protection/breached-password-detection", "attack_protection"),
+      get3(ctx, "/attack-protection/suspicious-ip-throttling", "attack_protection")
     ]);
     const observed = { bruteForceProtection: brute.enabled === true, breachedPasswordDetection: breached.enabled === true, suspiciousIpThrottling: throttle.enabled === true };
     const off = Object.entries(observed).filter(([, v]) => !v).map(([k]) => k);
@@ -5181,8 +5790,8 @@ var mfaEnforced2 = {
   severity: "high",
   maps: ["soc2:CC6.1", "iso:5.17", "iso:8.5", "ce:user-access"],
   run: (ctx) => guarded("api.mfa", async () => {
-    const policies = await get2(ctx, "/guardian/policies", "mfa_policies");
-    const factors = await get2(ctx, "/guardian/factors", "guardian_factors");
+    const policies = await get3(ctx, "/guardian/policies", "mfa_policies");
+    const factors = await get3(ctx, "/guardian/factors", "guardian_factors");
     const enabledFactors = (Array.isArray(factors) ? factors : []).filter((f) => f.enabled === true).map((f) => f.name ?? "?");
     const enforced = Array.isArray(policies) && policies.some((p) => p === "all-applications" || p === "confidence-score");
     const observed = { policies: Array.isArray(policies) ? policies : [], enforced, enabledFactors };
@@ -5228,7 +5837,7 @@ var sessionLifetime = {
   severity: "medium",
   maps: ["soc2:CC6.1", "iso:8.5"],
   run: (ctx) => guarded("api.tenant_settings", async () => {
-    const t = await get2(ctx, "/tenants/settings?fields=session_lifetime,idle_session_lifetime", "tenant_settings");
+    const t = await get3(ctx, "/tenants/settings?fields=session_lifetime,idle_session_lifetime", "tenant_settings");
     const session = typeof t.session_lifetime === "number" ? t.session_lifetime : 168;
     const idle = typeof t.idle_session_lifetime === "number" ? t.idle_session_lifetime : 72;
     const observed = { sessionLifetimeHours: session, idleSessionLifetimeHours: idle, maxSessionHours: MAX_SESSION_HOURS, maxIdleHours: MAX_IDLE_HOURS };
@@ -5243,7 +5852,7 @@ var passwordPolicy = {
   severity: "medium",
   maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access"],
   run: (ctx) => guarded("api.connections", async () => {
-    const conns = await get2(ctx, "/connections?strategy=auth0&per_page=100&fields=id,name,strategy,options", "connections");
+    const conns = await get3(ctx, "/connections?strategy=auth0&per_page=100&fields=id,name,strategy,options", "connections");
     const db = (Array.isArray(conns) ? conns : []).filter((c) => c.strategy === "auth0");
     if (db.length === 0) return unknown("api.no_database_connections");
     if (db.every((c) => !c.options || !("passwordPolicy" in c.options))) return unknown("scope.connections_options", { connections: db.length });
@@ -5257,12 +5866,12 @@ var AUTH0_CHECKS = [attackProtection, mfaEnforced2, callbacksHttps, refreshToken
 
 // ../lib/checks/providers/bitbucket.ts
 var PAGELEN = 100;
-var MAX_PAGES3 = 10;
+var MAX_PAGES4 = 10;
 var MAX_REPOS = 50;
-async function list2(ctx, path, scope) {
+async function list4(ctx, path, scope) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const out = [];
-  for (let page = 1; page <= MAX_PAGES3; page++) {
+  for (let page = 1; page <= MAX_PAGES4; page++) {
     const r = await ctx.api.get(`${path}${path.includes("?") ? "&" : "?"}pagelen=${PAGELEN}&page=${page}`);
     if (r.status === 403) throw new Error(`scope:scope.${scope}`);
     if (r.status !== 200) throw new Error(`scope:api.${scope}`);
@@ -5273,7 +5882,7 @@ async function list2(ctx, path, scope) {
   return out;
 }
 async function repos(ctx) {
-  const all = await list2(ctx, `/repositories/${encodeURIComponent(ctx.workspace)}`, "repositories");
+  const all = await list4(ctx, `/repositories/${encodeURIComponent(ctx.workspace)}`, "repositories");
   return all.slice(0, MAX_REPOS);
 }
 var repoPath = (ctx, r) => `/repositories/${encodeURIComponent(ctx.workspace)}/${encodeURIComponent(r.slug ?? "")}`;
@@ -5320,7 +5929,7 @@ var defaultReviewers = {
     const without = [];
     const evidence = [];
     for (const r of all) {
-      const reviewers = await list2(ctx, `${repoPath(ctx, r)}/effective-default-reviewers`, "pullrequest");
+      const reviewers = await list4(ctx, `${repoPath(ctx, r)}/effective-default-reviewers`, "pullrequest");
       evidence.push({ name: name(r), reviewers: reviewers.length });
       if (reviewers.length === 0) without.push(name(r));
     }
@@ -5344,7 +5953,7 @@ var deployKeysRecent = {
     const stale = [];
     const evidence = [];
     for (const r of all) {
-      const keys = await list2(ctx, `${repoPath(ctx, r)}/deploy-keys`, "ssh_key");
+      const keys = await list4(ctx, `${repoPath(ctx, r)}/deploy-keys`, "ssh_key");
       for (const k of keys) {
         const used = k.last_used ? Date.parse(k.last_used) : NaN;
         const added = k.added_on ? Date.parse(k.added_on) : NaN;
@@ -5375,7 +5984,7 @@ var pipelineSecrets = {
       const probe = await ctx.api.get(`${repoPath(ctx, r)}/pipelines_config/variables?pagelen=1`);
       if (probe.status === 404) continue;
       if (probe.status === 403) throw new Error("scope:scope.pipeline");
-      const vars = await list2(ctx, `${repoPath(ctx, r)}/pipelines_config/variables`, "pipeline");
+      const vars = await list4(ctx, `${repoPath(ctx, r)}/pipelines_config/variables`, "pipeline");
       for (const v of vars) {
         const key = v.key ?? "?";
         if (!SECRET_NAME.test(key)) continue;
@@ -5409,11 +6018,11 @@ var BITBUCKET_CHECKS = [reposPrivate, forkPolicy, defaultReviewers, deployKeysRe
 
 // ../lib/checks/providers/hetzner.ts
 var PER_PAGE2 = 50;
-var MAX_PAGES4 = 10;
-async function list3(ctx, resource) {
+var MAX_PAGES5 = 10;
+async function list5(ctx, resource) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const out = [];
-  for (let page = 1; page <= MAX_PAGES4; page++) {
+  for (let page = 1; page <= MAX_PAGES5; page++) {
     const r = await ctx.api.get(`/${resource}?per_page=${PER_PAGE2}&page=${page}`);
     if (r.status === 403) throw new Error(`scope:scope.${resource}`);
     if (r.status !== 200) throw new Error(`scope:api.${resource}`);
@@ -5435,7 +6044,7 @@ var serverFirewall = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
   run: (ctx) => guarded("api.servers", async () => {
-    const servers = (await list3(ctx, "servers")).filter(live).filter(isPublic2);
+    const servers = (await list5(ctx, "servers")).filter(live).filter(isPublic2);
     if (servers.length === 0) return unknown("api.no_public_servers");
     const bare = servers.filter((s) => !(s.public_net?.firewalls ?? []).some((f) => f.status === "applied")).map(name2);
     const observed = { publicServers: servers.length, withoutFirewall: bare };
@@ -5450,7 +6059,7 @@ var serverBackups = {
   severity: "medium",
   maps: ["soc2:A1.2", "iso:8.13", "gdpr:art32"],
   run: (ctx) => guarded("api.servers", async () => {
-    const servers = (await list3(ctx, "servers")).filter(live);
+    const servers = (await list5(ctx, "servers")).filter(live);
     if (servers.length === 0) return unknown("api.no_servers");
     const off = servers.filter((s) => !s.backup_window).map(name2);
     const observed = { servers: servers.length, withoutBackups: off };
@@ -5465,7 +6074,7 @@ var deleteProtection = {
   severity: "medium",
   maps: ["soc2:A1.2", "soc2:CC6.1", "iso:8.13"],
   run: (ctx) => guarded("api.servers", async () => {
-    const servers = (await list3(ctx, "servers")).filter(live);
+    const servers = (await list5(ctx, "servers")).filter(live);
     if (servers.length === 0) return unknown("api.no_servers");
     const off = servers.filter((s) => s.protection?.delete !== true).map(name2);
     const observed = { servers: servers.length, deletable: off };
@@ -5490,7 +6099,7 @@ var adminPortsRestricted = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls", "ce:secure-config"],
   run: (ctx) => guarded("api.firewalls", async () => {
-    const firewalls = (await list3(ctx, "firewalls")).filter((f) => (f.applied_to ?? []).length > 0);
+    const firewalls = (await list5(ctx, "firewalls")).filter((f) => (f.applied_to ?? []).length > 0);
     if (firewalls.length === 0) return unknown("api.no_applied_firewalls");
     const open = [];
     const evidence = firewalls.map((f) => {
@@ -5510,7 +6119,7 @@ var loadBalancerHttps = {
   severity: "medium",
   maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("api.load_balancers", async () => {
-    const lbs = (await list3(ctx, "load_balancers")).filter((lb) => lb.public_net?.enabled !== false);
+    const lbs = (await list5(ctx, "load_balancers")).filter((lb) => lb.public_net?.enabled !== false);
     if (lbs.length === 0) return unknown("api.no_public_load_balancers");
     const weak = lbs.filter((lb) => {
       const services2 = lb.services ?? [];
@@ -5524,6 +6133,659 @@ var loadBalancerHttps = {
   })
 };
 var HETZNER_CHECKS = [serverFirewall, serverBackups, deleteProtection, adminPortsRestricted, loadBalancerHttps];
+
+// ../lib/checks/providers/azure.ts
+var ROLE_OWNER = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635";
+var MAX_PAGES6 = 10;
+async function list6(api4, path, scope) {
+  const out = [];
+  let next = path;
+  for (let i = 0; i < MAX_PAGES6 && next; i++) {
+    const r = await api4.get(next);
+    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
+    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
+    const body = r.json;
+    out.push(...body?.value ?? []);
+    next = body?.nextLink;
+  }
+  return out;
+}
+var roleTail = (id) => (id ?? "").split("/").pop()?.toLowerCase() ?? "";
+var sub = (ctx) => `/subscriptions/${encodeURIComponent(ctx.subscriptionId)}`;
+function api(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  return ctx.api;
+}
+var name3 = (r) => r.name ?? r.id ?? "?";
+var storageLockedDown = {
+  code: "azure.storage.locked_down",
+  provider: "azure",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "soc2:CC6.7", "iso:8.20", "iso:8.24", "ce:secure-config"],
+  run: (ctx) => guarded("api.storage", async () => {
+    const accounts = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Storage/storageAccounts?api-version=2023-05-01`, "storage");
+    if (accounts.length === 0) return unknown("api.no_storage_accounts");
+    const weak = accounts.filter((a) => a.properties?.allowBlobPublicAccess === true || a.properties?.supportsHttpsTrafficOnly !== true || (a.properties?.minimumTlsVersion ?? "TLS1_0") < "TLS1_2").map(name3);
+    const observed = { storageAccounts: accounts.length, weak };
+    const evidence = accounts.map((a) => ({ name: name3(a), blobPublicAccess: a.properties?.allowBlobPublicAccess ?? null, httpsOnly: a.properties?.supportsHttpsTrafficOnly ?? null, minimumTls: a.properties?.minimumTlsVersion ?? null, publicNetworkAccess: a.properties?.publicNetworkAccess ?? null }));
+    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var ADMIN_PORTS2 = [22, 3389, 5900, 2375, 2376, 1433, 3306, 5432, 6379, 27017, 9200, 11211];
+var ANYWHERE2 = /* @__PURE__ */ new Set(["*", "internet", "0.0.0.0/0", "::/0", "any"]);
+function portsCovered(range) {
+  if (!range) return [];
+  if (range.trim() === "*") return [...ADMIN_PORTS2];
+  const m = /^(\d+)(?:-(\d+))?$/.exec(range.trim());
+  if (!m) return [];
+  const lo = Number(m[1]);
+  const hi = m[2] ? Number(m[2]) : lo;
+  return ADMIN_PORTS2.filter((p) => p >= lo && p <= hi);
+}
+var nsgAdminPorts = {
+  code: "azure.nsg.admin_ports_restricted",
+  provider: "azure",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls", "ce:secure-config"],
+  run: (ctx) => guarded("api.network", async () => {
+    const groups = (await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Network/networkSecurityGroups?api-version=2024-01-01`, "network")).filter(
+      (g) => (g.properties?.subnets ?? []).length + (g.properties?.networkInterfaces ?? []).length > 0
+    );
+    if (groups.length === 0) return unknown("api.no_attached_nsgs");
+    const open = [];
+    const evidence = groups.map((g) => {
+      const ports = /* @__PURE__ */ new Set();
+      for (const r of g.properties?.securityRules ?? []) {
+        const p = r.properties ?? {};
+        if (p.access?.toLowerCase() !== "allow" || p.direction?.toLowerCase() !== "inbound") continue;
+        const sources = [p.sourceAddressPrefix, ...p.sourceAddressPrefixes ?? []].filter((s) => Boolean(s)).map((s) => s.toLowerCase());
+        if (!sources.some((s) => ANYWHERE2.has(s))) continue;
+        for (const range of [p.destinationPortRange, ...p.destinationPortRanges ?? []]) for (const port of portsCovered(range)) ports.add(port);
+      }
+      const sorted = [...ports].sort((a, b) => a - b);
+      if (sorted.length) open.push(`${name3(g)}: ${sorted.join(", ")}`);
+      return { name: name3(g), rules: (g.properties?.securityRules ?? []).length, adminPortsOpenToInternet: sorted };
+    });
+    const observed = { networkSecurityGroups: groups.length, adminPortsOpen: open };
+    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var sqlHardened = {
+  code: "azure.sql.hardened",
+  provider: "azure",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.6", "soc2:CC7.2", "iso:8.15", "iso:8.20", "iso:8.24"],
+  run: (ctx) => guarded("api.sql", async () => {
+    const servers = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Sql/servers?api-version=2021-11-01`, "sql");
+    if (servers.length === 0) return unknown("api.no_sql_servers");
+    const weak = [];
+    const evidence = [];
+    for (const s of servers) {
+      const base2 = s.id ?? "";
+      const audit = await api(ctx).get(`${base2}/auditingSettings/default?api-version=2021-11-01`);
+      const auditState = audit.status === 200 ? audit.json?.properties?.state ?? null : null;
+      const rules = await list6(api(ctx), `${base2}/firewallRules?api-version=2021-11-01`, "sql");
+      const openToInternet = rules.some((r) => r.properties?.startIpAddress === "0.0.0.0" && r.properties?.endIpAddress === "255.255.255.255");
+      const tls = s.properties?.minimalTlsVersion ?? null;
+      const ok = auditState === "Enabled" && tls === "1.2" && !openToInternet;
+      evidence.push({ name: name3(s), minimalTls: tls, auditing: auditState, openToInternet });
+      if (!ok) weak.push(name3(s));
+    }
+    const observed = { sqlServers: servers.length, weak };
+    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var keyVaultProtected = {
+  code: "azure.keyvault.protected",
+  provider: "azure",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:A1.2", "soc2:CC6.1", "iso:8.13", "iso:8.24"],
+  run: (ctx) => guarded("api.keyvault", async () => {
+    const vaults = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01`, "keyvault");
+    if (vaults.length === 0) return unknown("api.no_key_vaults");
+    const weak = vaults.filter((v) => v.properties?.enableSoftDelete === false || v.properties?.enablePurgeProtection !== true).map(name3);
+    const observed = { keyVaults: vaults.length, withoutDeleteProtection: weak };
+    const evidence = vaults.map((v) => ({ name: name3(v), softDelete: v.properties?.enableSoftDelete ?? null, purgeProtection: v.properties?.enablePurgeProtection ?? null, rbac: v.properties?.enableRbacAuthorization ?? null }));
+    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var appServiceHttps = {
+  code: "azure.appservice.https_only",
+  provider: "azure",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
+  run: (ctx) => guarded("api.web", async () => {
+    const sites2 = (await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Web/sites?api-version=2022-09-01`, "web")).filter((s) => (s.properties?.state ?? "Running") === "Running");
+    if (sites2.length === 0) return unknown("api.no_web_apps");
+    const weak = [];
+    const evidence = [];
+    for (const s of sites2) {
+      const cfg = await api(ctx).get(`${s.id ?? ""}/config/web?api-version=2022-09-01`);
+      const props = cfg.status === 200 ? cfg.json?.properties ?? {} : {};
+      const minTls = props.minTlsVersion ?? null;
+      const ftps = props.ftpsState ?? null;
+      const ok = s.properties?.httpsOnly === true && minTls !== null && minTls >= "1.2" && ftps !== "AllAllowed";
+      evidence.push({ name: name3(s), httpsOnly: s.properties?.httpsOnly ?? null, minTls, ftps });
+      if (!ok) weak.push(name3(s));
+    }
+    const observed = { webApps: sites2.length, weak };
+    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var MAX_OWNERS2 = 3;
+var ownersLimited2 = {
+  code: "azure.rbac.owners_limited",
+  provider: "azure",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
+  run: (ctx) => guarded("api.rbac", async () => {
+    const all = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()`, "rbac");
+    const owners = all.filter((a) => roleTail(a.properties?.roleDefinitionId) === ROLE_OWNER);
+    const observed = { assignmentsAtScope: all.length, owners: owners.length, max: MAX_OWNERS2 };
+    const evidence = owners.map((a) => ({ principalType: a.properties?.principalType ?? null, scope: a.properties?.scope ?? null }));
+    return owners.length > 0 && owners.length <= MAX_OWNERS2 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var AZURE_CHECKS = [storageLockedDown, nsgAdminPorts, sqlHardened, keyVaultProtected, appServiceHttps, ownersLimited2];
+
+// ../lib/checks/providers/pagerduty.ts
+var LIMIT3 = 100;
+var MAX_PAGES7 = 5;
+async function list7(ctx, path, key, scope) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const out = [];
+  for (let page = 0; page < MAX_PAGES7; page++) {
+    const sep = path.includes("?") ? "&" : "?";
+    const r = await ctx.api.get(`${path}${sep}limit=${LIMIT3}&offset=${page * LIMIT3}`);
+    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
+    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
+    const body = r.json;
+    const items = body?.[key];
+    if (!Array.isArray(items)) throw new Error(`scope:api.${scope}`);
+    out.push(...items);
+    if (!body.more) break;
+  }
+  return out;
+}
+var WEEK_MS = 7 * 24 * 3600 * 1e3;
+var DAY_MS = 24 * 3600 * 1e3;
+function covered(shifts, from, to) {
+  const sorted = shifts.filter((s) => s.end > from && s.start < to).sort((a, b) => a.start - b.start);
+  let cursor = from;
+  for (const s of sorted) {
+    if (s.start > cursor) return false;
+    cursor = Math.max(cursor, s.end);
+    if (cursor >= to) return true;
+  }
+  return cursor >= to;
+}
+var oncallCovered = {
+  code: "pagerduty.oncall.covered",
+  provider: "pagerduty",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC7.3", "soc2:CC7.4", "soc2:A1.1", "iso:5.24", "iso:5.26"],
+  run: (ctx) => guarded("api.oncalls", async () => {
+    const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
+    if (policies.length === 0) return unknown("api.no_escalation_policies");
+    const from = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    const to = from + WEEK_MS;
+    const oncalls = await list7(ctx, `/oncalls?since=${encodeURIComponent(new Date(from).toISOString())}&until=${encodeURIComponent(new Date(to).toISOString())}&earliest=true`, "oncalls", "oncalls");
+    const gaps = [];
+    const evidence = policies.map((p) => {
+      const shifts = oncalls.filter((o) => o.escalation_policy?.id === p.id && (o.escalation_level ?? 1) === 1).map((o) => ({ start: o.start ? Date.parse(o.start) : from, end: o.end ? Date.parse(o.end) : to }));
+      const ok = covered(shifts, from, to);
+      if (!ok) gaps.push(p.name ?? p.id);
+      return { policy: p.name ?? p.id, levelOneShifts: shifts.length, coveredNextSevenDays: ok };
+    });
+    const observed = { escalationPolicies: policies.length, withGapsNextSevenDays: gaps };
+    return gaps.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var servicesEscalate = {
+  code: "pagerduty.services.escalation_wired",
+  provider: "pagerduty",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.3", "soc2:A1.1", "iso:5.24"],
+  run: (ctx) => guarded("api.services", async () => {
+    const services2 = (await list7(ctx, "/services", "services", "services")).filter((s) => s.status !== "disabled");
+    if (services2.length === 0) return unknown("api.no_services");
+    const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
+    const byId = new Map(policies.map((p) => [p.id, p]));
+    const silent = services2.filter((s) => {
+      const p = s.escalation_policy?.id ? byId.get(s.escalation_policy.id) : void 0;
+      return !p || !(p.escalation_rules ?? []).some((r) => (r.targets ?? []).length > 0);
+    }).map((s) => s.name ?? s.id);
+    const observed = { services: services2.length, withoutEscalationTargets: silent };
+    const evidence = services2.map((s) => ({ service: s.name ?? s.id, status: s.status ?? null, escalationPolicy: s.escalation_policy?.summary ?? null }));
+    return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var escalationHasBackup = {
+  code: "pagerduty.escalation.backup_level",
+  provider: "pagerduty",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.4", "soc2:A1.1", "iso:5.26"],
+  run: (ctx) => guarded("api.escalation_policies", async () => {
+    const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
+    if (policies.length === 0) return unknown("api.no_escalation_policies");
+    const single = policies.filter((p) => (p.escalation_rules ?? []).length < 2 && (p.num_loops ?? 0) < 1).map((p) => p.name ?? p.id);
+    const observed = { escalationPolicies: policies.length, singleLevelNoRepeat: single };
+    const evidence = policies.map((p) => ({ policy: p.name ?? p.id, levels: (p.escalation_rules ?? []).length, repeats: p.num_loops ?? 0 }));
+    return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var noStaleIncidents = {
+  code: "pagerduty.incidents.none_stale",
+  provider: "pagerduty",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.4", "soc2:CC7.5", "iso:5.26"],
+  run: (ctx) => guarded("api.incidents", async () => {
+    const open = await list7(ctx, "/incidents?statuses[]=triggered&statuses[]=acknowledged&date_range=all", "incidents", "incidents");
+    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    const stale = open.filter((i) => i.created_at && now - Date.parse(i.created_at) > DAY_MS).map((i) => `${i.title ?? i.id} (${i.status ?? "?"})`);
+    const observed = { openIncidents: open.length, olderThanADay: stale };
+    const evidence = open.map((i) => ({ incident: i.title ?? i.id, status: i.status ?? null, urgency: i.urgency ?? null, createdAt: i.created_at ?? null }));
+    return stale.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var PAGERDUTY_CHECKS = [oncallCovered, servicesEscalate, escalationHasBackup, noStaleIncidents];
+
+// ../lib/checks/providers/datadog.ts
+function api2(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  return ctx.api;
+}
+var PAGE = 1e3;
+async function monitors3(ctx) {
+  const out = [];
+  for (let page = 0; page < 5; page++) {
+    const r = await api2(ctx).get(`/api/v1/monitor?page=${page}&page_size=${PAGE}`);
+    if (r.status === 403) throw new Error("scope:scope.monitors_read");
+    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.monitors");
+    out.push(...r.json);
+    if (r.json.length < PAGE) break;
+  }
+  return out;
+}
+var NOTIFY = /@[a-z0-9][\w.@+-]*/i;
+var label3 = (m) => m.name ?? String(m.id ?? "?");
+var monitorsNotify = {
+  code: "datadog.monitors.notify_someone",
+  provider: "datadog",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC7.2", "soc2:A1.1", "iso:8.16"],
+  run: (ctx) => guarded("api.monitors", async () => {
+    const all = await monitors3(ctx);
+    const silent = all.filter((m) => !NOTIFY.test(m.message ?? "")).map(label3);
+    const observed = { monitors: all.length, withoutNotification: silent };
+    const evidence = all.map((m) => ({ monitor: label3(m), type: m.type ?? null, state: m.overall_state ?? null, notifies: NOTIFY.test(m.message ?? "") }));
+    return all.length > 0 && silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var monitorsNotMuted = {
+  code: "datadog.monitors.none_muted_forever",
+  provider: "datadog",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.2", "iso:8.16"],
+  run: (ctx) => guarded("api.monitors", async () => {
+    const all = await monitors3(ctx);
+    if (all.length === 0) return unknown("api.no_monitors");
+    const muted = all.filter((m) => Object.values(m.options?.silenced ?? {}).some((expiry) => expiry === null)).map(label3);
+    const observed = { monitors: all.length, mutedIndefinitely: muted };
+    const evidence = all.filter((m) => m.options?.silenced && Object.keys(m.options.silenced).length > 0).map((m) => ({ monitor: label3(m), silenced: m.options?.silenced ?? null }));
+    return muted.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var noDataNoticed = {
+  code: "datadog.monitors.no_data_alerts",
+  provider: "datadog",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:CC7.2", "iso:8.16"],
+  run: (ctx) => guarded("api.monitors", async () => {
+    const metric = (await monitors3(ctx)).filter((m) => m.type === "metric alert" || m.type === "query alert" || m.type === "service check");
+    if (metric.length === 0) return unknown("api.no_metric_monitors");
+    const quiet = metric.filter((m) => m.options?.notify_no_data !== true && !(m.options?.on_missing_data ?? "").includes("notify")).map(label3);
+    const observed = { metricMonitors: metric.length, silentOnMissingData: quiet };
+    const evidence = metric.map((m) => ({ monitor: label3(m), notifyNoData: m.options?.notify_no_data ?? null, onMissingData: m.options?.on_missing_data ?? null }));
+    return quiet.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+function mask2(email) {
+  if (!email) return "?";
+  const [local, domain] = email.split("@");
+  return domain ? `${local.slice(0, 1)}\u2026@${domain}` : `${local.slice(0, 1)}\u2026`;
+}
+var usersMfa = {
+  code: "datadog.users.mfa",
+  provider: "datadog",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access"],
+  run: (ctx) => guarded("api.users", async () => {
+    const users3 = [];
+    for (let page = 0; page < 10; page++) {
+      const r = await api2(ctx).get(`/api/v2/users?filter[status]=Active&page[size]=100&page[number]=${page}`);
+      if (r.status === 403) throw new Error("scope:scope.user_access_read");
+      if (r.status !== 200) throw new Error("scope:api.users");
+      const data = r.json?.data ?? [];
+      users3.push(...data);
+      if (data.length < 100) break;
+    }
+    const people = users3.filter((u) => u.attributes?.service_account !== true && u.attributes?.disabled !== true);
+    if (people.length === 0) return unknown("api.no_users");
+    const without = people.filter((u) => u.attributes?.mfa_enabled !== true).map((u) => mask2(u.attributes?.email));
+    const observed = { users: people.length, withoutMfa: without };
+    const evidence = people.map((u) => ({ user: mask2(u.attributes?.email), mfa: u.attributes?.mfa_enabled ?? null, lastLogin: u.attributes?.last_login_time ?? null }));
+    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var MIN_RETENTION_DAYS = 15;
+var logRetention = {
+  code: "datadog.logs.retention",
+  provider: "datadog",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.2", "iso:8.15", "gdpr:art32"],
+  run: (ctx) => guarded("api.logs", async () => {
+    const r = await api2(ctx).get("/api/v1/logs/config/indexes");
+    if (r.status === 403) throw new Error("scope:scope.logs_read_config");
+    if (r.status !== 200) throw new Error("scope:api.logs");
+    const indexes = r.json?.indexes ?? [];
+    if (indexes.length === 0) return unknown("api.no_log_indexes");
+    const short = indexes.filter((i) => (i.num_retention_days ?? 0) < MIN_RETENTION_DAYS).map((i) => `${i.name ?? "?"} (${i.num_retention_days ?? 0}d)`);
+    const observed = { indexes: indexes.length, minimumDays: MIN_RETENTION_DAYS, belowMinimum: short };
+    const evidence = indexes.map((i) => ({ index: i.name ?? null, retentionDays: i.num_retention_days ?? null }));
+    return short.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var DATADOG_CHECKS = [monitorsNotify, monitorsNotMuted, noDataNoticed, usersMfa, logRetention];
+
+// ../lib/checks/providers/okta.ts
+var MAX_PAGES8 = 5;
+async function list8(api4, path, scope) {
+  const out = [];
+  let next = path;
+  for (let i = 0; i < MAX_PAGES8 && next; i++) {
+    const r = await api4.get(next);
+    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
+    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error(`scope:api.${scope}`);
+    out.push(...r.json);
+    next = r.next;
+  }
+  return out;
+}
+var USER_CAP2 = 200;
+var DORMANT_DAYS4 = 90;
+var NEW_DAYS3 = 30;
+var MAX_SUPER_ADMINS = 3;
+var DAY3 = 24 * 3600 * 1e3;
+function mask3(login) {
+  if (!login) return "?";
+  const [local, domain] = login.split("@");
+  return domain ? `${local.slice(0, 1)}\u2026@${domain}` : `${local.slice(0, 1)}\u2026`;
+}
+async function activeUsers(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const users3 = await list8(ctx.api, `/users?filter=${encodeURIComponent('status eq "ACTIVE"')}&limit=200`, "users");
+  return users3.length > USER_CAP2 ? null : users3;
+}
+async function signOnRules(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  const policies = await list8(ctx.api, "/policies?type=OKTA_SIGN_ON", "policies");
+  const out = [];
+  for (const p of policies.filter((p2) => p2.status === "ACTIVE")) {
+    const rules = await list8(ctx.api, `/policies/${encodeURIComponent(p.id)}/rules`, "policies");
+    out.push({ policy: p.name ?? p.id, rules: rules.filter((r) => r.status !== "INACTIVE") });
+  }
+  return out;
+}
+var mfaEnforced3 = {
+  code: "okta.signon.mfa_required",
+  provider: "okta",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "iso:5.17", "iso:8.5", "ce:user-access"],
+  run: (ctx) => guarded("api.policies", async () => {
+    const policies = await signOnRules(ctx);
+    if (policies.length === 0) return unknown("api.no_signon_policies");
+    const lax = policies.flatMap((p) => p.rules.filter((r) => r.actions?.signon?.access === "ALLOW" && r.actions?.signon?.requireFactor !== true).map(() => p.policy));
+    const observed = { policies: policies.length, rulesAllowingWithoutFactor: lax };
+    const evidence = policies.map((p) => ({ policy: p.policy, rules: p.rules.map((r) => ({ access: r.actions?.signon?.access ?? null, requireFactor: r.actions?.signon?.requireFactor ?? null })) }));
+    return lax.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var mfaEnrolled = {
+  code: "okta.users.mfa_enrolled",
+  provider: "okta",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access"],
+  run: (ctx) => guarded("api.factors", async () => {
+    const users3 = await activeUsers(ctx);
+    if (users3 === null) return unknown("api.users.too_many");
+    if (users3.length === 0) return unknown("api.no_active_users");
+    const without = [];
+    const evidence = [];
+    for (const u of users3) {
+      const factors = await list8(ctx.api, `/users/${encodeURIComponent(u.id)}/factors`, "factors");
+      const active2 = factors.filter((f) => f.status === "ACTIVE").map((f) => f.factorType ?? "?");
+      evidence.push({ user: mask3(u.profile?.login), activeFactors: active2 });
+      if (active2.length === 0) without.push(mask3(u.profile?.login));
+    }
+    const observed = { users: users3.length, withoutFactor: without };
+    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var superAdminsLimited = {
+  code: "okta.admins.limited",
+  provider: "okta",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
+  run: (ctx) => guarded("api.roles", async () => {
+    const users3 = await activeUsers(ctx);
+    if (users3 === null) return unknown("api.users.too_many");
+    if (users3.length === 0) return unknown("api.no_active_users");
+    const supers = [];
+    for (const u of users3) {
+      const roles = await list8(ctx.api, `/users/${encodeURIComponent(u.id)}/roles`, "roles");
+      if (roles.some((r) => r.type === "SUPER_ADMIN")) supers.push(mask3(u.profile?.login));
+    }
+    const observed = { users: users3.length, superAdmins: supers.length, max: MAX_SUPER_ADMINS };
+    const evidence = { superAdmins: supers };
+    return supers.length > 0 && supers.length <= MAX_SUPER_ADMINS ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var dormantUsers4 = {
+  code: "okta.users.dormant",
+  provider: "okta",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.2", "soc2:CC6.3", "iso:5.18", "ce:user-access"],
+  run: (ctx) => guarded("api.users", async () => {
+    const users3 = await activeUsers(ctx);
+    if (users3 === null) return unknown("api.users.too_many");
+    if (users3.length === 0) return unknown("api.no_active_users");
+    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    const dormant = users3.filter((u) => {
+      const last = u.lastLogin ? Date.parse(u.lastLogin) : NaN;
+      const created = u.created ? Date.parse(u.created) : NaN;
+      if (Number.isFinite(last)) return now - last > DORMANT_DAYS4 * DAY3;
+      return Number.isFinite(created) ? now - created > NEW_DAYS3 * DAY3 : false;
+    }).map((u) => mask3(u.profile?.login));
+    const observed = { users: users3.length, dormantDays: DORMANT_DAYS4, dormant };
+    const evidence = users3.map((u) => ({ user: mask3(u.profile?.login), lastLogin: u.lastLogin ?? null, created: u.created ?? null }));
+    return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var MAX_IDLE_MINUTES = 24 * 60;
+var MAX_LIFETIME_MINUTES = 30 * 24 * 60;
+var sessionsBounded = {
+  code: "okta.signon.sessions_bounded",
+  provider: "okta",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:8.5"],
+  run: (ctx) => guarded("api.policies", async () => {
+    const policies = await signOnRules(ctx);
+    if (policies.length === 0) return unknown("api.no_signon_policies");
+    const loose = [];
+    const evidence = policies.map((p) => ({
+      policy: p.policy,
+      rules: p.rules.filter((r) => r.actions?.signon?.access === "ALLOW").map((r) => {
+        const s = r.actions?.signon?.session ?? {};
+        const idle = s.maxSessionIdleMinutes ?? null;
+        const life = s.maxSessionLifetimeMinutes ?? null;
+        const ok = idle !== null && idle > 0 && idle <= MAX_IDLE_MINUTES && life !== null && life > 0 && life <= MAX_LIFETIME_MINUTES;
+        if (!ok) loose.push(p.policy);
+        return { idleMinutes: idle, lifetimeMinutes: life };
+      })
+    }));
+    const observed = { policies: policies.length, maxIdleMinutes: MAX_IDLE_MINUTES, maxLifetimeMinutes: MAX_LIFETIME_MINUTES, rulesOutOfBounds: [...new Set(loose)] };
+    return loose.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var OKTA_CHECKS = [mfaEnforced3, mfaEnrolled, superAdminsLimited, dormantUsers4, sessionsBounded];
+
+// ../lib/checks/providers/azuredevops.ts
+var API = "api-version=7.1";
+var MAX_PAGES9 = 5;
+var MAX_REPOS2 = 50;
+function api3(ctx) {
+  if (!ctx.api) throw new Error("scope:api.not_connected");
+  return ctx.api;
+}
+var base = (ctx) => `https://dev.azure.com/${encodeURIComponent(ctx.org)}`;
+async function listValues(ctx, url, scope) {
+  const out = [];
+  let token;
+  for (let i = 0; i < MAX_PAGES9; i++) {
+    const r = await api3(ctx).get(token ? `${url}&continuationToken=${encodeURIComponent(token)}` : url);
+    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
+    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
+    out.push(...r.json?.value ?? []);
+    token = r.continuation;
+    if (!token) break;
+  }
+  return out;
+}
+async function projects4(ctx) {
+  return (await listValues(ctx, `${base(ctx)}/_apis/projects?${API}&$top=100`, "projects")).filter((p) => (p.state ?? "wellFormed") === "wellFormed");
+}
+var projectsPrivate = {
+  code: "azuredevops.projects.private",
+  provider: "azuredevops",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:8.3", "iso:8.4"],
+  run: (ctx) => guarded("api.projects", async () => {
+    const all = await projects4(ctx);
+    if (all.length === 0) return unknown("api.no_projects");
+    const open = all.filter((p) => (p.visibility ?? "private") !== "private").map((p) => p.name);
+    const observed = { projects: all.length, public: open };
+    const evidence = all.map((p) => ({ name: p.name, visibility: p.visibility ?? null }));
+    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var POLICY_MIN_REVIEWERS = "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd";
+var defaultBranchReviewed = {
+  code: "azuredevops.repos.default_branch_reviewed",
+  provider: "azuredevops",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC8.1", "iso:8.25", "iso:8.29", "iso:8.32"],
+  run: (ctx) => guarded("api.policies", async () => {
+    const all = await projects4(ctx);
+    if (all.length === 0) return unknown("api.no_projects");
+    const repos2 = [];
+    for (const p of all) {
+      const rs = await listValues(ctx, `${base(ctx)}/${encodeURIComponent(p.name)}/_apis/git/repositories?${API}`, "repositories");
+      for (const r of rs) if (r.isDisabled !== true && r.defaultBranch) repos2.push({ ...r, projectName: p.name });
+      if (repos2.length >= MAX_REPOS2) break;
+    }
+    if (repos2.length === 0) return unknown("api.no_repositories");
+    const unprotected = [];
+    const evidence = [];
+    for (const r of repos2.slice(0, MAX_REPOS2)) {
+      const policies = await listValues(ctx, `${base(ctx)}/${encodeURIComponent(r.projectName)}/_apis/git/policy/configurations?repositoryId=${encodeURIComponent(r.id)}&refName=${encodeURIComponent(r.defaultBranch)}&${API}`, "policies");
+      const review = policies.find((p) => p.type?.id?.toLowerCase() === POLICY_MIN_REVIEWERS && p.isEnabled === true && p.isDeleted !== true);
+      const count = review?.settings?.minimumApproverCount ?? null;
+      const ok = review !== void 0 && (count ?? 0) >= 1 && review.isBlocking === true && review.settings?.creatorVoteCounts !== true;
+      const label4 = `${r.projectName}/${r.name}`;
+      evidence.push({ repository: label4, defaultBranch: r.defaultBranch, minimumApprovers: count, blocking: review?.isBlocking === true });
+      if (!ok) unprotected.push(label4);
+    }
+    const observed = { repositories: evidence.length, withoutRequiredReview: unprotected };
+    return unprotected.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var pipelinesAsCode = {
+  code: "azuredevops.pipelines.yaml",
+  provider: "azuredevops",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:CC8.1", "iso:8.32"],
+  run: (ctx) => guarded("api.pipelines", async () => {
+    const all = await projects4(ctx);
+    if (all.length === 0) return unknown("api.no_projects");
+    const pipelines = [];
+    for (const p of all) {
+      const ps = await listValues(ctx, `${base(ctx)}/${encodeURIComponent(p.name)}/_apis/pipelines?${API}&$top=100`, "pipelines");
+      for (const x of ps) pipelines.push({ name: `${p.name}/${x.name ?? "?"}`, type: x.configuration?.type ?? "unknown" });
+    }
+    if (pipelines.length === 0) return unknown("api.no_pipelines");
+    const classic = pipelines.filter((x) => x.type !== "yaml").map((x) => x.name);
+    const observed = { pipelines: pipelines.length, notAsCode: classic };
+    return classic.length === 0 ? pass(observed, pipelines) : fail(observed, pipelines);
+  })
+};
+var DORMANT_DAYS5 = 90;
+var NEW_DAYS4 = 30;
+var DAY4 = 24 * 3600 * 1e3;
+function mask4(principal) {
+  if (!principal) return "?";
+  const [local, domain] = principal.split("@");
+  return domain ? `${local.slice(0, 1)}\u2026@${domain}` : `${local.slice(0, 1)}\u2026`;
+}
+var dormantMembers = {
+  code: "azuredevops.members.dormant",
+  provider: "azuredevops",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.2", "soc2:CC6.3", "iso:5.18", "ce:user-access"],
+  run: (ctx) => guarded("api.entitlements", async () => {
+    const url = `https://vsaex.dev.azure.com/${encodeURIComponent(ctx.org)}/_apis/userentitlements?${API}&$top=500`;
+    const r = await api3(ctx).get(url);
+    if (r.status === 403) throw new Error("scope:scope.entitlements");
+    if (r.status !== 200) throw new Error("scope:api.entitlements");
+    const items = (r.json?.items ?? r.json?.members ?? []).filter((e) => (e.accessLevel?.status ?? "active") === "active");
+    if (items.length === 0) return unknown("api.no_members");
+    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    const dormant = items.filter((e) => {
+      const last = e.lastAccessedDate ? Date.parse(e.lastAccessedDate) : NaN;
+      const created = e.dateCreated ? Date.parse(e.dateCreated) : NaN;
+      if (Number.isFinite(last) && last > Date.parse("1990-01-01T00:00:00Z")) return now - last > DORMANT_DAYS5 * DAY4;
+      return Number.isFinite(created) ? now - created > NEW_DAYS4 * DAY4 : false;
+    }).map((e) => mask4(e.user?.principalName));
+    const observed = { members: items.length, dormantDays: DORMANT_DAYS5, dormant };
+    const evidence = items.map((e) => ({ member: mask4(e.user?.principalName), licence: e.accessLevel?.accountLicenseType ?? null, lastAccessed: e.lastAccessedDate ?? null }));
+    return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  })
+};
+var AZUREDEVOPS_CHECKS = [projectsPrivate, defaultBranchReviewed, pipelinesAsCode, dormantMembers];
 
 // ../lib/checks/registry.ts
 function entries(defs) {
@@ -5557,7 +6819,16 @@ var CATALOGUE = [
   ...entries(RAILWAY_CHECKS),
   ...entries(AUTH0_CHECKS),
   ...entries(BITBUCKET_CHECKS),
-  ...entries(HETZNER_CHECKS)
+  ...entries(HETZNER_CHECKS),
+  ...entries(AZURE_CHECKS),
+  ...entries(WORKOS_CHECKS),
+  ...entries(TURSO_CHECKS),
+  ...entries(CHECKLY_CHECKS),
+  ...entries(CIRCLECI_CHECKS),
+  ...entries(AZUREDEVOPS_CHECKS),
+  ...entries(OKTA_CHECKS),
+  ...entries(DATADOG_CHECKS),
+  ...entries(PAGERDUTY_CHECKS)
 ];
 var catalogueByCode = new Map(CATALOGUE.map((c) => [c.code, c]));
 
@@ -5581,18 +6852,38 @@ var LOCAL = {
   clerk: { env: "CLERK_SECRET_KEY", label: "Clerk", run: (t) => runClerkChecks({ api: clerkApi(t) }) },
   upstash: { env: "UPSTASH_API_KEY", extra: "UPSTASH_EMAIL", label: "Upstash", run: (t, email) => runUpstashChecks({ api: upstashApi(email, t) }) },
   betterstack: { env: "BETTERSTACK_API_TOKEN", label: "Better Stack", run: (t) => runBetterStackChecks({ api: betterStackApi(t) }) },
-  railway: { env: "RAILWAY_TOKEN", label: "Railway", run: (t) => runRailwayChecks({ api: railwayApi(t) }) }
+  railway: { env: "RAILWAY_TOKEN", label: "Railway", run: (t) => runRailwayChecks({ api: railwayApi(t) }) },
+  circleci: {
+    env: "CIRCLECI_TOKEN",
+    extra: "CIRCLECI_PROJECT",
+    label: "CircleCI",
+    run: (t, project) => {
+      if (!CIRCLECI_PROJECT.test(project)) throw new Error("CIRCLECI_PROJECT must be a project slug such as gh/acme/api.");
+      return runCircleCiChecks({ project, api: circleCiApi(t) });
+    }
+  },
+  checkly: { env: "CHECKLY_API_KEY", extra: "CHECKLY_ACCOUNT_ID", label: "Checkly", run: (t, account) => runChecklyChecks({ api: checklyApi(t, account) }) },
+  turso: {
+    env: "TURSO_API_TOKEN",
+    extra: "TURSO_ORG",
+    label: "Turso",
+    run: (t, org) => {
+      if (!TURSO_ORG.test(org)) throw new Error("TURSO_ORG must be the organisation slug.");
+      return runTursoChecks({ org, api: tursoApi(t) });
+    }
+  },
+  workos: { env: "WORKOS_API_KEY", label: "WorkOS", run: (t) => runWorkOsChecks({ api: workOsApi(t) }) }
 };
 function text(key) {
   return COPY[key] ?? key;
 }
 function usage() {
   return [
-    `snoopios ${"0.5.0"} \u2014 continuous compliance for small software teams`,
+    `snoopios ${"0.6.0"} \u2014 continuous compliance for small software teams`,
     "",
     "Usage:",
     "  snoopios scan <domain> [--email <resend|postmark|mailgun|ses|other>] [--json]",
-    "  snoopios run <netlify|neon|render|heroku|clerk|upstash|betterstack|railway> [--json] [--push] [--ci]",
+    "  snoopios run <netlify|neon|render|heroku|clerk|upstash|betterstack|railway|circleci|checkly|turso|workos> [--json] [--push] [--ci]",
     "  snoopios doctor <postgres-connection-string> [--json]",
     "  snoopios repo [path] [--json] [--push] [--ci]",
     "",
@@ -5601,7 +6892,9 @@ function usage() {
     "run     a provider whose token cannot be made read-only, so it runs here instead of on",
     "        Snoopios's servers. Reads NETLIFY_AUTH_TOKEN, NEON_API_KEY, RENDER_API_KEY,",
     "        HEROKU_API_KEY, CLERK_SECRET_KEY, UPSTASH_API_KEY with UPSTASH_EMAIL,",
-    "        BETTERSTACK_API_TOKEN or RAILWAY_TOKEN (a project token) from the environment.",
+    "        BETTERSTACK_API_TOKEN, RAILWAY_TOKEN (a project token), CIRCLECI_TOKEN with",
+    "        CIRCLECI_PROJECT (gh/org/repo), CHECKLY_API_KEY with CHECKLY_ACCOUNT_ID,",
+    "        TURSO_API_TOKEN with TURSO_ORG, or WORKOS_API_KEY from the environment.",
     "        The token never leaves this machine.",
     "doctor  the Supabase SQL checks (RLS on every table, no anon writes, private schema",
     "        closed, SECURITY DEFINER search_path, anon-callable definers) against any",
@@ -5649,7 +6942,7 @@ ${heading}
 }
 async function emit(heading, subject, results, json, pushTo) {
   if (json) {
-    console.log(JSON.stringify({ subject, version: "0.5.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
+    console.log(JSON.stringify({ subject, version: "0.6.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
   } else {
     print(heading, rows(results));
   }
@@ -5692,16 +6985,16 @@ async function push(p, results) {
     console.error(key ? "SNOOPIOS_INGEST_KEY is not a Snoopios ingest key (snpi_\u2026). Create one on the project page under Run locally and push." : "SNOOPIOS_INGEST_KEY is not set. Create a key on the project page under Run locally and push, and put it in that environment variable.");
     return false;
   }
-  const base = (process.env.SNOOPIOS_URL ?? "https://snoopios.com").replace(/\/+$/, "");
+  const base2 = (process.env.SNOOPIOS_URL ?? "https://snoopios.com").replace(/\/+$/, "");
   const body = {
     provider: p.provider,
     results: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, evidence: r.result.evidence ?? null, errorScope: r.result.errorScope ?? null })),
     runner: detectRunner(p.ci)
   };
   try {
-    const res = await fetch(`${base}/api/projects/${parsed.projectId}/ingest`, {
+    const res = await fetch(`${base2}/api/projects/${parsed.projectId}/ingest`, {
       method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json", accept: "application/json", connection: "close", "user-agent": `snoopios-cli/${"0.5.0"}` },
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json", accept: "application/json", connection: "close", "user-agent": `snoopios-cli/${"0.6.0"}` },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(3e4)
     });
@@ -5710,7 +7003,7 @@ async function push(p, results) {
       console.error(`Push refused (${res.status}${json?.error ? `, ${json.error}` : ""}). Nothing was stored.`);
       return false;
     }
-    console.error(`Pushed ${json.written} results to ${base}/app/projects/${parsed.projectId} as ${body.runner.kind === "ci" ? "run in CI" : "run by you"}.`);
+    console.error(`Pushed ${json.written} results to ${base2}/app/projects/${parsed.projectId} as ${body.runner.kind === "ci" ? "run in CI" : "run by you"}.`);
     return true;
   } catch (e) {
     console.error(`Push failed: ${e instanceof Error ? e.message : String(e)}. Nothing was stored.`);
@@ -5746,8 +7039,8 @@ async function run(rest) {
 ${usage()}`);
     return 2;
   }
-  const name3 = (positional[0] ?? "").toLowerCase();
-  const p = LOCAL[name3];
+  const name4 = (positional[0] ?? "").toLowerCase();
+  const p = LOCAL[name4];
   if (!p) {
     console.error(`run needs one of ${Object.keys(LOCAL).join(", ")}. Example: snoopios run netlify`);
     return 2;
@@ -5763,7 +7056,7 @@ ${usage()}`);
     return 2;
   }
   const results = await p.run(token, extra);
-  return emit(`snoopios run ${name3}`, name3, results, json, pushFlag ? { provider: name3, ci } : void 0);
+  return emit(`snoopios run ${name4}`, name4, results, json, pushFlag ? { provider: name4, ci } : void 0);
 }
 async function doctor(rest) {
   const { positional, json, push: pushFlag, error } = parse(rest);
@@ -5872,7 +7165,7 @@ async function main(argv) {
     return 0;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log("0.5.0");
+    console.log("0.6.0");
     return 0;
   }
   if (cmd === "scan") return scan(rest);

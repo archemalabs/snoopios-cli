@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 — 8 September 2026
+- `snoopios run circleci` (CIRCLECI_TOKEN and CIRCLECI_PROJECT such as gh/org/repo): builds
+  hidden from the public, settings changed by admins only, forks do not receive secrets.
+- `snoopios run checkly` (CHECKLY_API_KEY and CHECKLY_ACCOUNT_ID): checks present and none
+  muted, every check alerts somebody, certificate expiry alerts on, checks from more than
+  one location.
+- `snoopios run turso` (TURSO_API_TOKEN and TURSO_ORG): delete protection on every database
+  and group, owners held by few.
+- `snoopios run workos` (WORKOS_API_KEY): SSO connections live, directory syncs healthy,
+  customer domains verified, user emails verified.
+
 ## 0.5.0 — 8 September 2026
 - `--push` on `run` and `repo`: posts the results (check, status, observed values,
   evidence) to your Snoopios project with the key in `SNOOPIOS_INGEST_KEY`, created on the

@@ -27,6 +27,9 @@ async function guarded(scope, body) {
     return unknown(err instanceof Error && err.message === "edge.challenge" ? "edge.challenge" : scope);
   }
 }
+function shapeMismatch(items, pick) {
+  return items.length > 0 && items.every((item) => pick(item).every((v) => v === void 0));
+}
 
 // ../lib/checks/http.ts
 var READ_ONLY_POST = [
@@ -959,6 +962,7 @@ var maintenanceOff = {
   run: (ctx) => guarded("api.apps", async () => {
     const list9 = await apps(ctx);
     if (list9.length === 0) return unknown("api.no_apps");
+    if (shapeMismatch(list9, (a) => [a.maintenance])) return unknown("api.shape.maintenance");
     const on = list9.filter((a) => a.maintenance === true).map((a) => a.name);
     const observed = { apps: list9.length, inMaintenance: on };
     return on.length === 0 ? pass(observed, list9.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false }))) : fail(observed, list9.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false })));
@@ -973,6 +977,7 @@ var stackSupported = {
   run: (ctx) => guarded("api.apps", async () => {
     const list9 = await apps(ctx);
     if (list9.length === 0) return unknown("api.no_apps");
+    if (shapeMismatch(list9, (a) => [a.stack])) return unknown("api.shape.stack");
     const old = list9.filter((a) => !SUPPORTED_STACKS.has(a.stack?.name ?? "")).map((a) => `${a.name} (${a.stack?.name ?? "unknown"})`);
     const observed = { apps: list9.length, unsupportedStack: old, supported: [...SUPPORTED_STACKS] };
     const evidence = list9.map((a) => ({ name: a.name, stack: a.stack?.name ?? null, buildStack: a.build_stack?.name ?? null }));
@@ -1074,6 +1079,7 @@ var jwtLifetime = {
     if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.jwt_templates");
     const templates = r.json;
     if (templates.length === 0) return pass({ templates: 0, longLived: [], maxSeconds: MAX_JWT_LIFETIME }, []);
+    if (shapeMismatch(templates, (t) => [t.lifetime])) return unknown("api.shape.lifetime");
     const long = templates.filter((t) => (t.lifetime ?? 0) > MAX_JWT_LIFETIME).map((t) => `${t.name ?? "?"} (${t.lifetime}s)`);
     const observed = { templates: templates.length, longLived: long, maxSeconds: MAX_JWT_LIFETIME };
     const evidence = templates.map((t) => ({ name: t.name ?? null, lifetime: t.lifetime ?? null }));
@@ -1095,6 +1101,7 @@ var dormantUsers = {
     if (r.json.length >= USER_CAP) return unknown("api.users.too_many", { users: r.json.length, cap: USER_CAP });
     if (users3.length === 0) return unknown("api.no_users");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    if (shapeMismatch(users3, (u) => [u.last_active_at, u.last_sign_in_at, u.created_at])) return unknown("api.shape.last_active_at");
     const dormant = users3.filter((u) => {
       const last = u.last_active_at ?? u.last_sign_in_at ?? null;
       if (last) return now - last > DORMANT_DAYS * DAY;
@@ -1158,6 +1165,7 @@ var tlsEverywhere = {
   run: (ctx) => guarded("api.databases", async () => {
     const dbs = await databases(ctx);
     if (dbs.length === 0) return unknown("api.no_databases");
+    if (shapeMismatch(dbs, (d) => [d.tls])) return unknown("api.shape.tls");
     const plain = dbs.filter((d) => d.tls !== true).map((d) => d.database_name ?? d.database_id ?? "?");
     const observed = { databases: dbs.length, withoutTls: plain };
     const evidence = dbs.map((d) => ({ name: d.database_name ?? null, region: d.region ?? null, tls: d.tls ?? null }));
@@ -1175,6 +1183,7 @@ var dailyBackup = {
     if (dbs.length === 0) return unknown("api.no_databases");
     const paid = dbs.filter((d) => (d.type ?? "free") !== "free");
     if (paid.length === 0) return unknown("api.free_only", { databases: dbs.length });
+    if (shapeMismatch(paid, (d) => [d.daily_backup_enabled])) return unknown("api.shape.daily_backup_enabled");
     const off = paid.filter((d) => d.daily_backup_enabled !== true).map((d) => d.database_name ?? d.database_id ?? "?");
     const observed = { databases: dbs.length, paid: paid.length, withoutBackup: off };
     const evidence = paid.map((d) => ({ name: d.database_name ?? null, type: d.type ?? null, dailyBackup: d.daily_backup_enabled ?? null }));
@@ -1190,6 +1199,7 @@ var noneSuspended = {
   run: (ctx) => guarded("api.databases", async () => {
     const dbs = await databases(ctx);
     if (dbs.length === 0) return unknown("api.no_databases");
+    if (shapeMismatch(dbs, (d) => [d.state])) return unknown("api.shape.state");
     const suspended = dbs.filter((d) => d.state === "suspended").map((d) => d.database_name ?? d.database_id ?? "?");
     const observed = { databases: dbs.length, suspended };
     const evidence = dbs.map((d) => ({ name: d.database_name ?? null, state: d.state ?? null }));
@@ -1255,6 +1265,7 @@ var monitorsActive = {
   maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
   run: (ctx) => guarded("api.monitors", async () => {
     const all = await monitors(ctx);
+    if (shapeMismatch(all, (m) => [m.paused_at, m.url])) return unknown("api.shape.paused_at");
     const paused = all.filter((m) => !active(m)).map(label);
     const observed = { monitors: all.length, paused };
     const evidence = all.map((m) => ({ name: label(m), type: m.monitor_type ?? null, status: m.status ?? null, pausedAt: m.paused_at ?? null }));
@@ -1270,6 +1281,7 @@ var sslVerified = {
   run: (ctx) => guarded("api.monitors", async () => {
     const https = (await monitors(ctx)).filter((m) => active(m) && HTTP_TYPES.has(m.monitor_type ?? "") && (m.url ?? "").toLowerCase().startsWith("https://"));
     if (https.length === 0) return unknown("api.no_https_monitors");
+    if (shapeMismatch(https, (m) => [m.verify_ssl, m.ssl_expiration])) return unknown("api.shape.verify_ssl");
     const weak = https.filter((m) => m.verify_ssl !== true || !(typeof m.ssl_expiration === "number" && m.ssl_expiration > 0)).map(label);
     const observed = { httpsMonitors: https.length, withoutSslChecks: weak };
     const evidence = https.map((m) => ({ name: label(m), verifySsl: m.verify_ssl ?? null, sslExpirationDays: m.ssl_expiration ?? null }));
@@ -1285,6 +1297,7 @@ var checkFrequency = {
   run: (ctx) => guarded("api.monitors", async () => {
     const live2 = (await monitors(ctx)).filter(active);
     if (live2.length === 0) return unknown("api.no_active_monitors");
+    if (shapeMismatch(live2, (m) => [m.check_frequency])) return unknown("api.shape.check_frequency");
     const slow = live2.filter((m) => !(typeof m.check_frequency === "number" && m.check_frequency <= MAX_FREQUENCY_SECONDS)).map(label);
     const observed = { monitors: live2.length, slowerThanSeconds: MAX_FREQUENCY_SECONDS, slow };
     const evidence = live2.map((m) => ({ name: label(m), checkFrequencySeconds: m.check_frequency ?? null }));
@@ -1300,6 +1313,7 @@ var alerting = {
   run: (ctx) => guarded("api.monitors", async () => {
     const live2 = (await monitors(ctx)).filter(active);
     if (live2.length === 0) return unknown("api.no_active_monitors");
+    if (shapeMismatch(live2, (m) => [m.policy_id, m.call, m.sms, m.email, m.push])) return unknown("api.shape.policy_id");
     const silent = live2.filter((m) => !(m.policy_id || m.call || m.sms || m.email || m.push)).map(label);
     const observed = { monitors: live2.length, withoutAlerts: silent };
     const evidence = live2.map((m) => ({ name: label(m), policy: Boolean(m.policy_id), call: m.call ?? false, sms: m.sms ?? false, email: m.email ?? false, push: m.push ?? false }));
@@ -1496,6 +1510,7 @@ var buildsPrivate = {
   maps: ["soc2:CC6.1", "iso:8.3"],
   run: (ctx) => guarded("api.settings", async () => {
     const s = await settings(ctx);
+    if (s.oss === void 0) return unknown("api.shape.oss");
     const observed = { project: ctx.project, oss: s.oss ?? null };
     return s.oss === false ? pass(observed, observed) : fail(observed, observed);
   })
@@ -1508,6 +1523,7 @@ var settingsAdminOnly = {
   maps: ["soc2:CC8.1", "iso:8.32"],
   run: (ctx) => guarded("api.settings", async () => {
     const s = await settings(ctx);
+    if (s.write_settings_requires_admin === void 0) return unknown("api.shape.write_settings_requires_admin");
     const observed = { project: ctx.project, writeSettingsRequiresAdmin: s.write_settings_requires_admin ?? null };
     return s.write_settings_requires_admin === true ? pass(observed, observed) : fail(observed, observed);
   })
@@ -1520,6 +1536,7 @@ var forksNoSecrets = {
   maps: ["soc2:CC6.1", "iso:8.12", "iso:8.28"],
   run: (ctx) => guarded("api.settings", async () => {
     const s = await settings(ctx);
+    if (s.forks_receive_secret_env_vars === void 0) return unknown("api.shape.forks_receive_secret_env_vars");
     const observed = { project: ctx.project, buildForkPrs: s.build_fork_prs ?? null, forksReceiveSecrets: s.forks_receive_secret_env_vars ?? null };
     const ok = s.forks_receive_secret_env_vars !== true;
     return ok ? pass(observed, observed) : fail(observed, observed);
@@ -1581,6 +1598,7 @@ var checksActive = {
   maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
   run: (ctx) => guarded("api.checks", async () => {
     const all = await list(ctx, "/v1/checks?applyGroupSettings=true", "checks");
+    if (shapeMismatch(all, (c) => [c.activated, c.muted])) return unknown("api.shape.activated");
     const off = all.filter((c) => c.activated === false || c.muted === true).map(label2);
     const observed = { checks: all.length, deactivatedOrMuted: off };
     const evidence = all.map((c) => ({ check: label2(c), type: c.checkType ?? null, activated: c.activated ?? null, muted: c.muted ?? null }));
@@ -1596,6 +1614,7 @@ var checksAlert = {
   run: (ctx) => guarded("api.checks", async () => {
     const live2 = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
     if (live2.length === 0) return unknown("api.no_active_checks");
+    if (shapeMismatch(live2, (c) => [c.alertChannelSubscriptions])) return unknown("api.shape.alertChannelSubscriptions");
     const silent = live2.filter((c) => !(c.alertChannelSubscriptions ?? []).some((s) => s.activated !== false)).map(label2);
     const observed = { activeChecks: live2.length, withoutAlertChannel: silent };
     const evidence = live2.map((c) => ({ check: label2(c), channels: (c.alertChannelSubscriptions ?? []).filter((s) => s.activated !== false).length }));
@@ -1611,6 +1630,7 @@ var sslExpiryWatched = {
   run: (ctx) => guarded("api.alert_channels", async () => {
     const channels = await list(ctx, "/v1/alert-channels", "alert_channels");
     if (channels.length === 0) return fail({ alertChannels: 0, sslExpiryChannels: [] }, []);
+    if (shapeMismatch(channels, (c) => [c.sslExpiry])) return unknown("api.shape.sslExpiry");
     const ssl = channels.filter((c) => c.sslExpiry === true).map((c) => `${c.type ?? "?"} (${c.sslExpiryThreshold ?? "?"} days)`);
     const observed = { alertChannels: channels.length, sslExpiryChannels: ssl };
     const evidence = channels.map((c) => ({ type: c.type ?? null, sslExpiry: c.sslExpiry ?? null, thresholdDays: c.sslExpiryThreshold ?? null }));
@@ -1626,6 +1646,7 @@ var multiLocation = {
   run: (ctx) => guarded("api.checks", async () => {
     const live2 = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
     if (live2.length === 0) return unknown("api.no_active_checks");
+    if (shapeMismatch(live2, (c) => [c.locations])) return unknown("api.shape.locations");
     const single = live2.filter((c) => (c.locations ?? []).length < 2).map(label2);
     const observed = { activeChecks: live2.length, singleLocation: single };
     const evidence = live2.map((c) => ({ check: label2(c), locations: c.locations ?? [] }));
@@ -1685,6 +1706,7 @@ var databasesProtected = {
   run: (ctx) => guarded("api.databases", async () => {
     const dbs = await get(ctx, "/databases", "databases", "databases");
     if (dbs.length === 0) return unknown("api.no_databases");
+    if (shapeMismatch(dbs, (d) => [d.delete_protection])) return unknown("api.shape.delete_protection");
     const off = dbs.filter((d) => d.delete_protection !== true).map(dbName);
     const observed = { databases: dbs.length, deletable: off };
     const evidence = dbs.map((d) => ({ database: dbName(d), group: d.group ?? null, deleteProtection: d.delete_protection ?? null, blocked: Boolean(d.block_reads || d.block_writes) }));
@@ -1700,6 +1722,7 @@ var groupsProtected = {
   run: (ctx) => guarded("api.groups", async () => {
     const groups = await get(ctx, "/groups", "groups", "groups");
     if (groups.length === 0) return unknown("api.no_groups");
+    if (shapeMismatch(groups, (g) => [g.delete_protection])) return unknown("api.shape.delete_protection");
     const off = groups.filter((g) => g.delete_protection !== true).map((g) => g.name ?? "?");
     const observed = { groups: groups.length, deletable: off };
     const evidence = groups.map((g) => ({ group: g.name ?? null, primary: g.primary ?? null, deleteProtection: g.delete_protection ?? null }));
@@ -1716,6 +1739,7 @@ var ownersLimited = {
   run: (ctx) => guarded("api.members", async () => {
     const members2 = await get(ctx, "/members", "members", "members");
     if (members2.length === 0) return unknown("api.no_members");
+    if (shapeMismatch(members2, (m) => [m.role])) return unknown("api.shape.role");
     const owners = members2.filter((m) => m.role === "owner").length;
     const admins = members2.filter((m) => m.role === "admin").length;
     const observed = { members: members2.length, owners, admins, max: MAX_OWNERS };
@@ -1784,6 +1808,7 @@ var connectionsActive = {
   run: (ctx) => guarded("api.connections", async () => {
     const { items } = await list2(ctx, "/connections", "connections");
     if (items.length === 0) return unknown("api.no_connections");
+    if (shapeMismatch(items, (c) => [c.state])) return unknown("api.shape.state");
     const inactive = items.filter((c) => c.state !== "active").map((c) => `${c.name ?? c.id} (${c.state ?? "?"})`);
     const observed = { connections: items.length, notActive: inactive };
     const evidence = items.map((c) => ({ connection: c.name ?? c.id, type: c.connection_type ?? null, state: c.state ?? null }));
@@ -1799,6 +1824,7 @@ var directoriesLinked = {
   run: (ctx) => guarded("api.directories", async () => {
     const { items } = await list2(ctx, "/directories", "directories");
     if (items.length === 0) return unknown("api.no_directories");
+    if (shapeMismatch(items, (d) => [d.state])) return unknown("api.shape.state");
     const broken = items.filter((d) => d.state !== "linked").map((d) => `${d.name ?? d.id} (${d.state ?? "?"})`);
     const observed = { directories: items.length, notLinked: broken };
     const evidence = items.map((d) => ({ directory: d.name ?? d.id, type: d.type ?? null, state: d.state ?? null }));
@@ -1815,6 +1841,7 @@ var domainsVerified = {
     const { items } = await list2(ctx, "/organizations", "organizations");
     const withDomains = items.filter((o) => (o.domains ?? []).length > 0);
     if (withDomains.length === 0) return unknown("api.no_organization_domains");
+    if (shapeMismatch(withDomains.flatMap((o) => o.domains ?? []), (d) => [d.state])) return unknown("api.shape.domain_state");
     const unverified = withDomains.flatMap((o) => (o.domains ?? []).filter((d) => d.state !== "verified").map((d) => `${o.name ?? o.id}: ${d.domain ?? "?"} (${d.state ?? "?"})`));
     const observed = { organizations: withDomains.length, unverifiedDomains: unverified };
     const evidence = withDomains.map((o) => ({ organization: o.name ?? o.id, domains: (o.domains ?? []).map((d) => ({ domain: d.domain ?? null, state: d.state ?? null })) }));
@@ -1836,6 +1863,7 @@ var usersVerified = {
     const { items, truncated } = await list2(ctx, "/user_management/users", "users");
     if (truncated) return unknown("api.users.too_many");
     if (items.length === 0) return unknown("api.no_users");
+    if (shapeMismatch(items, (u) => [u.email_verified])) return unknown("api.shape.email_verified");
     const unverified = items.filter((u) => u.email_verified !== true).map((u) => mask(u.email));
     const observed = { users: items.length, unverifiedEmails: unverified };
     const evidence = { unverified };
@@ -5581,6 +5609,7 @@ var ipAccessList = {
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
   run: (ctx) => guarded("api.access_list", async () => {
     const entries2 = await list3(ctx, "accessList", "access_list");
+    if (shapeMismatch(entries2, (e) => [e.cidrBlock, e.ipAddress])) return unknown("api.shape.cidrBlock");
     const open = entries2.filter((e) => e.cidrBlock === "0.0.0.0/0" || e.cidrBlock === "::/0").map((e) => e.cidrBlock ?? "");
     const observed = { entries: entries2.length, openToInternet: open };
     const evidence = entries2.map((e) => ({ cidr: e.cidrBlock ?? e.ipAddress ?? null, comment: e.comment ?? null }));
@@ -5597,6 +5626,7 @@ var backupsEnabled = {
   run: (ctx) => guarded("api.clusters", async () => {
     const clusters = await list3(ctx, "clusters", "clusters");
     if (clusters.length === 0) return unknown("api.no_clusters");
+    if (shapeMismatch(clusters, (c) => [c.backupEnabled])) return unknown("api.shape.backupEnabled");
     const off = clusters.filter((c) => c.backupEnabled !== true).map((c) => c.name);
     const observed = { clusters: clusters.length, withoutBackups: off };
     const evidence = clusters.map((c) => ({ name: c.name, backupEnabled: c.backupEnabled ?? null, type: c.clusterType ?? null }));
@@ -5612,6 +5642,7 @@ var versionSupported = {
   run: (ctx) => guarded("api.clusters", async () => {
     const clusters = await list3(ctx, "clusters", "clusters");
     if (clusters.length === 0) return unknown("api.no_clusters");
+    if (shapeMismatch(clusters, (c) => [c.mongoDBMajorVersion])) return unknown("api.shape.mongoDBMajorVersion");
     const old = clusters.filter((c) => !SUPPORTED_MAJOR.has(c.mongoDBMajorVersion ?? "")).map((c) => `${c.name} (${c.mongoDBMajorVersion ?? "unknown"})`);
     const observed = { clusters: clusters.length, unsupportedVersion: old, supported: [...SUPPORTED_MAJOR] };
     const evidence = clusters.map((c) => ({ name: c.name, version: c.mongoDBMajorVersion ?? null }));
@@ -5627,6 +5658,7 @@ var terminationProtection = {
   run: (ctx) => guarded("api.clusters", async () => {
     const clusters = await list3(ctx, "clusters", "clusters");
     if (clusters.length === 0) return unknown("api.no_clusters");
+    if (shapeMismatch(clusters, (c) => [c.terminationProtectionEnabled])) return unknown("api.shape.terminationProtectionEnabled");
     const off = clusters.filter((c) => c.terminationProtectionEnabled !== true).map((c) => c.name);
     const observed = { clusters: clusters.length, deletable: off };
     const evidence = clusters.map((c) => ({ name: c.name, terminationProtection: c.terminationProtectionEnabled ?? null }));
@@ -5642,6 +5674,7 @@ var leastPrivilegeUsers = {
   run: (ctx) => guarded("api.database_users", async () => {
     const users3 = await list3(ctx, "databaseUsers", "database_users");
     if (users3.length === 0) return unknown("api.no_database_users");
+    if (shapeMismatch(users3, (u) => [u.roles])) return unknown("api.shape.roles");
     const admins = users3.filter((u) => (u.roles ?? []).some((r) => ADMIN_ROLES.has(r.roleName ?? ""))).map((u) => u.username ?? "?");
     const observed = { users: users3.length, withAdminRole: admins };
     const evidence = users3.map((u) => ({ username: u.username ?? null, roles: (u.roles ?? []).map((r) => `${r.roleName}@${r.databaseName}`) }));
@@ -5691,6 +5724,7 @@ var dropletBackups = {
   run: (ctx) => guarded("api.droplets", async () => {
     const droplets = (await get2(ctx, "/droplets?per_page=200", "droplets", "droplets")).filter((d) => d.status === "active");
     if (droplets.length === 0) return unknown("api.no_droplets");
+    if (shapeMismatch(droplets, (d) => [d.features])) return unknown("api.shape.features");
     const off = droplets.filter((d) => !(d.features ?? []).includes("backups")).map((d) => d.name);
     const observed = { droplets: droplets.length, withoutBackups: off };
     const evidence = droplets.map((d) => ({ name: d.name, features: d.features ?? [] }));
@@ -5779,6 +5813,7 @@ var attackProtection = {
       get3(ctx, "/attack-protection/suspicious-ip-throttling", "attack_protection")
     ]);
     const observed = { bruteForceProtection: brute.enabled === true, breachedPasswordDetection: breached.enabled === true, suspiciousIpThrottling: throttle.enabled === true };
+    if (brute.enabled === void 0 && breached.enabled === void 0 && throttle.enabled === void 0) return unknown("api.shape.enabled");
     const off = Object.entries(observed).filter(([, v]) => !v).map(([k]) => k);
     return off.length === 0 ? pass({ ...observed, off }, observed) : fail({ ...observed, off }, observed);
   })
@@ -5807,6 +5842,7 @@ var callbacksHttps = {
   run: (ctx) => guarded("api.clients", async () => {
     const all = await clients(ctx);
     if (all.length === 0) return unknown("api.no_clients");
+    if (shapeMismatch(all, (c) => [c.callbacks, c.allowed_logout_urls, c.web_origins, c.app_type])) return unknown("api.shape.callbacks");
     const bad = all.map((c) => ({ name: c.name ?? c.client_id ?? "?", urls: [...c.callbacks ?? [], ...c.allowed_logout_urls ?? [], ...c.web_origins ?? []].filter(insecureUrl) })).filter((c) => c.urls.length > 0);
     const observed = { clients: all.length, withInsecureUrls: bad.map((b) => b.name) };
     const evidence = all.map((c) => ({ name: c.name ?? null, appType: c.app_type ?? null, urls: [...c.callbacks ?? [], ...c.allowed_logout_urls ?? [], ...c.web_origins ?? []].length, insecure: bad.find((b) => b.name === (c.name ?? c.client_id))?.urls ?? [] }));
@@ -5822,6 +5858,7 @@ var refreshTokenRotation = {
   run: (ctx) => guarded("api.clients", async () => {
     const refreshing = (await clients(ctx)).filter((c) => (c.grant_types ?? []).includes("refresh_token") && (c.app_type === "spa" || c.app_type === "native"));
     if (refreshing.length === 0) return unknown("api.no_public_clients_with_refresh");
+    if (shapeMismatch(refreshing, (c) => [c.refresh_token])) return unknown("api.shape.refresh_token");
     const weak = refreshing.filter((c) => c.refresh_token?.rotation_type !== "rotating" || c.refresh_token?.expiration_type !== "expiring").map((c) => c.name ?? c.client_id ?? "?");
     const observed = { publicClientsWithRefresh: refreshing.length, withoutRotation: weak };
     const evidence = refreshing.map((c) => ({ name: c.name ?? null, appType: c.app_type ?? null, rotation: c.refresh_token?.rotation_type ?? null, expiration: c.refresh_token?.expiration_type ?? null }));
@@ -5838,6 +5875,7 @@ var sessionLifetime = {
   maps: ["soc2:CC6.1", "iso:8.5"],
   run: (ctx) => guarded("api.tenant_settings", async () => {
     const t = await get3(ctx, "/tenants/settings?fields=session_lifetime,idle_session_lifetime", "tenant_settings");
+    if (t.session_lifetime === void 0 && t.idle_session_lifetime === void 0) return unknown("api.shape.session_lifetime");
     const session = typeof t.session_lifetime === "number" ? t.session_lifetime : 168;
     const idle = typeof t.idle_session_lifetime === "number" ? t.idle_session_lifetime : 72;
     const observed = { sessionLifetimeHours: session, idleSessionLifetimeHours: idle, maxSessionHours: MAX_SESSION_HOURS, maxIdleHours: MAX_IDLE_HOURS };
@@ -5896,6 +5934,7 @@ var reposPrivate = {
   run: (ctx) => guarded("api.repositories", async () => {
     const all = await repos(ctx);
     if (all.length === 0) return unknown("api.no_repositories");
+    if (shapeMismatch(all, (r) => [r.is_private])) return unknown("api.shape.is_private");
     const open = all.filter((r) => r.is_private !== true).map(name);
     const observed = { repositories: all.length, public: open };
     const evidence = all.map((r) => ({ name: name(r), private: r.is_private ?? null }));
@@ -5911,6 +5950,7 @@ var forkPolicy = {
   run: (ctx) => guarded("api.repositories", async () => {
     const priv = (await repos(ctx)).filter((r) => r.is_private === true);
     if (priv.length === 0) return unknown("api.no_private_repositories");
+    if (shapeMismatch(priv, (r) => [r.fork_policy])) return unknown("api.shape.fork_policy");
     const loose = priv.filter((r) => r.fork_policy === "allow_forks").map(name);
     const observed = { privateRepositories: priv.length, publicForksAllowed: loose };
     const evidence = priv.map((r) => ({ name: name(r), forkPolicy: r.fork_policy ?? null }));
@@ -6046,6 +6086,7 @@ var serverFirewall = {
   run: (ctx) => guarded("api.servers", async () => {
     const servers = (await list5(ctx, "servers")).filter(live).filter(isPublic2);
     if (servers.length === 0) return unknown("api.no_public_servers");
+    if (shapeMismatch(servers, (s) => [s.public_net?.firewalls])) return unknown("api.shape.firewalls");
     const bare = servers.filter((s) => !(s.public_net?.firewalls ?? []).some((f) => f.status === "applied")).map(name2);
     const observed = { publicServers: servers.length, withoutFirewall: bare };
     const evidence = servers.map((s) => ({ name: name2(s), firewalls: (s.public_net?.firewalls ?? []).map((f) => ({ id: f.id ?? null, status: f.status ?? null })) }));
@@ -6061,6 +6102,7 @@ var serverBackups = {
   run: (ctx) => guarded("api.servers", async () => {
     const servers = (await list5(ctx, "servers")).filter(live);
     if (servers.length === 0) return unknown("api.no_servers");
+    if (shapeMismatch(servers, (s) => [s.backup_window])) return unknown("api.shape.backup_window");
     const off = servers.filter((s) => !s.backup_window).map(name2);
     const observed = { servers: servers.length, withoutBackups: off };
     const evidence = servers.map((s) => ({ name: name2(s), backupWindow: s.backup_window ?? null }));
@@ -6076,6 +6118,7 @@ var deleteProtection = {
   run: (ctx) => guarded("api.servers", async () => {
     const servers = (await list5(ctx, "servers")).filter(live);
     if (servers.length === 0) return unknown("api.no_servers");
+    if (shapeMismatch(servers, (s) => [s.protection])) return unknown("api.shape.protection");
     const off = servers.filter((s) => s.protection?.delete !== true).map(name2);
     const observed = { servers: servers.length, deletable: off };
     const evidence = servers.map((s) => ({ name: name2(s), deleteProtection: s.protection?.delete ?? null, rebuildProtection: s.protection?.rebuild ?? null }));
@@ -6101,6 +6144,7 @@ var adminPortsRestricted = {
   run: (ctx) => guarded("api.firewalls", async () => {
     const firewalls = (await list5(ctx, "firewalls")).filter((f) => (f.applied_to ?? []).length > 0);
     if (firewalls.length === 0) return unknown("api.no_applied_firewalls");
+    if (shapeMismatch(firewalls, (f) => [f.rules])) return unknown("api.shape.rules");
     const open = [];
     const evidence = firewalls.map((f) => {
       const exposed = (f.rules ?? []).filter((r) => r.direction === "in" && (r.protocol === "tcp" || r.protocol === "udp") && (r.source_ips ?? []).some((ip) => ANYWHERE.has(ip))).flatMap((r) => coversAdminPort(r.port));
@@ -6121,6 +6165,7 @@ var loadBalancerHttps = {
   run: (ctx) => guarded("api.load_balancers", async () => {
     const lbs = (await list5(ctx, "load_balancers")).filter((lb) => lb.public_net?.enabled !== false);
     if (lbs.length === 0) return unknown("api.no_public_load_balancers");
+    if (shapeMismatch(lbs, (lb) => [lb.services])) return unknown("api.shape.services");
     const weak = lbs.filter((lb) => {
       const services2 = lb.services ?? [];
       const https = services2.filter((s) => s.protocol === "https");
@@ -6166,6 +6211,7 @@ var storageLockedDown = {
   run: (ctx) => guarded("api.storage", async () => {
     const accounts = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Storage/storageAccounts?api-version=2023-05-01`, "storage");
     if (accounts.length === 0) return unknown("api.no_storage_accounts");
+    if (shapeMismatch(accounts, (a) => [a.properties])) return unknown("api.shape.properties");
     const weak = accounts.filter((a) => a.properties?.allowBlobPublicAccess === true || a.properties?.supportsHttpsTrafficOnly !== true || (a.properties?.minimumTlsVersion ?? "TLS1_0") < "TLS1_2").map(name3);
     const observed = { storageAccounts: accounts.length, weak };
     const evidence = accounts.map((a) => ({ name: name3(a), blobPublicAccess: a.properties?.allowBlobPublicAccess ?? null, httpsOnly: a.properties?.supportsHttpsTrafficOnly ?? null, minimumTls: a.properties?.minimumTlsVersion ?? null, publicNetworkAccess: a.properties?.publicNetworkAccess ?? null }));
@@ -6194,6 +6240,7 @@ var nsgAdminPorts = {
       (g) => (g.properties?.subnets ?? []).length + (g.properties?.networkInterfaces ?? []).length > 0
     );
     if (groups.length === 0) return unknown("api.no_attached_nsgs");
+    if (shapeMismatch(groups, (g) => [g.properties?.securityRules])) return unknown("api.shape.securityRules");
     const open = [];
     const evidence = groups.map((g) => {
       const ports = /* @__PURE__ */ new Set();
@@ -6221,6 +6268,7 @@ var sqlHardened = {
   run: (ctx) => guarded("api.sql", async () => {
     const servers = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Sql/servers?api-version=2021-11-01`, "sql");
     if (servers.length === 0) return unknown("api.no_sql_servers");
+    if (shapeMismatch(servers, (s) => [s.properties, s.id])) return unknown("api.shape.properties");
     const weak = [];
     const evidence = [];
     for (const s of servers) {
@@ -6247,6 +6295,7 @@ var keyVaultProtected = {
   run: (ctx) => guarded("api.keyvault", async () => {
     const vaults = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01`, "keyvault");
     if (vaults.length === 0) return unknown("api.no_key_vaults");
+    if (shapeMismatch(vaults, (v) => [v.properties])) return unknown("api.shape.properties");
     const weak = vaults.filter((v) => v.properties?.enableSoftDelete === false || v.properties?.enablePurgeProtection !== true).map(name3);
     const observed = { keyVaults: vaults.length, withoutDeleteProtection: weak };
     const evidence = vaults.map((v) => ({ name: name3(v), softDelete: v.properties?.enableSoftDelete ?? null, purgeProtection: v.properties?.enablePurgeProtection ?? null, rbac: v.properties?.enableRbacAuthorization ?? null }));
@@ -6262,6 +6311,7 @@ var appServiceHttps = {
   run: (ctx) => guarded("api.web", async () => {
     const sites2 = (await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Web/sites?api-version=2022-09-01`, "web")).filter((s) => (s.properties?.state ?? "Running") === "Running");
     if (sites2.length === 0) return unknown("api.no_web_apps");
+    if (shapeMismatch(sites2, (s) => [s.properties, s.id])) return unknown("api.shape.properties");
     const weak = [];
     const evidence = [];
     for (const s of sites2) {
@@ -6286,6 +6336,7 @@ var ownersLimited2 = {
   maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
   run: (ctx) => guarded("api.rbac", async () => {
     const all = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()`, "rbac");
+    if (shapeMismatch(all, (a) => [a.properties?.roleDefinitionId])) return unknown("api.shape.roleDefinitionId");
     const owners = all.filter((a) => roleTail(a.properties?.roleDefinitionId) === ROLE_OWNER);
     const observed = { assignmentsAtScope: all.length, owners: owners.length, max: MAX_OWNERS2 };
     const evidence = owners.map((a) => ({ principalType: a.properties?.principalType ?? null, scope: a.properties?.scope ?? null }));
@@ -6337,6 +6388,7 @@ var oncallCovered = {
     const from = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
     const to = from + WEEK_MS;
     const oncalls = await list7(ctx, `/oncalls?since=${encodeURIComponent(new Date(from).toISOString())}&until=${encodeURIComponent(new Date(to).toISOString())}&earliest=true`, "oncalls", "oncalls");
+    if (shapeMismatch(oncalls, (o) => [o.escalation_policy, o.start, o.end])) return unknown("api.shape.oncalls");
     const gaps = [];
     const evidence = policies.map((p) => {
       const shifts = oncalls.filter((o) => o.escalation_policy?.id === p.id && (o.escalation_level ?? 1) === 1).map((o) => ({ start: o.start ? Date.parse(o.start) : from, end: o.end ? Date.parse(o.end) : to }));
@@ -6359,6 +6411,7 @@ var servicesEscalate = {
     if (services2.length === 0) return unknown("api.no_services");
     const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
     const byId = new Map(policies.map((p) => [p.id, p]));
+    if (shapeMismatch(services2, (s) => [s.escalation_policy]) || shapeMismatch(policies, (p) => [p.escalation_rules])) return unknown("api.shape.escalation_policy");
     const silent = services2.filter((s) => {
       const p = s.escalation_policy?.id ? byId.get(s.escalation_policy.id) : void 0;
       return !p || !(p.escalation_rules ?? []).some((r) => (r.targets ?? []).length > 0);
@@ -6377,6 +6430,7 @@ var escalationHasBackup = {
   run: (ctx) => guarded("api.escalation_policies", async () => {
     const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
     if (policies.length === 0) return unknown("api.no_escalation_policies");
+    if (shapeMismatch(policies, (p) => [p.escalation_rules, p.num_loops])) return unknown("api.shape.escalation_rules");
     const single = policies.filter((p) => (p.escalation_rules ?? []).length < 2 && (p.num_loops ?? 0) < 1).map((p) => p.name ?? p.id);
     const observed = { escalationPolicies: policies.length, singleLevelNoRepeat: single };
     const evidence = policies.map((p) => ({ policy: p.name ?? p.id, levels: (p.escalation_rules ?? []).length, repeats: p.num_loops ?? 0 }));
@@ -6392,6 +6446,7 @@ var noStaleIncidents = {
   run: (ctx) => guarded("api.incidents", async () => {
     const open = await list7(ctx, "/incidents?statuses[]=triggered&statuses[]=acknowledged&date_range=all", "incidents", "incidents");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    if (shapeMismatch(open, (i) => [i.created_at, i.status])) return unknown("api.shape.created_at");
     const stale = open.filter((i) => i.created_at && now - Date.parse(i.created_at) > DAY_MS).map((i) => `${i.title ?? i.id} (${i.status ?? "?"})`);
     const observed = { openIncidents: open.length, olderThanADay: stale };
     const evidence = open.map((i) => ({ incident: i.title ?? i.id, status: i.status ?? null, urgency: i.urgency ?? null, createdAt: i.created_at ?? null }));
@@ -6427,6 +6482,7 @@ var monitorsNotify = {
   maps: ["soc2:CC7.2", "soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.monitors", async () => {
     const all = await monitors3(ctx);
+    if (shapeMismatch(all, (m) => [m.message, m.name])) return unknown("api.shape.message");
     const silent = all.filter((m) => !NOTIFY.test(m.message ?? "")).map(label3);
     const observed = { monitors: all.length, withoutNotification: silent };
     const evidence = all.map((m) => ({ monitor: label3(m), type: m.type ?? null, state: m.overall_state ?? null, notifies: NOTIFY.test(m.message ?? "") }));
@@ -6442,6 +6498,7 @@ var monitorsNotMuted = {
   run: (ctx) => guarded("api.monitors", async () => {
     const all = await monitors3(ctx);
     if (all.length === 0) return unknown("api.no_monitors");
+    if (shapeMismatch(all, (m) => [m.options])) return unknown("api.shape.options");
     const muted = all.filter((m) => Object.values(m.options?.silenced ?? {}).some((expiry) => expiry === null)).map(label3);
     const observed = { monitors: all.length, mutedIndefinitely: muted };
     const evidence = all.filter((m) => m.options?.silenced && Object.keys(m.options.silenced).length > 0).map((m) => ({ monitor: label3(m), silenced: m.options?.silenced ?? null }));
@@ -6457,6 +6514,7 @@ var noDataNoticed = {
   run: (ctx) => guarded("api.monitors", async () => {
     const metric = (await monitors3(ctx)).filter((m) => m.type === "metric alert" || m.type === "query alert" || m.type === "service check");
     if (metric.length === 0) return unknown("api.no_metric_monitors");
+    if (shapeMismatch(metric, (m) => [m.options])) return unknown("api.shape.options");
     const quiet = metric.filter((m) => m.options?.notify_no_data !== true && !(m.options?.on_missing_data ?? "").includes("notify")).map(label3);
     const observed = { metricMonitors: metric.length, silentOnMissingData: quiet };
     const evidence = metric.map((m) => ({ monitor: label3(m), notifyNoData: m.options?.notify_no_data ?? null, onMissingData: m.options?.on_missing_data ?? null }));
@@ -6486,6 +6544,7 @@ var usersMfa = {
     }
     const people = users3.filter((u) => u.attributes?.service_account !== true && u.attributes?.disabled !== true);
     if (people.length === 0) return unknown("api.no_users");
+    if (shapeMismatch(people, (u) => [u.attributes?.mfa_enabled])) return unknown("api.shape.mfa_enabled");
     const without = people.filter((u) => u.attributes?.mfa_enabled !== true).map((u) => mask2(u.attributes?.email));
     const observed = { users: people.length, withoutMfa: without };
     const evidence = people.map((u) => ({ user: mask2(u.attributes?.email), mfa: u.attributes?.mfa_enabled ?? null, lastLogin: u.attributes?.last_login_time ?? null }));
@@ -6505,6 +6564,7 @@ var logRetention = {
     if (r.status !== 200) throw new Error("scope:api.logs");
     const indexes = r.json?.indexes ?? [];
     if (indexes.length === 0) return unknown("api.no_log_indexes");
+    if (shapeMismatch(indexes, (i) => [i.num_retention_days])) return unknown("api.shape.num_retention_days");
     const short = indexes.filter((i) => (i.num_retention_days ?? 0) < MIN_RETENTION_DAYS).map((i) => `${i.name ?? "?"} (${i.num_retention_days ?? 0}d)`);
     const observed = { indexes: indexes.length, minimumDays: MIN_RETENTION_DAYS, belowMinimum: short };
     const evidence = indexes.map((i) => ({ index: i.name ?? null, retentionDays: i.num_retention_days ?? null }));
@@ -6561,6 +6621,7 @@ var mfaEnforced3 = {
   run: (ctx) => guarded("api.policies", async () => {
     const policies = await signOnRules(ctx);
     if (policies.length === 0) return unknown("api.no_signon_policies");
+    if (shapeMismatch(policies.flatMap((p) => p.rules), (r) => [r.actions?.signon])) return unknown("api.shape.signon");
     const lax = policies.flatMap((p) => p.rules.filter((r) => r.actions?.signon?.access === "ALLOW" && r.actions?.signon?.requireFactor !== true).map(() => p.policy));
     const observed = { policies: policies.length, rulesAllowingWithoutFactor: lax };
     const evidence = policies.map((p) => ({ policy: p.policy, rules: p.rules.map((r) => ({ access: r.actions?.signon?.access ?? null, requireFactor: r.actions?.signon?.requireFactor ?? null })) }));
@@ -6620,6 +6681,7 @@ var dormantUsers4 = {
     if (users3 === null) return unknown("api.users.too_many");
     if (users3.length === 0) return unknown("api.no_active_users");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    if (shapeMismatch(users3, (u) => [u.lastLogin, u.created])) return unknown("api.shape.lastLogin");
     const dormant = users3.filter((u) => {
       const last = u.lastLogin ? Date.parse(u.lastLogin) : NaN;
       const created = u.created ? Date.parse(u.created) : NaN;
@@ -6642,6 +6704,7 @@ var sessionsBounded = {
   run: (ctx) => guarded("api.policies", async () => {
     const policies = await signOnRules(ctx);
     if (policies.length === 0) return unknown("api.no_signon_policies");
+    if (shapeMismatch(policies.flatMap((p) => p.rules), (r) => [r.actions?.signon?.session])) return unknown("api.shape.session");
     const loose = [];
     const evidence = policies.map((p) => ({
       policy: p.policy,
@@ -6694,6 +6757,7 @@ var projectsPrivate = {
   run: (ctx) => guarded("api.projects", async () => {
     const all = await projects4(ctx);
     if (all.length === 0) return unknown("api.no_projects");
+    if (shapeMismatch(all, (p) => [p.visibility])) return unknown("api.shape.visibility");
     const open = all.filter((p) => (p.visibility ?? "private") !== "private").map((p) => p.name);
     const observed = { projects: all.length, public: open };
     const evidence = all.map((p) => ({ name: p.name, visibility: p.visibility ?? null }));
@@ -6747,6 +6811,7 @@ var pipelinesAsCode = {
       for (const x of ps) pipelines.push({ name: `${p.name}/${x.name ?? "?"}`, type: x.configuration?.type ?? "unknown" });
     }
     if (pipelines.length === 0) return unknown("api.no_pipelines");
+    if (pipelines.every((x) => x.type === "unknown")) return unknown("api.shape.configuration");
     const classic = pipelines.filter((x) => x.type !== "yaml").map((x) => x.name);
     const observed = { pipelines: pipelines.length, notAsCode: classic };
     return classic.length === 0 ? pass(observed, pipelines) : fail(observed, pipelines);
@@ -6774,6 +6839,7 @@ var dormantMembers = {
     const items = (r.json?.items ?? r.json?.members ?? []).filter((e) => (e.accessLevel?.status ?? "active") === "active");
     if (items.length === 0) return unknown("api.no_members");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
+    if (shapeMismatch(items, (e) => [e.lastAccessedDate, e.dateCreated])) return unknown("api.shape.lastAccessedDate");
     const dormant = items.filter((e) => {
       const last = e.lastAccessedDate ? Date.parse(e.lastAccessedDate) : NaN;
       const created = e.dateCreated ? Date.parse(e.dateCreated) : NaN;

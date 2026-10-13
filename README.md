@@ -32,9 +32,17 @@ CIRCLECI_TOKEN=… CIRCLECI_PROJECT=gh/org/repo npx snoopios run circleci
 CHECKLY_API_KEY=… CHECKLY_ACCOUNT_ID=… npx snoopios run checkly
 TURSO_API_TOKEN=… TURSO_ORG=… npx snoopios run turso
 WORKOS_API_KEY=…     npx snoopios run workos
+SNYK_TOKEN=… SNYK_ORG_ID=… npx snoopios run snyk
+SEMGREP_APP_TOKEN=… SEMGREP_DEPLOYMENT=… npx snoopios run semgrep
+GITGUARDIAN_API_KEY=… npx snoopios run gitguardian
+AIKIDO_CLIENT_ID=… AIKIDO_CLIENT_SECRET=… npx snoopios run aikido
+SONAR_TOKEN=… SONAR_PROJECT_KEY=… npx snoopios run sonarqube
+OP_EVENTS_TOKEN=… OP_REGION=eu npx snoopios run onepassword
+BW_CLIENT_ID=… BW_CLIENT_SECRET=… BW_REGION=eu npx snoopios run bitwarden
+DOPPLER_TOKEN=…      npx snoopios run doppler
 ```
 
-These providers' tokens cannot be scoped read-only (Upstash's can, but nothing reads that
+Most of these providers' tokens cannot be scoped read-only (Upstash's can, but nothing reads that
 back and its API returns database credentials), so Snoopios never holds them. The
 CLI reads the token from your environment, runs the checks here and prints the report.
 The token never leaves your machine, and every request is a read.
@@ -63,6 +71,23 @@ The token never leaves your machine, and every request is a read.
 - **Turso**: delete protection on every database and group, owners held by few.
 - **WorkOS**: SSO connections live, directory syncs healthy, customer domains verified,
   user emails verified.
+- **Snyk, Semgrep, Aikido** (the scanner's own findings, read and never re-run): nothing
+  critical open, serious findings closed within thirty days, nothing open past ninety, and
+  for Snyk and Semgrep every project scanned in the last fortnight.
+- **GitGuardian**: no committed credential still valid, no critical secret incident open,
+  incidents closed within thirty days and none older than ninety. Needs `sources:read` as
+  well as `incidents:read`, so an unmonitored workspace is never reported clean.
+- **SonarQube and SonarCloud**: the quality gate passing and actually testing something,
+  analysed in the last fortnight, security rating A. Set `SONAR_HOST_URL` for a
+  self-hosted server.
+- **1Password** (Events API token, sign-in attempts and audit events only): every sign-in
+  used a second factor, no account being guessed at, an audit log you can produce.
+- **Bitwarden** (organisation API key; `BW_REGION=eu` for bitwarden.eu): everyone with
+  vault access has a second factor, the Enterprise policies that require it and keep
+  company items in the company, nobody seeing every collection by accident, nobody stuck
+  halfway through joining.
+- **Doppler** (personal token): no service token that can write, none pointing at a root
+  config, none older than a year.
 
 ## push results to your Snoopios project (`--push`)
 
@@ -132,7 +157,9 @@ The Supabase SQL checks against any connection string you already have, includin
 local Supabase: row-level security on every public table, no policy that lets anon
 write, the private schema closed to session roles, `SECURITY DEFINER` functions pinning
 `search_path`, and anon-callable definers that are safe to expose. SELECT statements
-only. Also reads `DATABASE_URL` when no argument is given.
+only. Also reads `DATABASE_URL` when no argument is given. The server's certificate is
+verified, against Supabase's own root for `*.supabase.com` and your system's roots for
+anything else, so the password is never sent to a server that only claims to be yours.
 
 ## output
 

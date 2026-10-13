@@ -24,7 +24,10 @@ async function guarded(scope, body) {
   try {
     return await body();
   } catch (err) {
-    return unknown(err instanceof Error && err.message === "edge.challenge" ? "edge.challenge" : scope);
+    const message = err instanceof Error ? err.message : "";
+    if (message === "edge.challenge") return unknown("edge.challenge");
+    if (message.startsWith("scope:")) return unknown(message.slice("scope:".length));
+    return unknown(scope);
   }
 }
 function shapeMismatch(items, pick) {
@@ -43,18 +46,97 @@ var READ_ONLY_POST = [
   /^https:\/\/cloud\.mongodb\.com\/api\/oauth\/token$/,
   // Supabase's read-only SQL endpoint: the server refuses anything but a read.
   /^https:\/\/api\.supabase\.com\/v1\/projects\/[^/]+\/database\/query\/read-only$/,
+  // Google names two reads as POST because the request carries options in a
+  // body. `:getIamPolicy` returns a policy and cannot set one — that is
+  // `:setIamPolicy`, which no pattern here admits.
+  /^https:\/\/cloudresourcemanager\.googleapis\.com\/v1\/projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]:getIamPolicy$/,
+  // `:testIamPermissions` answers "which of these permissions does this caller
+  // hold", and holds nothing itself. It is how the connector proves its own
+  // credential cannot write, so refusing it here would refuse the proof.
+  /^https:\/\/cloudresourcemanager\.googleapis\.com\/v1\/projects\/[a-z][a-z0-9-]{4,28}[a-z0-9]:testIamPermissions$/,
+  // Notion names search a POST because the request carries its options in a
+  // body. It reads pages and cannot create one, which is /v1/pages.
+  /^https:\/\/api\.notion\.com\/v1\/search$/,
+  // Jamf Pro API client credentials for a short-lived token.
+  /^https:\/\/[a-z0-9][a-z0-9-]{1,60}\.jamfcloud\.com\/api\/oauth\/token$/,
+  // 1Password's Events API reads a log through POST, because the body carries
+  // a cursor: a log is read forwards. There is no endpoint that writes one.
+  /^https:\/\/events\.(1password\.(com|ca|eu)|ent\.1password\.com)\/api\/v2\/(signinattempts|auditevents)$/,
+  // Bitwarden organisation API key for a bearer token.
+  /^https:\/\/identity\.bitwarden\.(com|eu)\/connect\/token$/,
+  // Aikido OAuth client credentials for a short-lived token.
+  /^https:\/\/app\.aikido\.dev\/api\/oauth\/token$/,
   // UptimeRobot's API is POST-only; these two methods read.
   /^https:\/\/api\.uptimerobot\.com\/v2\/(getMonitors|getAccountDetails)$/
 ];
-var GRAPHQL_READ = [/^https:\/\/api\.fly\.io\/graphql$/, /^https:\/\/backboard\.railway\.com\/graphql\/v2$/];
+var GRAPHQL_READ = [/^https:\/\/api\.fly\.io\/graphql$/, /^https:\/\/backboard\.railway\.com\/graphql\/v2$/, /^https:\/\/api\.linear\.app\/graphql$/];
 function isReadQueryBody(body) {
   if (typeof body !== "string") return false;
   try {
-    const q = JSON.parse(body).query;
-    return typeof q === "string" && /^\s*(query\b|\{)/.test(q);
+    const parsed = JSON.parse(body);
+    const q = parsed.query;
+    if (typeof q !== "string" || !/^\s*(query\b|\{)/.test(q)) return false;
+    if (/\b(mutation|subscription)\b/i.test(q)) return false;
+    if (parsed.operationName != null) return false;
+    return true;
   } catch {
     return false;
   }
+}
+var AWS_QUERY_HOST = /^https:\/\/(iam|sts)\.amazonaws\.com\/$|^https:\/\/(ec2|rds)\.[a-z0-9-]+\.amazonaws\.com\/$/;
+var AWS_READ_ACTIONS = /* @__PURE__ */ new Set([
+  // STS: who are we, under what role.
+  "GetCallerIdentity",
+  // IAM: the account's own posture, its users, and their credentials.
+  "GetAccountSummary",
+  "GetAccountPasswordPolicy",
+  "ListUsers",
+  "ListMFADevices",
+  "ListAccessKeys",
+  "ListAccountAliases",
+  "ListAttachedUserPolicies",
+  "GetAccessKeyLastUsed",
+  // EC2: the network and the disks.
+  "DescribeSecurityGroups",
+  "DescribeVpcs",
+  "DescribeFlowLogs",
+  "DescribeInstances",
+  "DescribeVolumes",
+  "DescribeRegions",
+  "DescribeAddresses",
+  "DescribeSnapshots",
+  "DescribeImages",
+  "GetEbsEncryptionByDefault",
+  // RDS: the databases.
+  "DescribeDBInstances",
+  "DescribeDBSnapshots"
+]);
+var AWS_JSON_HOST = /^https:\/\/(cloudtrail|kms|guardduty|config)\.[a-z0-9-]+\.amazonaws\.com\//;
+var AWS_READ_TARGETS = /* @__PURE__ */ new Set([
+  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.DescribeTrails",
+  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.GetTrailStatus",
+  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.GetEventSelectors",
+  "TrentService.ListKeys",
+  "TrentService.DescribeKey",
+  "TrentService.GetKeyRotationStatus",
+  "StarlingDoveService.DescribeConfigurationRecorders",
+  "StarlingDoveService.DescribeConfigurationRecorderStatus"
+]);
+function awsAction(body) {
+  if (typeof body !== "string") return null;
+  const action = new URLSearchParams(body).get("Action");
+  return action && /^[A-Za-z]{1,64}$/.test(action) ? action : null;
+}
+function headerValue(headers, name) {
+  if (!headers) return null;
+  const wanted = name.toLowerCase();
+  if (headers instanceof Headers) return headers.get(wanted);
+  if (Array.isArray(headers)) {
+    for (const [k, v] of headers) if (k.toLowerCase() === wanted) return v;
+    return null;
+  }
+  for (const [k, v] of Object.entries(headers)) if (k.toLowerCase() === wanted) return String(v);
+  return null;
 }
 var WriteRefused = class extends Error {
   constructor(method, url) {
@@ -62,18 +144,49 @@ var WriteRefused = class extends Error {
     this.name = "WriteRefused";
   }
 };
-function isReadOnlyRequest(url, method, body) {
+function isReadOnlyRequest(url, method, body, headers) {
   const m = method.toUpperCase();
   if (m === "GET" || m === "HEAD") return true;
-  if (m === "POST") return READ_ONLY_POST.some((re) => re.test(url)) || GRAPHQL_READ.some((re) => re.test(url)) && isReadQueryBody(body);
+  if (m !== "POST") return false;
+  if (READ_ONLY_POST.some((re) => re.test(url))) return true;
+  if (GRAPHQL_READ.some((re) => re.test(url)) && isReadQueryBody(body)) return true;
+  if (AWS_QUERY_HOST.test(url)) {
+    const action = awsAction(body);
+    return action !== null && AWS_READ_ACTIONS.has(action);
+  }
+  if (AWS_JSON_HOST.test(url)) {
+    const target = headerValue(headers, "x-amz-target");
+    return target !== null && AWS_READ_TARGETS.has(target);
+  }
   return false;
 }
 var readOnlyFetch = (input, init) => {
   const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
   const method = init?.method ?? (typeof input === "object" && !(input instanceof URL) ? input.method : "GET") ?? "GET";
-  if (!isReadOnlyRequest(url, method, init?.body)) return Promise.reject(new WriteRefused(method.toUpperCase(), url));
+  if (!isReadOnlyRequest(url, method, init?.body, init?.headers)) {
+    return Promise.reject(new WriteRefused(method.toUpperCase(), url));
+  }
   return fetch(input, init);
 };
+
+// ../lib/checks/dns-tags.ts
+function dnsTag(record, tag) {
+  if (!record) return null;
+  const re = new RegExp(`(?:^|;)\\s*${tag}\\s*=\\s*([^;]*)`, "i");
+  const raw = re.exec(record)?.[1];
+  return raw === void 0 ? null : raw.trim();
+}
+function dmarcPolicy(record) {
+  const v = dnsTag(record, "p")?.toLowerCase();
+  return v === "none" || v === "quarantine" || v === "reject" ? v : null;
+}
+function dmarcRua(record) {
+  const v = dnsTag(record, "rua");
+  if (!v) return null;
+  const first = v.split(",")[0]?.trim() ?? "";
+  const m = /^mailto:(.+)$/i.exec(first);
+  return m ? m[1].trim() : null;
+}
 
 // ../lib/checks/providers/domain.ts
 var TIMEOUT_MS = 1e4;
@@ -86,8 +199,15 @@ var EdgeChallenge = class extends Error {
 function challenged(res) {
   return res.headers.get("cf-mitigated") === "challenge" || res.status === 403 && /challenge-platform|cf-chl/i.test(res.headers.get("cf-chl-bypass") ?? "");
 }
+var REFUSED_STATUS = /* @__PURE__ */ new Set([401, 403, 407, 429, 451]);
+var EdgeRefused = class extends Error {
+  constructor(status) {
+    super(`scope:edge.refused.${status}`);
+  }
+};
 function rejectChallenge(res) {
   if (challenged(res)) throw new EdgeChallenge();
+  if (REFUSED_STATUS.has(res.status)) throw new EdgeRefused(res.status);
   return res;
 }
 async function head(ctx, url, redirect = "manual") {
@@ -106,10 +226,10 @@ async function head(ctx, url, redirect = "manual") {
   });
   return { status: res.status, headers, url: res.url };
 }
-async function dohTxt(ctx, name4, type = "TXT") {
+async function dohTxt(ctx, name, type = "TXT") {
   const f = ctx.fetch ?? readOnlyFetch;
   const res = await f(
-    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name4)}&type=${type}`,
+    `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
     { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(TIMEOUT_MS) }
   );
   const json = await res.json();
@@ -118,6 +238,12 @@ async function dohTxt(ctx, name4, type = "TXT") {
 function realTls(host) {
   return new Promise((resolve2, reject) => {
     const socket = tlsConnect(
+      // Deliberate: this connection exists to READ the certificate and judge
+      // it (expiry, issuer, protocol). Verifying it first would make an expired
+      // or self-signed certificate unreadable, which is the finding. Nothing is
+      // sent over this socket. (Semgrep bypass-tls-verification, triaged
+      // 12 Oct 2026 as by design.)
+      // nosemgrep: problem-based-packs.insecure-transport.js-node.bypass-tls-verification.bypass-tls-verification
       { host, port: 443, servername: host, rejectUnauthorized: false, timeout: TIMEOUT_MS },
       () => {
         const cert = socket.getPeerCertificate();
@@ -140,19 +266,25 @@ function realTls(host) {
 var headersCsp = {
   code: "domain.headers.csp",
   provider: "domain",
-  version: 1,
+  version: 2,
   severity: "medium",
   maps: ["soc2:CC6.6", "ce:secure-config", "iso:8.26", "iso:8.9"],
   run: (ctx) => guarded("http.get", async () => {
     const r = await head(ctx, `https://${ctx.host}/`, "follow");
     const csp = r.headers["content-security-policy"] ?? null;
+    const scriptSrc = /script-src\s+([^;]+)/i.exec(csp ?? "")?.[1] ?? /default-src\s+([^;]+)/i.exec(csp ?? "")?.[1] ?? "";
+    const nonceOrHash = /'nonce-|'sha(256|384|512)-|'strict-dynamic'/i.test(scriptSrc);
     const observed = {
       present: Boolean(csp),
       objectSrcNone: /object-src\s+'none'/i.test(csp ?? ""),
       baseUriSelf: /base-uri\s+'self'/i.test(csp ?? ""),
-      frameAncestors: /frame-ancestors/i.test(csp ?? "")
+      frameAncestors: /frame-ancestors/i.test(csp ?? ""),
+      // Inline script and eval are only excused by a nonce, a hash or strict-dynamic.
+      scriptUnsafeInline: /'unsafe-inline'/i.test(scriptSrc) && !nonceOrHash,
+      scriptUnsafeEval: /'unsafe-eval'/i.test(scriptSrc),
+      scriptWildcard: /(^|\s)\*(\s|$)/.test(scriptSrc)
     };
-    const ok = observed.present && observed.objectSrcNone && observed.baseUriSelf && observed.frameAncestors;
+    const ok = observed.present && observed.objectSrcNone && observed.baseUriSelf && observed.frameAncestors && !observed.scriptUnsafeInline && !observed.scriptUnsafeEval && !observed.scriptWildcard;
     return ok ? pass(observed, r) : fail(observed, r);
   })
 };
@@ -254,7 +386,7 @@ var dnsDmarc = {
   run: (ctx) => guarded("doh.txt", async () => {
     const json = await dohTxt(ctx, `_dmarc.${ctx.host}`);
     const rec = txtRecords(json.Answer).find((t) => t.toLowerCase().startsWith("v=dmarc1")) ?? null;
-    const policy = /p=(none|quarantine|reject)/i.exec(rec ?? "")?.[1]?.toLowerCase() ?? null;
+    const policy = dmarcPolicy(rec);
     const observed = { present: Boolean(rec), policy };
     return policy === "quarantine" || policy === "reject" ? pass(observed, json) : fail(observed, json);
   })
@@ -389,9 +521,9 @@ var ESP_DEFAULTS = {
   other: {}
 };
 var TIMEOUT_MS2 = 1e4;
-async function doh(ctx, name4, type = "TXT") {
+async function doh(ctx, name, type = "TXT") {
   const f = ctx.fetch ?? readOnlyFetch;
-  const res = await f(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name4)}&type=${type}`, {
+  const res = await f(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`, {
     headers: { accept: "application/dns-json" },
     signal: AbortSignal.timeout(TIMEOUT_MS2)
   });
@@ -400,12 +532,41 @@ async function doh(ctx, name4, type = "TXT") {
 function txt(answer) {
   return (answer ?? []).filter((a) => a.type === 16).map((a) => a.data.replace(/"\s+"/g, "").replace(/^"|"$/g, ""));
 }
+function mxHosts(answer) {
+  return (answer ?? []).filter((a) => a.type === 15).map((a) => (a.data.trim().split(/\s+/).pop() ?? "").replace(/\.$/, "").toLowerCase()).filter(Boolean);
+}
+function parseStsPolicy(text2) {
+  let version = null;
+  let mode = null;
+  let maxAge = null;
+  const mx = [];
+  for (const line of text2.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$/.exec(line);
+    if (!m) continue;
+    const [, rawKey, value] = m;
+    const key = rawKey.toLowerCase();
+    if (key === "version") version ??= value;
+    else if (key === "mode") mode ??= value.toLowerCase();
+    else if (key === "mx") mx.push(value.replace(/\.$/, "").toLowerCase());
+    else if (key === "max_age" && /^\d+$/.test(value)) maxAge ??= Number(value);
+  }
+  return { version, mode, mx, maxAge };
+}
+function mxCoveredBy(host, pattern) {
+  const h = host.replace(/\.$/, "").toLowerCase();
+  const p = pattern.replace(/\.$/, "").toLowerCase();
+  if (!p.startsWith("*.")) return h === p;
+  const suffix = p.slice(1);
+  if (!h.endsWith(suffix)) return false;
+  const label4 = h.slice(0, h.length - suffix.length);
+  return label4.length > 0 && !label4.includes(".");
+}
 function selectorFor(ctx) {
   return ctx.selector?.trim() || ESP_DEFAULTS[ctx.esp].selector || null;
 }
 function returnPathHost(ctx) {
-  const sub2 = ctx.returnPath?.trim() || ESP_DEFAULTS[ctx.esp].returnPath;
-  return sub2 ? `${sub2}.${ctx.domain}` : ctx.domain;
+  const sub = ctx.returnPath?.trim() || ESP_DEFAULTS[ctx.esp].returnPath;
+  return sub ? `${sub}.${ctx.domain}` : ctx.domain;
 }
 var dkimPresent = {
   code: "email.dkim.present",
@@ -417,8 +578,8 @@ var dkimPresent = {
     const selector = selectorFor(ctx);
     if (!selector) return unknown("dkim.selector", { selector: null });
     const json = await doh(ctx, `${selector}._domainkey.${ctx.domain}`);
-    const rec = txt(json.Answer).find((t) => /(^|;)\s*p=/.test(t)) ?? null;
-    const key = /(?:^|;)\s*p=([A-Za-z0-9+/=]*)/.exec(rec ?? "")?.[1] ?? "";
+    const rec = txt(json.Answer).find((t) => dnsTag(t, "p") !== null) ?? null;
+    const key = (dnsTag(rec, "p") ?? "").replace(/\s+/g, "");
     let bits = null;
     if (key) {
       const bytes = Buffer.from(key, "base64").length;
@@ -453,8 +614,8 @@ var spfReturnPath = {
 async function dmarc(ctx) {
   const json = await doh(ctx, `_dmarc.${ctx.domain}`);
   const rec = txt(json.Answer).find((t) => t.toLowerCase().startsWith("v=dmarc1")) ?? null;
-  const policy = /(?:^|;)\s*p=(none|quarantine|reject)/i.exec(rec ?? "")?.[1]?.toLowerCase() ?? null;
-  const rua = /(?:^|;)\s*rua=mailto:([^;,\s]+)/i.exec(rec ?? "")?.[1] ?? null;
+  const policy = dmarcPolicy(rec);
+  const rua = dmarcRua(rec);
   return { json, rec, policy, rua };
 }
 var dmarcEnforced = {
@@ -481,25 +642,102 @@ var dmarcReporting = {
     return d.rua ? pass(observed, d.json) : fail(observed, d.json);
   })
 };
+var MIN_MAX_AGE = 86400;
+var MAX_MAX_AGE = 31557600;
+async function stsPolicy(ctx) {
+  const json = await doh(ctx, `_mta-sts.${ctx.domain}`);
+  const rec = txt(json.Answer).find((t) => t.toLowerCase().startsWith("v=stsv1")) ?? null;
+  if (!rec) return { json, rec, status: null, contentType: null, policy: null };
+  const f = ctx.fetch ?? readOnlyFetch;
+  const res = await f(`https://mta-sts.${ctx.domain}/.well-known/mta-sts.txt`, {
+    redirect: "manual",
+    signal: AbortSignal.timeout(TIMEOUT_MS2)
+  });
+  const contentType = (res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase() || null;
+  const readable = res.ok && res.status < 300 && contentType === "text/plain";
+  return { json, rec, status: res.status, contentType, policy: readable ? parseStsPolicy(await res.text()) : null };
+}
+function enforcing(policy) {
+  return Boolean(
+    policy && policy.version === "STSv1" && policy.mode === "enforce" && policy.maxAge !== null && policy.maxAge >= MIN_MAX_AGE && policy.maxAge <= MAX_MAX_AGE && policy.mx.length > 0
+  );
+}
 var mtaSts = {
   code: "email.mta_sts",
   provider: "email",
-  version: 1,
+  version: 2,
   severity: "low",
   maps: ["iso:8.24", "iso:8.20"],
+  // "Is inbound mail protected from downgrade?" Absence is a missing hardening
+  // control on a domain that is working fine, which is what `low` is for. The
+  // separate question — "is this domain's mail about to bounce?" — is
+  // email.mta_sts.mx_match below, and it is `high`, because those two failures
+  // have nothing in common but a config file.
+  //
+  // This one still fails on a mismatched mx: list, and deliberately, even
+  // though the check below covers it: `check.email.mta_sts.pass` says the
+  // policy's exchangers cover the domain's MX records, and a green tick under
+  // a sentence that is not true is worse than the same fault counted twice.
+  //
+  // v2, 16 Sep 2026. v1 asked one question — does the file say `mode: enforce`
+  // — and passed four kinds of policy that a conforming sender rejects or
+  // ignores: reached through a redirect, served as something other than
+  // text/plain, carrying a max_age too short to matter, and the one that
+  // matters, listing exchangers that are not the domain's. Found by verifying
+  // snoopios.com's own policy by hand (docs/pilot-readiness.md, 16 Sep 2026).
   run: (ctx) => guarded("doh.mta-sts", async () => {
-    const json = await doh(ctx, `_mta-sts.${ctx.domain}`);
-    const rec = txt(json.Answer).find((t) => t.toLowerCase().startsWith("v=stsv1")) ?? null;
-    let mode = null;
-    let policyStatus = null;
-    if (rec) {
-      const f = ctx.fetch ?? readOnlyFetch;
-      const res = await f(`https://mta-sts.${ctx.domain}/.well-known/mta-sts.txt`, { signal: AbortSignal.timeout(TIMEOUT_MS2) });
-      policyStatus = res.status;
-      if (res.ok) mode = /^\s*mode:\s*(enforce|testing|none)/im.exec(await res.text())?.[1]?.toLowerCase() ?? null;
-    }
-    const observed = { dnsRecord: Boolean(rec), policyStatus, mode };
-    return mode === "enforce" ? pass(observed, { dns: json, policyStatus, mode }) : fail(observed, { dns: json, policyStatus, mode });
+    const { json, rec, status, contentType, policy } = await stsPolicy(ctx);
+    const observed = {
+      dnsRecord: Boolean(rec),
+      policyStatus: status,
+      redirected: status !== null && status >= 300 && status < 400,
+      contentType,
+      mode: policy?.mode ?? null,
+      maxAge: policy?.maxAge ?? null,
+      mxPolicy: policy?.mx ?? []
+    };
+    const evidence = { dns: json, policyStatus: status, contentType, policy };
+    if (!enforcing(policy)) return fail(observed, evidence);
+    const hosts = mxHosts((await doh(ctx, ctx.domain, "MX")).Answer);
+    if (hosts.length === 0) return unknown("dns.mx.none", { ...observed, mxActual: [] });
+    const mxUnmatched = hosts.filter((h) => !policy.mx.some((m) => mxCoveredBy(h, m)));
+    const final = { ...observed, mxActual: hosts, mxUnmatched };
+    const full = { ...evidence, mx: { policy: policy.mx, actual: hosts, unmatched: mxUnmatched } };
+    return mxUnmatched.length === 0 ? pass(final, full) : fail(final, full);
+  })
+};
+var mtaStsMxMatch = {
+  code: "email.mta_sts.mx_match",
+  provider: "email",
+  version: 1,
+  severity: "high",
+  maps: ["iso:8.24", "iso:8.20"],
+  // The one MTA-STS failure that is an incident rather than a gap. A policy in
+  // enforce mode whose mx: lines do not cover the zone's exchangers makes a
+  // conforming sender REJECT mail rather than deliver it: the domain is not
+  // less protected, it is not receiving email. That is why this is `high` and
+  // email.mta_sts is `low`, and why it exists as its own check at all —
+  // severity lives on the definition, not the result, so one check cannot say
+  // "absent, and that is a nice-to-have" and "misconfigured, and your mail is
+  // bouncing" with the right weight for each.
+  //
+  // It PASSES when no policy is in force, and records the zero it counted.
+  // Nothing is enforcing, so nothing is being rejected, and the hazard this
+  // check exists to find is genuinely absent — the same shape as
+  // vercel.projects.fork_protection, which holds only linked projects to the
+  // rule. `enforcing: false` with `mxChecked: 0` is exactly what the
+  // pass-that-counted-nothing detector in scripts/evidence-ledger.mjs is meant
+  // to surface for a human to dismiss, and it is right to surface it.
+  run: (ctx) => guarded("doh.mta-sts", async () => {
+    const { json, status, contentType, policy } = await stsPolicy(ctx);
+    const evidence = { dns: json, policyStatus: status, contentType, policy };
+    if (!enforcing(policy)) return pass({ enforcing: false, mxChecked: 0, mxUnmatched: [] }, evidence);
+    const hosts = mxHosts((await doh(ctx, ctx.domain, "MX")).Answer);
+    if (hosts.length === 0) return unknown("dns.mx.none", { enforcing: true, mxChecked: 0 });
+    const mxUnmatched = hosts.filter((h) => !policy.mx.some((m) => mxCoveredBy(h, m)));
+    const observed = { enforcing: true, mxChecked: hosts.length, mxPolicy: policy.mx, mxActual: hosts, mxUnmatched };
+    const full = { ...evidence, mx: { policy: policy.mx, actual: hosts, unmatched: mxUnmatched } };
+    return mxUnmatched.length === 0 ? pass(observed, full) : fail(observed, full);
   })
 };
 var tlsRpt = {
@@ -516,7 +754,7 @@ var tlsRpt = {
     return rec && rua ? pass(observed, json) : fail(observed, json);
   })
 };
-var EMAIL_CHECKS = [dkimPresent, spfReturnPath, dmarcEnforced, dmarcReporting, mtaSts, tlsRpt];
+var EMAIL_CHECKS = [dkimPresent, spfReturnPath, dmarcEnforced, dmarcReporting, mtaSts, mtaStsMxMatch, tlsRpt];
 async function runEmailChecks(ctx) {
   const out = [];
   for (const c of EMAIL_CHECKS) out.push({ code: c.code, version: c.version, result: await c.run(ctx) });
@@ -548,53 +786,88 @@ async function sites(ctx) {
   const r = await ctx.api.get("/sites?per_page=100");
   if (r.status === 403) throw new Error("scope:sites.read");
   if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.sites");
-  let list9 = r.json.filter((s) => s && s.id && s.name);
-  if (ctx.sites?.length) list9 = list9.filter((s) => ctx.sites.includes(s.name));
-  return list9.slice(0, max);
+  let list4 = r.json.filter((s) => s && s.id && s.name);
+  if (ctx.sites?.length) list4 = list4.filter((s) => ctx.sites.includes(s.name));
+  return list4.slice(0, max);
+}
+async function publishedSites(ctx) {
+  return (await sites(ctx)).filter((s) => Boolean(s.published_deploy));
 }
 var SECRET_KEY = /(SECRET|TOKEN|PASSWORD|PRIVATE|API_KEY|_KEY$|^KEY_)/i;
 var PUBLIC_KEY = /^(NEXT_PUBLIC_|PUBLIC_|VITE_|EXPO_PUBLIC_|REACT_APP_|GATSBY_)|_PUBLIC_KEY$|PUBLISHABLE/i;
+var REDIRECTS = /* @__PURE__ */ new Set([301, 302, 307, 308]);
 var forceHttps = {
   code: "netlify.site.force_https",
   provider: "netlify",
-  version: 1,
+  version: 2,
   severity: "high",
   maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
-  run: (ctx) => guarded("api.sites", async () => {
-    const list9 = await sites(ctx);
-    if (list9.length === 0) return unknown("api.no_sites");
-    const off = list9.filter((s) => s.ssl !== true || s.force_ssl !== true).map((s) => s.name);
-    const observed = { sites: list9.length, notForced: off };
-    const evidence = list9.map((s) => ({ name: s.name, ssl: s.ssl ?? null, force_ssl: s.force_ssl ?? null }));
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
+  run: (ctx) => guarded("site.force_https", async () => {
+    if ((await sites(ctx)).length === 0) return unknown("api.no_sites");
+    const list4 = await publishedSites(ctx);
+    if (list4.length === 0) return unknown("api.no_published_sites");
+    const f = ctx.fetch ?? readOnlyFetch;
+    const serving = [];
+    const evidence = {};
+    for (const s of list4) {
+      const host = s.custom_domain || s.default_domain || `${s.name}.netlify.app`;
+      const res = await f(`http://${host}/`, { method: "HEAD", redirect: "manual", signal: AbortSignal.timeout(1e4) });
+      const location = res.headers.get("location") ?? "";
+      const redirected = REDIRECTS.has(res.status) && /^https:\/\//i.test(location);
+      evidence[s.name] = {
+        host,
+        status: res.status,
+        redirectsToHttps: redirected,
+        aliases: s.domain_aliases ?? [],
+        // Kept because an auditor will ask, and because version 1 believed them.
+        apiSsl: s.ssl ?? null,
+        apiForceSsl: s.force_ssl ?? null
+      };
+      if (!redirected) serving.push(s.name);
+    }
+    const observed = { sites: list4.length, notForced: serving };
+    return serving.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
 var siteProtected = {
   code: "netlify.site.protected",
   provider: "netlify",
-  version: 1,
+  version: 2,
   severity: "medium",
   maps: ["soc2:CC6.1", "iso:8.3"],
   run: (ctx) => guarded("api.sites", async () => {
-    const list9 = await sites(ctx);
-    if (list9.length === 0) return unknown("api.no_sites");
-    if (list9.every((s) => s.password === void 0)) return unknown("api.protection_hidden", { sites: list9.length });
-    const open = list9.filter((s) => !s.password).map((s) => s.name);
-    const observed = { sites: list9.length, unprotected: open };
-    const evidence = list9.map((s) => ({ name: s.name, passwordSet: Boolean(s.password) }));
+    const list4 = await sites(ctx);
+    if (list4.length === 0) return unknown("api.no_sites");
+    const password = (s) => s.password !== void 0 ? Boolean(s.password) : s.has_password;
+    const locked = (s) => {
+      const p = password(s);
+      const sso = s.sso_login;
+      if (p === void 0 && sso === void 0) return void 0;
+      return p === true || sso === true;
+    };
+    if (list4.every((s) => locked(s) === void 0)) return unknown("api.protection_hidden", { sites: list4.length });
+    const open = list4.filter((s) => locked(s) !== true).map((s) => s.name);
+    const observed = { sites: list4.length, unprotected: open };
+    const evidence = list4.map((s) => ({
+      name: s.name,
+      protected: locked(s) ?? null,
+      passwordSet: password(s) ?? null,
+      teamLoginRequired: s.sso_login ?? null,
+      context: s.sso_login === true ? s.sso_login_context ?? null : s.password_context ?? null
+    }));
     return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
 var envSecretsMarked = {
   code: "netlify.env.secrets_marked",
   provider: "netlify",
-  version: 1,
+  version: 2,
   severity: "high",
   maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("api.env", async () => {
-    const list9 = await sites(ctx);
-    if (list9.length === 0) return unknown("api.no_sites");
-    const accounts = [...new Set(list9.map((s) => s.account_slug).filter((a) => Boolean(a)))];
+    const list4 = await sites(ctx);
+    if (list4.length === 0) return unknown("api.no_sites");
+    const accounts = [...new Set(list4.map((s) => s.account_slug).filter((a) => Boolean(a)))];
     if (accounts.length === 0) return unknown("api.no_account");
     const unmarked = {};
     const evidence = {};
@@ -610,35 +883,46 @@ var envSecretsMarked = {
       if (bad.length) unmarked[account] = bad;
     }
     const observed = { accounts: accounts.length, variables: total, secretLikeNotMarkedSecret: unmarked };
+    if (total === 0) return unknown("api.no_env_vars", observed);
     return Object.keys(unmarked).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
 var liveHeaders = {
   code: "netlify.site.headers",
   provider: "netlify",
-  version: 1,
+  version: 2,
   severity: "medium",
   maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("site.headers", async () => {
-    const list9 = await sites(ctx);
-    if (list9.length === 0) return unknown("api.no_sites");
+    if ((await sites(ctx)).length === 0) return unknown("api.no_sites");
+    const list4 = await publishedSites(ctx);
+    if (list4.length === 0) return unknown("api.no_published_sites");
     const f = ctx.fetch ?? readOnlyFetch;
     const missing = {};
     const evidence = {};
-    for (const s of list9) {
+    const behindLogin = [];
+    let judged = 0;
+    for (const s of list4) {
       const url = s.ssl_url ?? s.url;
       if (!url) continue;
       const res = await f(url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(1e4) });
       const h = (n) => res.headers.get(n);
+      if (res.status === 401 || res.status === 403) {
+        behindLogin.push(s.name);
+        evidence[s.name] = { url, status: res.status, judged: false, reason: "behind site protection" };
+        continue;
+      }
+      judged++;
       const csp = h("content-security-policy") ?? "";
       const gaps = [];
       if (!h("x-frame-options") && !/frame-ancestors/i.test(csp)) gaps.push("framing");
       if ((h("x-content-type-options") ?? "").toLowerCase() !== "nosniff") gaps.push("nosniff");
       if (!h("referrer-policy")) gaps.push("referrer-policy");
-      evidence[s.name] = { url, status: res.status, xFrameOptions: h("x-frame-options"), nosniff: h("x-content-type-options"), referrerPolicy: h("referrer-policy"), cspFrameAncestors: /frame-ancestors/i.test(csp) };
+      evidence[s.name] = { url, status: res.status, judged: true, xFrameOptions: h("x-frame-options"), nosniff: h("x-content-type-options"), referrerPolicy: h("referrer-policy"), cspFrameAncestors: /frame-ancestors/i.test(csp) };
       if (gaps.length) missing[s.name] = gaps;
     }
-    const observed = { sites: list9.length, missing };
+    const observed = { sites: judged, behindLogin, missing };
+    if (judged === 0) return unknown("api.sites_behind_login", observed);
     return Object.keys(missing).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -678,16 +962,24 @@ function neonApi(key, fetchImpl = readOnlyFetch) {
 }
 var WEEK = 7 * 24 * 3600;
 var STALE_DAYS = 30;
+async function listProjectIds(api) {
+  const orgs = await api.get("/users/me/organizations");
+  const orgIds = orgs.status === 200 ? (orgs.json?.organizations ?? []).map((o) => o.id) : [];
+  const queries = orgIds.length > 0 ? orgIds.map((id) => `/projects?org_id=${encodeURIComponent(id)}&limit=100`) : ["/projects?limit=100"];
+  const ids = [];
+  for (const q of queries) {
+    const r = await api.get(q);
+    if (r.status === 403) throw new Error("scope:projects.read");
+    if (r.status !== 200) throw new Error("scope:api.projects");
+    for (const p of r.json?.projects ?? []) ids.push(p.id);
+  }
+  return ids;
+}
 async function projects(ctx) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const max = ctx.maxProjects ?? 20;
   let ids = ctx.projects ?? [];
-  if (ids.length === 0) {
-    const r = await ctx.api.get("/projects?limit=100");
-    if (r.status === 403) throw new Error("scope:projects.read");
-    if (r.status !== 200) throw new Error("scope:api.projects");
-    ids = (r.json?.projects ?? []).map((p) => p.id);
-  }
+  if (ids.length === 0) ids = await listProjectIds(ctx.api);
   const out = [];
   for (const id of ids.slice(0, max)) {
     const r = await ctx.api.get(`/projects/${encodeURIComponent(id)}`);
@@ -709,11 +1001,11 @@ var ipAllowlist = {
   severity: "high",
   maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list9 = await projects(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
-    const open = list9.filter((p) => !p.settings?.allowed_ips?.ips?.length && p.settings?.block_public_connections !== true).map((p) => p.name);
-    const observed = { projects: list9.length, openToAnyAddress: open };
-    const evidence = list9.map((p) => ({ name: p.name, allowedIps: p.settings?.allowed_ips?.ips?.length ?? 0, protectedBranchesOnly: p.settings?.allowed_ips?.protected_branches_only ?? null, blockPublic: p.settings?.block_public_connections ?? null }));
+    const list4 = await projects(ctx);
+    if (list4.length === 0) return unknown("api.no_projects");
+    const open = list4.filter((p) => !p.settings?.allowed_ips?.ips?.length && p.settings?.block_public_connections !== true).map((p) => p.name);
+    const observed = { projects: list4.length, openToAnyAddress: open };
+    const evidence = list4.map((p) => ({ name: p.name, allowedIps: p.settings?.allowed_ips?.ips?.length ?? 0, protectedBranchesOnly: p.settings?.allowed_ips?.protected_branches_only ?? null, blockPublic: p.settings?.block_public_connections ?? null }));
     return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -724,17 +1016,17 @@ var defaultProtected = {
   severity: "high",
   maps: ["soc2:CC6.1", "soc2:A1.2", "iso:8.13"],
   run: (ctx) => guarded("api.branches", async () => {
-    const list9 = await projects(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
+    const list4 = await projects(ctx);
+    if (list4.length === 0) return unknown("api.no_projects");
     const unprotected = [];
     const evidence = {};
-    for (const p of list9) {
+    for (const p of list4) {
       const bs = await branches(ctx, p.id);
       const main2 = bs.find((b) => b.default);
       evidence[p.name] = main2 ? { branch: main2.name, protected: main2.protected ?? false } : null;
       if (!main2 || main2.protected !== true) unprotected.push(p.name);
     }
-    const observed = { projects: list9.length, defaultUnprotected: unprotected };
+    const observed = { projects: list4.length, defaultUnprotected: unprotected };
     return unprotected.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -745,11 +1037,11 @@ var historyRetention = {
   severity: "high",
   maps: ["soc2:A1.2", "iso:8.13", "gdpr:art32"],
   run: (ctx) => guarded("api.projects", async () => {
-    const list9 = await projects(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
-    const short = list9.filter((p) => (p.history_retention_seconds ?? 0) < WEEK).map((p) => p.name);
-    const observed = { projects: list9.length, underSevenDays: short, requiredSeconds: WEEK };
-    const evidence = list9.map((p) => ({ name: p.name, historyRetentionSeconds: p.history_retention_seconds ?? null }));
+    const list4 = await projects(ctx);
+    if (list4.length === 0) return unknown("api.no_projects");
+    const short = list4.filter((p) => (p.history_retention_seconds ?? 0) < WEEK).map((p) => p.name);
+    const observed = { projects: list4.length, underSevenDays: short, requiredSeconds: WEEK };
+    const evidence = list4.map((p) => ({ name: p.name, historyRetentionSeconds: p.history_retention_seconds ?? null }));
     return short.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -760,18 +1052,18 @@ var stalePreviews = {
   severity: "medium",
   maps: ["soc2:CC6.5", "gdpr:art5", "iso:8.10"],
   run: (ctx) => guarded("api.branches", async () => {
-    const list9 = await projects(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
+    const list4 = await projects(ctx);
+    if (list4.length === 0) return unknown("api.no_projects");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
     const stale = {};
     const evidence = {};
-    for (const p of list9) {
+    for (const p of list4) {
       const bs = await branches(ctx, p.id);
       const old = bs.filter((b) => !b.default && b.parent_id && b.created_at && now - Date.parse(b.created_at) > STALE_DAYS * 24 * 3600 * 1e3).map((b) => b.name);
       evidence[p.name] = bs.map((b) => ({ name: b.name, default: b.default ?? false, parent: b.parent_id ?? null, createdAt: b.created_at ?? null }));
       if (old.length) stale[p.name] = old;
     }
-    const observed = { projects: list9.length, staleDays: STALE_DAYS, stale };
+    const observed = { projects: list4.length, staleDays: STALE_DAYS, stale };
     return Object.keys(stale).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -815,7 +1107,7 @@ async function services(ctx) {
   const max = ctx.maxServices ?? 50;
   const out = [];
   let cursor = "";
-  for (let page = 0; page < 5; page++) {
+  for (let page2 = 0; page2 < 5; page2++) {
     const r = await ctx.api.get(`/services?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
     if (r.status === 403) throw new Error("scope:services.read");
     if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.services");
@@ -825,8 +1117,8 @@ async function services(ctx) {
     cursor = items[items.length - 1]?.cursor ?? "";
     if (!cursor) break;
   }
-  const list9 = ctx.services?.length ? out.filter((s) => ctx.services.includes(s.name)) : out;
-  return list9.slice(0, max);
+  const list4 = ctx.services?.length ? out.filter((s) => ctx.services.includes(s.name)) : out;
+  return list4.slice(0, max);
 }
 var healthCheck = {
   code: "render.service.health_check",
@@ -835,27 +1127,27 @@ var healthCheck = {
   severity: "medium",
   maps: ["soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.services", async () => {
-    const list9 = (await services(ctx)).filter((s) => s.type === "web_service" && s.suspended !== "suspended");
-    if (list9.length === 0) return unknown("api.no_web_services");
-    const without = list9.filter((s) => !s.serviceDetails?.healthCheckPath).map((s) => s.name);
-    const observed = { webServices: list9.length, withoutHealthCheck: without };
-    const evidence = list9.map((s) => ({ name: s.name, healthCheckPath: s.serviceDetails?.healthCheckPath ?? null, region: s.serviceDetails?.region ?? null }));
+    const list4 = (await services(ctx)).filter((s) => s.type === "web_service" && s.suspended !== "suspended");
+    if (list4.length === 0) return unknown("api.no_web_services");
+    const without = list4.filter((s) => !s.serviceDetails?.healthCheckPath).map((s) => s.name);
+    const observed = { webServices: list4.length, withoutHealthCheck: without };
+    const evidence = list4.map((s) => ({ name: s.name, healthCheckPath: s.serviceDetails?.healthCheckPath ?? null, region: s.serviceDetails?.region ?? null }));
     return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
 var customDomainsVerified = {
   code: "render.service.custom_domains_verified",
   provider: "render",
-  version: 1,
+  version: 2,
   severity: "medium",
   maps: ["soc2:CC6.7", "iso:8.24"],
   run: (ctx) => guarded("api.domains", async () => {
-    const list9 = (await services(ctx)).filter((s) => WEB.has(s.type) && s.suspended !== "suspended");
-    if (list9.length === 0) return unknown("api.no_web_services");
+    const list4 = (await services(ctx)).filter((s) => WEB.has(s.type) && s.suspended !== "suspended");
+    if (list4.length === 0) return unknown("api.no_web_services");
     const pending = {};
     const evidence = {};
     let domains = 0;
-    for (const s of list9) {
+    for (const s of list4) {
       const r = await ctx.api.get(`/services/${encodeURIComponent(s.id)}/custom-domains?limit=100`);
       if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.domains");
       const items = r.json.map((i) => i.customDomain).filter((d) => Boolean(d));
@@ -864,22 +1156,34 @@ var customDomainsVerified = {
       evidence[s.name] = items.map((d) => ({ name: d.name ?? null, verificationStatus: d.verificationStatus ?? null }));
       if (bad.length) pending[s.name] = bad;
     }
-    const observed = { services: list9.length, customDomains: domains, unverified: pending };
+    if (domains === 0) return unknown("api.no_custom_domains");
+    const observed = { services: list4.length, customDomains: domains, unverified: pending };
     return Object.keys(pending).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
 var notifyOnFail = {
   code: "render.service.notify_on_fail",
   provider: "render",
-  version: 1,
+  version: 2,
   severity: "low",
   maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
   run: (ctx) => guarded("api.services", async () => {
-    const list9 = (await services(ctx)).filter((s) => s.suspended !== "suspended");
-    if (list9.length === 0) return unknown("api.no_services");
-    const silent = list9.filter((s) => s.notifyOnFail === "ignore").map((s) => s.name);
-    const observed = { services: list9.length, deployFailuresIgnored: silent };
-    const evidence = list9.map((s) => ({ name: s.name, type: s.type, notifyOnFail: s.notifyOnFail ?? null }));
+    const list4 = (await services(ctx)).filter((s) => s.suspended !== "suspended");
+    if (list4.length === 0) return unknown("api.no_services");
+    const owners = [...new Set(list4.filter((s) => (s.notifyOnFail ?? "default") === "default").map((s) => s.ownerId ?? ""))];
+    const quiet = /* @__PURE__ */ new Set();
+    const workspace = {};
+    for (const owner of owners) {
+      if (!owner) throw new Error("scope:api.shape.ownerId");
+      const r = await ctx.api.get(`/notification-settings/owners/${encodeURIComponent(owner)}`);
+      if (r.status !== 200 || !r.json) throw new Error("scope:api.notification_settings");
+      const n = r.json;
+      workspace[owner] = { notificationsToSend: n.notificationsToSend ?? null, emailEnabled: n.emailEnabled ?? null, slackEnabled: n.slackEnabled ?? null };
+      if (n.notificationsToSend === "none" || !n.emailEnabled && !n.slackEnabled) quiet.add(owner);
+    }
+    const silent = list4.filter((s) => s.notifyOnFail === "ignore" || (s.notifyOnFail ?? "default") === "default" && quiet.has(s.ownerId ?? "")).map((s) => s.name);
+    const observed = { services: list4.length, deployFailuresIgnored: silent };
+    const evidence = { services: list4.map((s) => ({ name: s.name, type: s.type, notifyOnFail: s.notifyOnFail ?? null })), workspace };
     return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -924,9 +1228,9 @@ async function apps(ctx) {
   const r = await ctx.api.get("/apps");
   if (r.status === 403) throw new Error("scope:apps.read");
   if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.apps");
-  let list9 = r.json.filter((a) => a && a.id && a.name);
-  if (ctx.apps?.length) list9 = list9.filter((a) => ctx.apps.includes(a.name));
-  return list9.slice(0, max);
+  let list4 = r.json.filter((a) => a && a.id && a.name);
+  if (ctx.apps?.length) list4 = list4.filter((a) => ctx.apps.includes(a.name));
+  return list4.slice(0, max);
 }
 var managedCerts = {
   code: "heroku.app.managed_certs",
@@ -935,12 +1239,12 @@ var managedCerts = {
   severity: "high",
   maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
   run: (ctx) => guarded("api.domains", async () => {
-    const list9 = await apps(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
+    const list4 = await apps(ctx);
+    if (list4.length === 0) return unknown("api.no_apps");
     const bad = {};
     const evidence = {};
     let custom = 0;
-    for (const a of list9) {
+    for (const a of list4) {
       const r = await ctx.api.get(`/apps/${encodeURIComponent(a.id)}/domains`);
       if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.domains");
       const domains = r.json.filter((d) => d.kind === "custom");
@@ -949,7 +1253,7 @@ var managedCerts = {
       evidence[a.name] = { acm: a.acm ?? null, customDomains: domains.map((d) => ({ hostname: d.hostname ?? null, status: d.status ?? null, cert: Boolean(d.sni_endpoint) })) };
       if (without.length) bad[a.name] = without;
     }
-    const observed = { apps: list9.length, customDomains: custom, withoutCertificate: bad };
+    const observed = { apps: list4.length, customDomains: custom, withoutCertificate: bad };
     return Object.keys(bad).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -960,12 +1264,12 @@ var maintenanceOff = {
   severity: "medium",
   maps: ["soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.apps", async () => {
-    const list9 = await apps(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
-    if (shapeMismatch(list9, (a) => [a.maintenance])) return unknown("api.shape.maintenance");
-    const on = list9.filter((a) => a.maintenance === true).map((a) => a.name);
-    const observed = { apps: list9.length, inMaintenance: on };
-    return on.length === 0 ? pass(observed, list9.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false }))) : fail(observed, list9.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false })));
+    const list4 = await apps(ctx);
+    if (list4.length === 0) return unknown("api.no_apps");
+    if (shapeMismatch(list4, (a) => [a.maintenance])) return unknown("api.shape.maintenance");
+    const on = list4.filter((a) => a.maintenance === true).map((a) => a.name);
+    const observed = { apps: list4.length, inMaintenance: on };
+    return on.length === 0 ? pass(observed, list4.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false }))) : fail(observed, list4.map((a) => ({ name: a.name, maintenance: a.maintenance ?? false })));
   })
 };
 var stackSupported = {
@@ -975,12 +1279,12 @@ var stackSupported = {
   severity: "high",
   maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
   run: (ctx) => guarded("api.apps", async () => {
-    const list9 = await apps(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
-    if (shapeMismatch(list9, (a) => [a.stack])) return unknown("api.shape.stack");
-    const old = list9.filter((a) => !SUPPORTED_STACKS.has(a.stack?.name ?? "")).map((a) => `${a.name} (${a.stack?.name ?? "unknown"})`);
-    const observed = { apps: list9.length, unsupportedStack: old, supported: [...SUPPORTED_STACKS] };
-    const evidence = list9.map((a) => ({ name: a.name, stack: a.stack?.name ?? null, buildStack: a.build_stack?.name ?? null }));
+    const list4 = await apps(ctx);
+    if (list4.length === 0) return unknown("api.no_apps");
+    if (shapeMismatch(list4, (a) => [a.stack])) return unknown("api.shape.stack");
+    const old = list4.filter((a) => !SUPPORTED_STACKS.has(a.stack?.name ?? "")).map((a) => `${a.name} (${a.stack?.name ?? "unknown"})`);
+    const observed = { apps: list4.length, unsupportedStack: old, supported: [...SUPPORTED_STACKS] };
+    const evidence = list4.map((a) => ({ name: a.name, stack: a.stack?.name ?? null, buildStack: a.build_stack?.name ?? null }));
     return old.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -991,12 +1295,12 @@ var webRedundancy = {
   severity: "low",
   maps: ["soc2:A1.2", "iso:8.14"],
   run: (ctx) => guarded("api.formation", async () => {
-    const list9 = await apps(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
+    const list4 = await apps(ctx);
+    if (list4.length === 0) return unknown("api.no_apps");
     const single = [];
     const evidence = {};
     let withWeb = 0;
-    for (const a of list9) {
+    for (const a of list4) {
       const r = await ctx.api.get(`/apps/${encodeURIComponent(a.id)}/formation`);
       if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.formation");
       const web = r.json.find((f) => f.type === "web");
@@ -1005,7 +1309,7 @@ var webRedundancy = {
       withWeb++;
       if ((web.quantity ?? 0) < 2) single.push(a.name);
     }
-    if (withWeb === 0) return unknown("api.no_web_dynos", { apps: list9.length });
+    if (withWeb === 0) return unknown("api.no_web_dynos", { apps: list4.length });
     const observed = { appsWithWeb: withWeb, singleWebDyno: single };
     return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
@@ -1052,7 +1356,7 @@ var DAY = 24 * 3600 * 1e3;
 var redirectUrlsHttps = {
   code: "clerk.redirect_urls.https_only",
   provider: "clerk",
-  version: 1,
+  version: 2,
   severity: "high",
   maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
   run: (ctx) => guarded("api.redirect_urls", async () => {
@@ -1061,6 +1365,7 @@ var redirectUrlsHttps = {
     if (r.status === 403) throw new Error("scope:redirect_urls.read");
     if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.redirect_urls");
     const urls = r.json.map((u) => u.url ?? "").filter(Boolean);
+    if (urls.length === 0) return unknown("api.no_redirect_urls");
     const bad = urls.filter((u) => !/^https:\/\//i.test(u) || /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:|\/|$)/i.test(u) || /^https:\/\/[^/]*\.(local|test|localhost)(:|\/|$)/i.test(u));
     const observed = { redirectUrls: urls.length, insecureOrLocal: bad };
     return bad.length === 0 ? pass(observed, { urls }) : fail(observed, { urls });
@@ -1097,17 +1402,17 @@ var dormantUsers = {
     const r = await ctx.api.get(`/users?limit=${USER_CAP}&order_by=-last_active_at`);
     if (r.status === 403) throw new Error("scope:users.read");
     if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.users");
-    const users3 = r.json.filter((u) => u && u.id && !u.banned && !u.locked);
+    const users = r.json.filter((u) => u && u.id && !u.banned && !u.locked);
     if (r.json.length >= USER_CAP) return unknown("api.users.too_many", { users: r.json.length, cap: USER_CAP });
-    if (users3.length === 0) return unknown("api.no_users");
+    if (users.length === 0) return unknown("api.no_users");
     const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    if (shapeMismatch(users3, (u) => [u.last_active_at, u.last_sign_in_at, u.created_at])) return unknown("api.shape.last_active_at");
-    const dormant = users3.filter((u) => {
+    if (shapeMismatch(users, (u) => [u.last_active_at, u.last_sign_in_at, u.created_at])) return unknown("api.shape.last_active_at");
+    const dormant = users.filter((u) => {
       const last = u.last_active_at ?? u.last_sign_in_at ?? null;
       if (last) return now - last > DORMANT_DAYS * DAY;
       return (u.created_at ?? now) < now - NEW_DAYS * DAY;
     });
-    const observed = { users: users3.length, dormant: dormant.length, dormantDays: DORMANT_DAYS };
+    const observed = { users: users.length, dormant: dormant.length, dormantDays: DORMANT_DAYS };
     const evidence = { dormantUserIds: dormant.map((u) => u.id) };
     return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
@@ -1246,8 +1551,8 @@ var HTTP_TYPES = /* @__PURE__ */ new Set(["status", "expected_status_code", "key
 async function monitors(ctx) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const out = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const r = await ctx.api.get(`/monitors?per_page=250&page=${page}`);
+  for (let page2 = 1; page2 <= MAX_PAGES; page2++) {
+    const r = await ctx.api.get(`/monitors?per_page=250&page=${page2}`);
     if (r.status !== 200) throw new Error("scope:api.monitors");
     const body = r.json;
     for (const m of body?.data ?? []) out.push({ id: m.id, ...m.attributes ?? {} });
@@ -1295,12 +1600,12 @@ var checkFrequency = {
   severity: "low",
   maps: ["soc2:CC7.2", "iso:8.16"],
   run: (ctx) => guarded("api.monitors", async () => {
-    const live2 = (await monitors(ctx)).filter(active);
-    if (live2.length === 0) return unknown("api.no_active_monitors");
-    if (shapeMismatch(live2, (m) => [m.check_frequency])) return unknown("api.shape.check_frequency");
-    const slow = live2.filter((m) => !(typeof m.check_frequency === "number" && m.check_frequency <= MAX_FREQUENCY_SECONDS)).map(label);
-    const observed = { monitors: live2.length, slowerThanSeconds: MAX_FREQUENCY_SECONDS, slow };
-    const evidence = live2.map((m) => ({ name: label(m), checkFrequencySeconds: m.check_frequency ?? null }));
+    const live = (await monitors(ctx)).filter(active);
+    if (live.length === 0) return unknown("api.no_active_monitors");
+    if (shapeMismatch(live, (m) => [m.check_frequency])) return unknown("api.shape.check_frequency");
+    const slow = live.filter((m) => !(typeof m.check_frequency === "number" && m.check_frequency <= MAX_FREQUENCY_SECONDS)).map(label);
+    const observed = { monitors: live.length, slowerThanSeconds: MAX_FREQUENCY_SECONDS, slow };
+    const evidence = live.map((m) => ({ name: label(m), checkFrequencySeconds: m.check_frequency ?? null }));
     return slow.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -1311,12 +1616,12 @@ var alerting = {
   severity: "medium",
   maps: ["soc2:CC7.3", "soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.monitors", async () => {
-    const live2 = (await monitors(ctx)).filter(active);
-    if (live2.length === 0) return unknown("api.no_active_monitors");
-    if (shapeMismatch(live2, (m) => [m.policy_id, m.call, m.sms, m.email, m.push])) return unknown("api.shape.policy_id");
-    const silent = live2.filter((m) => !(m.policy_id || m.call || m.sms || m.email || m.push)).map(label);
-    const observed = { monitors: live2.length, withoutAlerts: silent };
-    const evidence = live2.map((m) => ({ name: label(m), policy: Boolean(m.policy_id), call: m.call ?? false, sms: m.sms ?? false, email: m.email ?? false, push: m.push ?? false }));
+    const live = (await monitors(ctx)).filter(active);
+    if (live.length === 0) return unknown("api.no_active_monitors");
+    if (shapeMismatch(live, (m) => [m.policy_id, m.call, m.sms, m.email, m.push])) return unknown("api.shape.policy_id");
+    const silent = live.filter((m) => !(m.policy_id || m.call || m.sms || m.email || m.push)).map(label);
+    const observed = { monitors: live.length, withoutAlerts: silent };
+    const evidence = live.map((m) => ({ name: label(m), policy: Boolean(m.policy_id), call: m.call ?? false, sms: m.sms ?? false, email: m.email ?? false, push: m.push ?? false }));
     return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -1356,8 +1661,8 @@ function railwayApi(projectToken, fetchImpl = readOnlyFetch) {
     }
   };
 }
-async function gql(api4, query, variables, scope) {
-  const r = await api4.query(query, variables);
+async function gql(api, query, variables, scope) {
+  const r = await api.query(query, variables);
   const body = r.json;
   if (body?.errors?.some((e) => /unauthori[sz]ed|not authorized|forbidden/i.test(e.message ?? "") || e.extensions?.code === "UNAUTHENTICATED")) throw new Error("scope:auth");
   if (r.status !== 200 || !body?.data || body.errors?.length) throw new Error(`scope:${scope}`);
@@ -1368,17 +1673,17 @@ var Q_PROJECT = "query snoopiosProject($id: String!) { project(id: $id) { id nam
 var Q_INSTANCE = "query snoopiosInstance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { healthcheckPath numReplicas restartPolicyType } }";
 var Q_DOMAINS = "query snoopiosDomains($projectId: String!, $environmentId: String!, $serviceId: String!) { domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) { serviceDomains { domain } customDomains { domain status { dnsRecords { hostlabel requiredValue currentValue status } } } } }";
 var MAX_SERVICES = 50;
-async function load(api4) {
-  const tok = await gql(api4, Q_TOKEN, {}, "api.project_token");
+async function load(api) {
+  const tok = await gql(api, Q_TOKEN, {}, "api.project_token");
   const projectId = tok.projectToken?.projectId ?? "";
   const environmentId = tok.projectToken?.environmentId ?? "";
   if (!projectId || !environmentId) throw new Error("scope:api.project_token");
-  const proj = await gql(api4, Q_PROJECT, { id: projectId }, "api.project");
+  const proj = await gql(api, Q_PROJECT, { id: projectId }, "api.project");
   const nodes = (proj.project?.services?.edges ?? []).map((e) => e.node).filter((n) => Boolean(n?.id)).slice(0, MAX_SERVICES);
   const services2 = [];
   for (const n of nodes) {
-    const inst = await gql(api4, Q_INSTANCE, { serviceId: n.id, environmentId }, "api.service_instance");
-    const dom = await gql(api4, Q_DOMAINS, { projectId, environmentId, serviceId: n.id }, "api.domains");
+    const inst = await gql(api, Q_INSTANCE, { serviceId: n.id, environmentId }, "api.service_instance");
+    const dom = await gql(api, Q_DOMAINS, { projectId, environmentId, serviceId: n.id }, "api.domains");
     services2.push({
       id: n.id,
       name: n.name ?? n.id,
@@ -1497,7 +1802,12 @@ async function settings(ctx) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const [vcs, org, repo2] = ctx.project.split("/");
   const r = await ctx.api.get(`/project/${encodeURIComponent(vcs)}/${encodeURIComponent(org)}/${encodeURIComponent(repo2)}/settings`);
-  if (r.status === 403) throw new Error("scope:scope.settings");
+  if (r.status === 403) {
+    const p = await ctx.api.get(`/project/${ctx.project.split("/").map(encodeURIComponent).join("/")}`);
+    const provider = p.json?.vcs_info?.provider;
+    if (p.status === 200 && provider === "CircleCI") throw new Error("scope:api.github_app_project");
+    throw new Error("scope:scope.settings");
+  }
   if (r.status === 404) throw new Error("scope:api.project_not_found");
   if (r.status !== 200) throw new Error("scope:api.settings");
   return r.json?.advanced ?? {};
@@ -1580,9 +1890,9 @@ var LIMIT = 100;
 async function list(ctx, path, scope) {
   if (!ctx.api) throw new Error("scope:api.not_connected");
   const out = [];
-  for (let page = 1; page <= 10; page++) {
+  for (let page2 = 1; page2 <= 10; page2++) {
     const sep = path.includes("?") ? "&" : "?";
-    const r = await ctx.api.get(`${path}${sep}limit=${LIMIT}&page=${page}`);
+    const r = await ctx.api.get(`${path}${sep}limit=${LIMIT}&page=${page2}`);
     if (r.status !== 200 || !Array.isArray(r.json)) throw new Error(`scope:api.${scope}`);
     out.push(...r.json);
     if (r.json.length < LIMIT) break;
@@ -1612,12 +1922,12 @@ var checksAlert = {
   severity: "medium",
   maps: ["soc2:CC7.3", "soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.checks", async () => {
-    const live2 = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
-    if (live2.length === 0) return unknown("api.no_active_checks");
-    if (shapeMismatch(live2, (c) => [c.alertChannelSubscriptions])) return unknown("api.shape.alertChannelSubscriptions");
-    const silent = live2.filter((c) => !(c.alertChannelSubscriptions ?? []).some((s) => s.activated !== false)).map(label2);
-    const observed = { activeChecks: live2.length, withoutAlertChannel: silent };
-    const evidence = live2.map((c) => ({ check: label2(c), channels: (c.alertChannelSubscriptions ?? []).filter((s) => s.activated !== false).length }));
+    const live = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
+    if (live.length === 0) return unknown("api.no_active_checks");
+    if (shapeMismatch(live, (c) => [c.alertChannelSubscriptions])) return unknown("api.shape.alertChannelSubscriptions");
+    const silent = live.filter((c) => !(c.alertChannelSubscriptions ?? []).some((s) => s.activated !== false)).map(label2);
+    const observed = { activeChecks: live.length, withoutAlertChannel: silent };
+    const evidence = live.map((c) => ({ check: label2(c), channels: (c.alertChannelSubscriptions ?? []).filter((s) => s.activated !== false).length }));
     return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -1644,12 +1954,12 @@ var multiLocation = {
   severity: "low",
   maps: ["soc2:A1.1", "iso:8.16"],
   run: (ctx) => guarded("api.checks", async () => {
-    const live2 = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
-    if (live2.length === 0) return unknown("api.no_active_checks");
-    if (shapeMismatch(live2, (c) => [c.locations])) return unknown("api.shape.locations");
-    const single = live2.filter((c) => (c.locations ?? []).length < 2).map(label2);
-    const observed = { activeChecks: live2.length, singleLocation: single };
-    const evidence = live2.map((c) => ({ check: label2(c), locations: c.locations ?? [] }));
+    const live = (await list(ctx, "/v1/checks?applyGroupSettings=true", "checks")).filter((c) => c.activated !== false);
+    if (live.length === 0) return unknown("api.no_active_checks");
+    if (shapeMismatch(live, (c) => [c.locations])) return unknown("api.shape.locations");
+    const single = live.filter((c) => (c.locations ?? []).length < 2).map(label2);
+    const observed = { activeChecks: live.length, singleLocation: single };
+    const evidence = live.map((c) => ({ check: label2(c), locations: c.locations ?? [] }));
     return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -1737,13 +2047,13 @@ var ownersLimited = {
   severity: "medium",
   maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
   run: (ctx) => guarded("api.members", async () => {
-    const members2 = await get(ctx, "/members", "members", "members");
-    if (members2.length === 0) return unknown("api.no_members");
-    if (shapeMismatch(members2, (m) => [m.role])) return unknown("api.shape.role");
-    const owners = members2.filter((m) => m.role === "owner").length;
-    const admins = members2.filter((m) => m.role === "admin").length;
-    const observed = { members: members2.length, owners, admins, max: MAX_OWNERS };
-    const evidence = { roles: members2.reduce((acc, m) => ({ ...acc, [m.role ?? "?"]: (acc[m.role ?? "?"] ?? 0) + 1 }), {}) };
+    const members = await get(ctx, "/members", "members", "members");
+    if (members.length === 0) return unknown("api.no_members");
+    if (shapeMismatch(members, (m) => [m.role])) return unknown("api.shape.role");
+    const owners = members.filter((m) => m.role === "owner").length;
+    const admins = members.filter((m) => m.role === "admin").length;
+    const observed = { members: members.length, owners, admins, max: MAX_OWNERS };
+    const evidence = { roles: members.reduce((acc, m) => ({ ...acc, [m.role ?? "?"]: (acc[m.role ?? "?"] ?? 0) + 1 }), {}) };
     return owners > 0 && owners <= MAX_OWNERS ? pass(observed, evidence) : fail(observed, evidence);
   })
 };
@@ -1885,6 +2195,1117 @@ async function runWorkOsChecks(ctx) {
   return out;
 }
 
+// ../lib/checks/findings.ts
+var REMEDIATION_DAYS = 30;
+var LONG_STOP_DAYS = 90;
+var SCAN_DAYS = 14;
+var URGENT = ["critical", "high"];
+var olderThan = (f, cutoff) => !f.openedAt || Date.parse(f.openedAt) < cutoff;
+var describe = (f) => `${f.ref} (${f.severity}, opened ${(f.openedAt ?? "date unknown").slice(0, 10)})`;
+function judgeNoCritical(findings4) {
+  if (findings4.length > 0 && shapeMismatch(findings4, (f) => [f.severity === "unknown" ? void 0 : f.severity])) {
+    return unknown("api.shape.severity");
+  }
+  const critical = findings4.filter((f) => f.severity === "critical").map(describe);
+  const observed = { openFindings: findings4.length, critical: critical.length, findings: critical.slice(0, 10) };
+  return critical.length === 0 ? pass(observed, findings4.length) : fail(observed, findings4.length);
+}
+function judgeWithinWindow(findings4, now) {
+  const urgent = findings4.filter((f) => URGENT.includes(f.severity));
+  if (urgent.length === 0) {
+    const observed2 = { openFindings: findings4.length, urgent: 0, withinDays: REMEDIATION_DAYS, overdue: 0, findings: [] };
+    return pass(observed2, findings4.length);
+  }
+  if (shapeMismatch(urgent, (f) => [f.openedAt])) return unknown("api.shape.openedAt");
+  const cutoff = now.getTime() - REMEDIATION_DAYS * 864e5;
+  const overdue = urgent.filter((f) => olderThan(f, cutoff)).map(describe);
+  const observed = { openFindings: findings4.length, urgent: urgent.length, withinDays: REMEDIATION_DAYS, overdue: overdue.length, findings: overdue.slice(0, 10) };
+  return overdue.length === 0 ? pass(observed, urgent.length) : fail(observed, urgent.length);
+}
+function judgeNoAncient(findings4, now) {
+  if (findings4.length === 0) {
+    return pass({ openFindings: 0, withinDays: LONG_STOP_DAYS, ancient: 0, findings: [] }, 0);
+  }
+  if (shapeMismatch(findings4, (f) => [f.openedAt])) return unknown("api.shape.openedAt");
+  const cutoff = now.getTime() - LONG_STOP_DAYS * 864e5;
+  const ancient = findings4.filter((f) => olderThan(f, cutoff)).map(describe);
+  const observed = { openFindings: findings4.length, withinDays: LONG_STOP_DAYS, ancient: ancient.length, findings: ancient.slice(0, 10) };
+  return ancient.length === 0 ? pass(observed, findings4.length) : fail(observed, findings4.length);
+}
+function judgeScanFresh(lastScan, now, label4) {
+  if (!lastScan) return unknown("scanner.no_scan_date");
+  const age = Math.floor((now.getTime() - Date.parse(lastScan)) / 864e5);
+  if (!Number.isFinite(age)) return unknown("api.shape.lastScan");
+  const observed = { subject: label4, lastScan: lastScan.slice(0, 10), daysAgo: age, withinDays: SCAN_DAYS };
+  return age <= SCAN_DAYS ? pass(observed, lastScan) : fail(observed, lastScan);
+}
+function severityOf(raw) {
+  const s = (raw ?? "").trim().toLowerCase();
+  if (s === "critical" || s === "blocker") return "critical";
+  if (s === "high" || s === "major") return "high";
+  if (s === "medium" || s === "moderate" || s === "warning") return "medium";
+  if (s === "low" || s === "info" || s === "note" || s === "minor") return "low";
+  return "unknown";
+}
+
+// ../lib/checks/providers/snyk.ts
+var need = (ctx) => {
+  if (!ctx.api || !ctx.orgId) throw new Error("scope:snyk.unconfigured");
+  return { api: ctx.api, orgId: ctx.orgId };
+};
+var VERSION = "2024-10-15";
+var MAX_PAGES3 = 10;
+var PER_PAGE = 100;
+async function collect(ctx, first, scope) {
+  const { api } = need(ctx);
+  const out = [];
+  let path = first;
+  for (let i = 0; i < MAX_PAGES3 && path; i++) {
+    const r = await api.get(path);
+    const body = r.json;
+    if (!body || !Array.isArray(body.data)) throw new Error(`scope:${scope}`);
+    out.push(...body.data);
+    path = body.links?.next;
+  }
+  return out;
+}
+async function openFindings(ctx) {
+  const { orgId } = need(ctx);
+  const issues = await collect(ctx, `/rest/orgs/${orgId}/issues?version=${VERSION}&limit=${PER_PAGE}&status=open`, "api.snyk.issues");
+  return issues.filter((i) => !i.attributes?.ignored && (i.attributes?.status ?? "open") === "open").map((i) => ({
+    ref: i.attributes?.key ?? i.attributes?.title ?? i.id ?? "an issue",
+    severity: severityOf(i.attributes?.effective_severity_level),
+    openedAt: i.attributes?.created_at
+  }));
+}
+async function projects2(ctx) {
+  const { orgId } = need(ctx);
+  return collect(ctx, `/rest/orgs/${orgId}/projects?version=${VERSION}&limit=${PER_PAGE}&meta.latest_issue_counts=true`, "api.snyk.projects");
+}
+var noCritical = {
+  code: "snyk.issues.no_critical",
+  provider: "snyk",
+  version: 1,
+  severity: "critical",
+  maps: ["soc2:CC7.1", "iso:8.8", "ce:patching", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.snyk.issues", async () => judgeNoCritical(await openFindings(ctx)))
+};
+var withinWindow = {
+  code: "snyk.issues.within_window",
+  provider: "snyk",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC7.1", "soc2:CC7.4", "iso:8.8", "ce:patching", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.snyk.issues", async () => judgeWithinWindow(await openFindings(ctx), ctx.now ?? /* @__PURE__ */ new Date()))
+};
+var noAncient = {
+  code: "snyk.issues.no_ancient",
+  provider: "snyk",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.1", "iso:8.8", "iso:5.25", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.snyk.issues", async () => judgeNoAncient(await openFindings(ctx), ctx.now ?? /* @__PURE__ */ new Date()))
+};
+var scanningFresh = {
+  code: "snyk.projects.scanned_recently",
+  provider: "snyk",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC7.1", "iso:8.8", "ce:patching", "nist-csf:DE.CM"],
+  run: (ctx) => guarded("api.snyk.projects", async () => {
+    const list4 = await projects2(ctx);
+    const active3 = list4.filter((p) => (p.attributes?.status ?? "active") === "active");
+    if (active3.length === 0) return unknown("api.snyk.no_projects");
+    const scannedAt = (p) => p.meta?.latest_issue_counts?.updated_at;
+    const dated = active3.map(scannedAt).filter((d) => typeof d === "string");
+    if (dated.length === 0) return unknown("api.shape.latest_issue_counts.updated_at");
+    const oldest = dated.reduce((a, b) => Date.parse(a) < Date.parse(b) ? a : b);
+    const stalest = active3.find((p) => scannedAt(p) === oldest);
+    const r = judgeScanFresh(oldest, ctx.now ?? /* @__PURE__ */ new Date(), stalest?.attributes?.name ?? "a project");
+    return { ...r, observed: { ...r.observed, projects: active3.length } };
+  })
+};
+var SNYK_CHECKS = [noCritical, withinWindow, scanningFresh, noAncient];
+var BASE = "https://api.snyk.io";
+var UA2 = "snoopios-check/1 (+https://snoopios.com)";
+var SNYK_ORG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function snykApi(token, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`${BASE}${path}`, {
+        headers: { authorization: `token ${token}`, accept: "application/vnd.api+json", "user-agent": UA2 },
+        signal: AbortSignal.timeout(3e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403) throw new Error("scope:plan.no_api_access");
+      const json = await res.json().catch(() => null);
+      return { status: res.status, json };
+    }
+  };
+}
+async function runSnykChecks(ctx) {
+  const out = [];
+  for (const c of SNYK_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/gitguardian.ts
+var need2 = (ctx) => {
+  if (!ctx.api) throw new Error("scope:gitguardian.unconfigured");
+  return ctx.api;
+};
+var MAX_PAGES4 = 10;
+var PER_PAGE2 = 100;
+var OPEN = /* @__PURE__ */ new Set(["TRIGGERED", "ASSIGNED"]);
+var LIVE = "valid";
+async function requireSources(api) {
+  const r = await api.get("/v1/sources?per_page=1");
+  if (r.status === 403) throw new Error("scope:scope.sources_read");
+  if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.sources");
+  if (r.json.length === 0) throw new Error("scope:api.no_sources");
+}
+async function incidents(ctx) {
+  const api = need2(ctx);
+  await requireSources(api);
+  const out = [];
+  let path = `/v1/incidents/secrets?per_page=${PER_PAGE2}`;
+  for (let i = 0; i < MAX_PAGES4 && path; i++) {
+    const r = await api.get(path);
+    if (!Array.isArray(r.json)) return out.length > 0 ? out : null;
+    out.push(...r.json);
+    path = r.next;
+  }
+  if (path) throw new Error("scope:gitguardian.too_many_incidents");
+  return out;
+}
+var openIncidents = (list4) => list4.filter((i) => OPEN.has((i.status ?? "").toUpperCase()));
+var label3 = (i) => i.detector?.display_name ?? i.detector?.name ?? (i.id !== void 0 ? `incident ${i.id}` : "an incident");
+function toFinding(i) {
+  const live = (i.validity ?? "").toLowerCase() === LIVE;
+  return { ref: label3(i), severity: live ? "critical" : severityOf(i.severity), openedAt: i.date };
+}
+async function findings(ctx) {
+  const list4 = await incidents(ctx);
+  return list4 === null ? null : openIncidents(list4).map(toFinding);
+}
+var noLiveSecrets = {
+  code: "gitguardian.secrets.none_live",
+  provider: "gitguardian",
+  version: 2,
+  severity: "critical",
+  maps: ["soc2:CC6.1", "soc2:CC6.3", "iso:8.24", "iso:5.17", "gdpr:art32", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.gitguardian.incidents", async () => {
+    const list4 = await incidents(ctx);
+    if (list4 === null) return unknown("api.shape.incidents");
+    const open = openIncidents(list4);
+    const live = open.filter((i) => (i.validity ?? "").toLowerCase() === LIVE).map(label3);
+    const observed = { openIncidents: open.length, stillValid: live.length, secrets: live.slice(0, 10) };
+    return live.length === 0 ? pass(observed, open.length) : fail(observed, open.length);
+  })
+};
+var noCritical2 = {
+  code: "gitguardian.secrets.no_critical",
+  provider: "gitguardian",
+  version: 2,
+  severity: "critical",
+  maps: ["soc2:CC6.1", "iso:8.24", "iso:5.17", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.gitguardian.incidents", async () => {
+    const list4 = await findings(ctx);
+    return list4 === null ? unknown("api.shape.incidents") : judgeNoCritical(list4);
+  })
+};
+var withinWindow2 = {
+  code: "gitguardian.secrets.within_window",
+  provider: "gitguardian",
+  version: 2,
+  severity: "high",
+  maps: ["soc2:CC7.1", "soc2:CC7.4", "iso:5.17", "iso:8.8", "nist-csf:RS.MA"],
+  run: (ctx) => guarded("api.gitguardian.incidents", async () => {
+    const list4 = await findings(ctx);
+    return list4 === null ? unknown("api.shape.incidents") : judgeWithinWindow(list4, ctx.now ?? /* @__PURE__ */ new Date());
+  })
+};
+var noAncient2 = {
+  code: "gitguardian.secrets.no_ancient",
+  provider: "gitguardian",
+  version: 2,
+  severity: "medium",
+  maps: ["soc2:CC7.1", "iso:5.17", "iso:5.25", "nist-csf:RS.MA"],
+  run: (ctx) => guarded("api.gitguardian.incidents", async () => {
+    const list4 = await findings(ctx);
+    return list4 === null ? unknown("api.shape.incidents") : judgeNoAncient(list4, ctx.now ?? /* @__PURE__ */ new Date());
+  })
+};
+var GITGUARDIAN_CHECKS = [noLiveSecrets, noCritical2, withinWindow2, noAncient2];
+var BASE2 = "https://api.gitguardian.com";
+var UA3 = "snoopios-check/1 (+https://snoopios.com)";
+function nextFromLink(link) {
+  if (!link) return null;
+  for (const part of link.split(",")) {
+    const m = /<([^>]+)>\s*;\s*rel="next"/.exec(part.trim());
+    if (!m) continue;
+    try {
+      const url = new URL(m[1]);
+      if (url.origin !== BASE2) return null;
+      return url.pathname + url.search;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+function gitGuardianApi(token, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`${BASE2}${path}`, {
+        headers: { authorization: `Token ${token}`, accept: "application/json", "user-agent": UA3 },
+        signal: AbortSignal.timeout(3e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403 && !path.startsWith("/v1/sources")) throw new Error("scope:gitguardian.forbidden");
+      const json = await res.json().catch(() => null);
+      return { status: res.status, json, next: nextFromLink(res.headers.get("link")) };
+    }
+  };
+}
+async function runGitGuardianChecks(ctx) {
+  const out = [];
+  for (const c of GITGUARDIAN_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/semgrep.ts
+var need3 = (ctx) => {
+  if (!ctx.api || !ctx.slug) throw new Error("scope:semgrep.unconfigured");
+  return { api: ctx.api, slug: ctx.slug };
+};
+var MAX_PAGES5 = 10;
+var PER_PAGE3 = 100;
+var OPEN2 = /* @__PURE__ */ new Set(["unresolved", "open", "reviewing"]);
+async function findings2(ctx) {
+  const { api, slug } = need3(ctx);
+  const known = await projects3(ctx);
+  if (known === null) return null;
+  if (known.length === 0) throw new Error("scope:api.no_projects");
+  if (!known.some((p) => typeof p.latest_scan_at === "string")) throw new Error("scope:api.no_completed_scan");
+  const out = [];
+  for (let page2 = 0; page2 < MAX_PAGES5; page2++) {
+    const r = await api.get(`/api/v1/deployments/${slug}/findings?page=${page2}&page_size=${PER_PAGE3}&issue_type=sast`);
+    const body = r.json;
+    if (!body || !Array.isArray(body.findings)) return out.length > 0 ? toShared(out) : null;
+    out.push(...body.findings);
+    if (body.findings.length < PER_PAGE3) return toShared(out);
+  }
+  throw new Error("scope:semgrep.too_many_findings");
+}
+function toShared(list4) {
+  return list4.filter((f) => OPEN2.has((f.state ?? "unresolved").toLowerCase())).map((f) => ({
+    ref: f.rule_name ?? (f.id !== void 0 ? `finding ${f.id}` : "a finding"),
+    severity: severityOf(f.severity),
+    openedAt: f.created_at
+  }));
+}
+async function projects3(ctx) {
+  const { api, slug } = need3(ctx);
+  const r = await api.get(`/api/v1/deployments/${slug}/projects`);
+  const body = r.json;
+  return Array.isArray(body?.projects) ? body.projects : null;
+}
+var noCritical3 = {
+  code: "semgrep.findings.no_critical",
+  provider: "semgrep",
+  version: 3,
+  severity: "critical",
+  maps: ["soc2:CC7.1", "soc2:CC8.1", "iso:8.28", "iso:8.8", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.semgrep.findings", async () => {
+    const list4 = await findings2(ctx);
+    return list4 === null ? unknown("api.shape.findings") : judgeNoCritical(list4);
+  })
+};
+var withinWindow3 = {
+  code: "semgrep.findings.within_window",
+  provider: "semgrep",
+  version: 3,
+  severity: "high",
+  maps: ["soc2:CC7.1", "soc2:CC7.4", "iso:8.28", "iso:8.8", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.semgrep.findings", async () => {
+    const list4 = await findings2(ctx);
+    return list4 === null ? unknown("api.shape.findings") : judgeWithinWindow(list4, ctx.now ?? /* @__PURE__ */ new Date());
+  })
+};
+var noAncient3 = {
+  code: "semgrep.findings.no_ancient",
+  provider: "semgrep",
+  version: 3,
+  severity: "medium",
+  maps: ["soc2:CC7.1", "iso:8.28", "iso:5.25", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.semgrep.findings", async () => {
+    const list4 = await findings2(ctx);
+    return list4 === null ? unknown("api.shape.findings") : judgeNoAncient(list4, ctx.now ?? /* @__PURE__ */ new Date());
+  })
+};
+var scanningFresh2 = {
+  code: "semgrep.projects.scanned_recently",
+  provider: "semgrep",
+  version: 3,
+  severity: "high",
+  maps: ["soc2:CC7.1", "iso:8.28", "iso:8.8", "nist-csf:DE.CM"],
+  run: (ctx) => guarded("api.semgrep.projects", async () => {
+    const list4 = await projects3(ctx);
+    if (list4 === null) return unknown("api.shape.projects");
+    if (list4.length === 0) return unknown("api.semgrep.no_projects");
+    const dated = list4.map((p) => p.latest_scan_at).filter((d) => typeof d === "string");
+    if (dated.length === 0) return unknown(list4.every((p) => "latest_scan_at" in p) ? "api.no_completed_scan" : "api.shape.latest_scan_at");
+    const oldest = dated.reduce((a, b) => Date.parse(a) < Date.parse(b) ? a : b);
+    const stalest = list4.find((p) => p.latest_scan_at === oldest);
+    const r = judgeScanFresh(oldest, ctx.now ?? /* @__PURE__ */ new Date(), stalest?.name ?? "a project");
+    return { ...r, observed: { ...r.observed, projects: list4.length } };
+  })
+};
+var SEMGREP_CHECKS = [noCritical3, withinWindow3, scanningFresh2, noAncient3];
+var BASE3 = "https://semgrep.dev";
+var UA4 = "snoopios-check/1 (+https://snoopios.com)";
+var SEMGREP_SLUG = /^[a-z0-9][a-z0-9_-]{0,62}$/i;
+function semgrepApi(token, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`${BASE3}${path}`, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": UA4 },
+        signal: AbortSignal.timeout(3e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403) throw new Error("scope:semgrep.forbidden");
+      const json = await res.json().catch(() => null);
+      return { status: res.status, json };
+    }
+  };
+}
+async function runSemgrepChecks(ctx) {
+  const out = [];
+  for (const c of SEMGREP_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/aikido.ts
+var need4 = (ctx) => {
+  if (!ctx.api) throw new Error("scope:aikido.unconfigured");
+  return ctx.api;
+};
+var OPEN3 = /* @__PURE__ */ new Set(["open", "unresolved", "snoozed_expired"]);
+function detectedAt(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return new Date(value * 1e3).toISOString();
+  }
+  if (typeof value === "string" && value.trim() && Number.isFinite(Date.parse(value))) return value;
+  return void 0;
+}
+async function findings3(ctx) {
+  const repos = await need4(ctx).get("/api/public/v1/repositories/code");
+  if (repos.status === 403) throw new Error("scope:scope.repositories_read");
+  if (repos.status !== 200 || !Array.isArray(repos.json)) throw new Error("scope:api.repositories");
+  if (repos.json.length === 0) throw new Error("scope:api.no_repositories");
+  const r = await need4(ctx).get("/api/public/v1/issues/export?format=json&filter_status=open");
+  const list4 = Array.isArray(r.json) ? r.json : null;
+  if (list4 === null) return null;
+  return list4.filter((i) => OPEN3.has((i.status ?? "open").toLowerCase())).map((i) => ({
+    // Dependency issues carry no rule; the package is what a reader looks for.
+    // On 12 Oct 2026 the first real run labelled a critical lodash finding
+    // only as "open_source".
+    ref: i.rule ?? (i.affected_package ? `${i.affected_package} (${i.type ?? "dependency"})` : void 0) ?? i.type ?? (i.id !== void 0 ? `issue ${i.id}` : "an issue"),
+    severity: severityOf(i.severity),
+    openedAt: detectedAt(i.first_detected_at)
+  }));
+}
+var noCritical4 = {
+  code: "aikido.issues.no_critical",
+  provider: "aikido",
+  version: 2,
+  severity: "critical",
+  maps: ["soc2:CC7.1", "iso:8.8", "iso:8.28", "ce:patching", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.aikido.issues", async () => {
+    const list4 = await findings3(ctx);
+    return list4 === null ? unknown("api.shape.issues") : judgeNoCritical(list4);
+  })
+};
+var withinWindow4 = {
+  code: "aikido.issues.within_window",
+  provider: "aikido",
+  version: 2,
+  severity: "high",
+  maps: ["soc2:CC7.1", "soc2:CC7.4", "iso:8.8", "ce:patching", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.aikido.issues", async () => {
+    const list4 = await findings3(ctx);
+    return list4 === null ? unknown("api.shape.issues") : judgeWithinWindow(list4, ctx.now ?? /* @__PURE__ */ new Date());
+  })
+};
+var noAncient4 = {
+  code: "aikido.issues.no_ancient",
+  provider: "aikido",
+  version: 2,
+  severity: "medium",
+  maps: ["soc2:CC7.1", "iso:8.8", "iso:5.25", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.aikido.issues", async () => {
+    const list4 = await findings3(ctx);
+    return list4 === null ? unknown("api.shape.issues") : judgeNoAncient(list4, ctx.now ?? /* @__PURE__ */ new Date());
+  })
+};
+var AIKIDO_CHECKS = [noCritical4, withinWindow4, noAncient4];
+var BASE4 = "https://app.aikido.dev";
+var UA5 = "snoopios-check/1 (+https://snoopios.com)";
+async function aikidoAccessToken(clientId, clientSecret, fetchImpl = readOnlyFetch) {
+  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  const res = await fetchImpl(`${BASE4}/api/oauth/token`, {
+    method: "POST",
+    headers: { authorization: `Basic ${basic}`, "content-type": "application/json", "user-agent": UA5 },
+    body: JSON.stringify({ grant_type: "client_credentials" }),
+    signal: AbortSignal.timeout(2e4)
+  });
+  if (!res.ok) throw new Error("scope:auth");
+  const body = await res.json().catch(() => null);
+  if (!body?.access_token) throw new Error("scope:auth");
+  return body.access_token;
+}
+function aikidoApi(accessToken, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`${BASE4}${path}`, {
+        headers: { authorization: `Bearer ${accessToken}`, accept: "application/json", "user-agent": UA5 },
+        signal: AbortSignal.timeout(3e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403) throw new Error("scope:aikido.forbidden");
+      const json = await res.json().catch(() => null);
+      return { status: res.status, json };
+    }
+  };
+}
+async function aikidoContext(clientId, clientSecret) {
+  return { api: aikidoApi(await aikidoAccessToken(clientId, clientSecret)) };
+}
+async function runAikidoChecks(ctx) {
+  const out = [];
+  for (const c of AIKIDO_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/bitwarden.ts
+var need5 = (ctx) => {
+  if (!ctx.api) throw new Error("scope:bitwarden.unconfigured");
+  return ctx.api;
+};
+var POLICY_TWO_FACTOR = 0;
+var POLICY_MASTER_PASSWORD = 1;
+var POLICY_PERSONAL_OWNERSHIP = 5;
+var POLICY_VAULT_TIMEOUT = 9;
+var STATUS_REVOKED = -1;
+var STATUS_CONFIRMED = 2;
+async function list3(ctx, path) {
+  const r = await need5(ctx).get(path);
+  const body = r.json;
+  return Array.isArray(body?.data) ? body.data : null;
+}
+var active2 = (members) => members.filter((m) => m.status === STATUS_CONFIRMED);
+var nameOf = (m) => m.email ?? m.name ?? m.id ?? "a member";
+var policyOn = (policies, type) => policies.some((p) => p.type === type && p.enabled === true);
+var membersTwoFactor = {
+  code: "bitwarden.members.two_factor",
+  provider: "bitwarden",
+  version: 1,
+  severity: "critical",
+  maps: ["soc2:CC6.1", "soc2:CC6.6", "iso:5.17", "iso:8.5", "ce:user-access", "gdpr:art32", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.bitwarden.members", async () => {
+    const members = await list3(ctx, "/public/members");
+    if (members === null) return unknown("api.shape.members");
+    const confirmed = active2(members);
+    if (confirmed.length === 0) return unknown("api.bitwarden.no_members");
+    if (shapeMismatch(confirmed, (m) => [m.twoFactorEnabled])) return unknown("api.shape.twoFactorEnabled");
+    const without = confirmed.filter((m) => m.twoFactorEnabled !== true).map(nameOf);
+    const observed = { members: confirmed.length, withoutSecondFactor: without.length, accounts: without.slice(0, 10) };
+    return without.length === 0 ? pass(observed, confirmed.length) : fail(observed, confirmed.length);
+  })
+};
+var policyTwoFactor = {
+  code: "bitwarden.policy.two_factor",
+  provider: "bitwarden",
+  version: 2,
+  severity: "high",
+  maps: ["soc2:CC6.1", "iso:5.17", "iso:8.5", "ce:user-access", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.bitwarden.policies", async () => {
+    const policies = await list3(ctx, "/public/policies");
+    if (policies === null) return unknown("api.shape.policies");
+    const on = policyOn(policies, POLICY_TWO_FACTOR);
+    const observed = { policies: policies.length, requiresSecondFactor: on };
+    return on ? pass(observed, policies) : fail(observed, policies);
+  })
+};
+var policyPersonalOwnership = {
+  code: "bitwarden.policy.organisation_ownership",
+  provider: "bitwarden",
+  version: 2,
+  severity: "high",
+  maps: ["soc2:CC6.1", "soc2:CC6.2", "iso:5.10", "iso:5.17", "iso:8.12", "nist-csf:PR.DS"],
+  run: (ctx) => guarded("api.bitwarden.policies", async () => {
+    const policies = await list3(ctx, "/public/policies");
+    if (policies === null) return unknown("api.shape.policies");
+    const on = policyOn(policies, POLICY_PERSONAL_OWNERSHIP);
+    const observed = { policies: policies.length, itemsOwnedByTheOrganisation: on };
+    return on ? pass(observed, policies) : fail(observed, policies);
+  })
+};
+var policyMasterPassword = {
+  code: "bitwarden.policy.master_password",
+  provider: "bitwarden",
+  version: 2,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.bitwarden.policies", async () => {
+    const policies = await list3(ctx, "/public/policies");
+    if (policies === null) return unknown("api.shape.policies");
+    const on = policyOn(policies, POLICY_MASTER_PASSWORD);
+    const observed = { policies: policies.length, masterPasswordRules: on };
+    return on ? pass(observed, policies) : fail(observed, policies);
+  })
+};
+var policyVaultTimeout = {
+  code: "bitwarden.policy.vault_timeout",
+  provider: "bitwarden",
+  version: 2,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:8.1", "iso:7.7", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.bitwarden.policies", async () => {
+    const policies = await list3(ctx, "/public/policies");
+    if (policies === null) return unknown("api.shape.policies");
+    const on = policyOn(policies, POLICY_VAULT_TIMEOUT);
+    const observed = { policies: policies.length, vaultLocks: on };
+    return on ? pass(observed, policies) : fail(observed, policies);
+  })
+};
+var noBlanketAccess = {
+  code: "bitwarden.members.least_privilege",
+  provider: "bitwarden",
+  version: 2,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "soc2:CC6.3", "iso:5.15", "iso:5.18", "ce:user-access", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.bitwarden.members", async () => {
+    const members = await list3(ctx, "/public/members");
+    if (members === null) return unknown("api.shape.members");
+    const confirmed = active2(members);
+    if (confirmed.length === 0) return unknown("api.bitwarden.no_members");
+    const users = confirmed.filter((m) => m.type !== 0 && m.type !== 1);
+    if (users.length === 0) return unknown("api.bitwarden.only_admins");
+    if (shapeMismatch(users, (m) => [m.collections])) return unknown("api.shape.collections");
+    const all = await list3(ctx, "/public/collections");
+    if (all === null) return unknown("api.shape.collections");
+    if (all.length < 2) return unknown("api.bitwarden.no_collection_structure", { collections: all.length });
+    const ids = new Set(all.map((c) => c.id).filter(Boolean));
+    const seesAll = (m) => m.accessAll === true || m.permissions?.editAnyCollection === true || [...ids].every((id) => (m.collections ?? []).some((c) => c.id === id));
+    const blanket = users.filter(seesAll).map(nameOf);
+    const observed = { members: confirmed.length, nonAdmins: users.length, seeEveryCollection: blanket.length, accounts: blanket.slice(0, 10) };
+    return blanket.length === 0 ? pass(observed, users.length) : fail(observed, users.length);
+  })
+};
+var noStaleInvites = {
+  code: "bitwarden.members.no_stale_invites",
+  provider: "bitwarden",
+  version: 1,
+  severity: "low",
+  maps: ["soc2:CC6.2", "iso:5.16", "iso:5.18", "ce:user-access", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.bitwarden.members", async () => {
+    const members = await list3(ctx, "/public/members");
+    if (members === null) return unknown("api.shape.members");
+    if (members.length === 0) return unknown("api.bitwarden.no_members");
+    const pending = members.filter((m) => m.status === 0 || m.status === 1).map(nameOf);
+    const revoked = members.filter((m) => m.status === STATUS_REVOKED).length;
+    const observed = { members: members.length, notFinishedJoining: pending.length, revoked, accounts: pending.slice(0, 10) };
+    return pending.length === 0 ? pass(observed, members.length) : fail(observed, members.length);
+  })
+};
+var BITWARDEN_CHECKS = [
+  membersTwoFactor,
+  policyTwoFactor,
+  policyPersonalOwnership,
+  noBlanketAccess,
+  policyMasterPassword,
+  policyVaultTimeout,
+  noStaleInvites
+];
+var BITWARDEN_REGIONS = { com: "bitwarden.com", eu: "bitwarden.eu" };
+var identityUrl = (r) => `https://identity.${BITWARDEN_REGIONS[r]}/connect/token`;
+var baseUrl = (r) => `https://api.${BITWARDEN_REGIONS[r]}`;
+var UA6 = "snoopios-check/1 (+https://snoopios.com)";
+async function bitwardenAccessToken(clientId, clientSecret, fetchImpl = readOnlyFetch, region = "com") {
+  const res = await fetchImpl(identityUrl(region), {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded", "user-agent": UA6 },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      scope: "api.organization",
+      client_id: clientId,
+      client_secret: clientSecret
+    }).toString(),
+    signal: AbortSignal.timeout(2e4)
+  });
+  if (!res.ok) throw new Error("scope:auth");
+  const body = await res.json().catch(() => null);
+  if (!body?.access_token) throw new Error("scope:auth");
+  return body.access_token;
+}
+function bitwardenApi(accessToken, fetchImpl = readOnlyFetch, region = "com") {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`${baseUrl(region)}${path}`, {
+        headers: { authorization: `Bearer ${accessToken}`, accept: "application/json", "user-agent": UA6 },
+        signal: AbortSignal.timeout(2e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403) throw new Error("scope:bitwarden.forbidden");
+      const json = await res.json().catch(() => null);
+      return { status: res.status, json };
+    }
+  };
+}
+async function bitwardenContext(clientId, clientSecret, region = "com") {
+  return { api: bitwardenApi(await bitwardenAccessToken(clientId, clientSecret, readOnlyFetch, region), readOnlyFetch, region) };
+}
+async function runBitwardenChecks(ctx) {
+  const out = [];
+  for (const c of BITWARDEN_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/onepassword.ts
+var WINDOW_DAYS = 30;
+var FAILURE_LIMIT = 10;
+var need6 = (ctx) => {
+  if (!ctx.api) throw new Error("scope:onepassword.unconfigured");
+  return ctx.api;
+};
+var MAX_PAGES6 = 20;
+var PER_PAGE4 = 1e3;
+var SECOND_FACTOR = /* @__PURE__ */ new Set(["mfa_ok", "sso_ok", "duo_ok"]);
+async function page(ctx, feature, since2) {
+  const api = need6(ctx);
+  const out = [];
+  let body = { limit: PER_PAGE4, start_time: since2.toISOString() };
+  for (let i = 0; i < MAX_PAGES6; i++) {
+    const res = await api.events(feature, body);
+    if (!res || !Array.isArray(res.items)) return out.length > 0 ? out : null;
+    out.push(...res.items);
+    if (!res.has_more || !res.cursor) return out;
+    body = { cursor: res.cursor };
+  }
+  throw new Error("scope:onepassword.too_many_events");
+}
+var since = (ctx) => new Date((ctx.now ?? /* @__PURE__ */ new Date()).getTime() - WINDOW_DAYS * 864e5);
+var who = (s) => s.target_user?.email ?? s.target_user?.name ?? s.target_user?.uuid ?? "an account";
+var secondFactorUsed = {
+  code: "onepassword.signins.second_factor",
+  provider: "onepassword",
+  version: 1,
+  severity: "critical",
+  maps: ["soc2:CC6.1", "soc2:CC6.6", "iso:5.17", "iso:8.5", "ce:user-access", "gdpr:art32", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.onepassword.signins", async () => {
+    const events = await page(ctx, "signinattempts", since(ctx));
+    if (events === null) return unknown("api.shape.signinattempts");
+    const successes = events.filter((e) => (e.category ?? "") === "success");
+    if (successes.length === 0) return unknown("api.onepassword.no_signins");
+    const without = [...new Set(successes.filter((e) => !SECOND_FACTOR.has(e.type ?? "")).map(who))];
+    const observed = { windowDays: WINDOW_DAYS, successfulSignIns: successes.length, withoutSecondFactor: without.length, accounts: without.slice(0, 10) };
+    return without.length === 0 ? pass(observed, successes.length) : fail(observed, successes.length);
+  })
+};
+var noRepeatedFailures = {
+  code: "onepassword.signins.no_repeated_failures",
+  provider: "onepassword",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC7.2", "soc2:CC6.1", "iso:8.15", "iso:8.16", "nist-csf:DE.CM"],
+  run: (ctx) => guarded("api.onepassword.signins", async () => {
+    const events = await page(ctx, "signinattempts", since(ctx));
+    if (events === null) return unknown("api.shape.signinattempts");
+    if (events.length === 0) return unknown("api.onepassword.no_signins");
+    const failures = /* @__PURE__ */ new Map();
+    for (const e of events) {
+      if ((e.category ?? "") === "success" || (e.category ?? "") === "firewall_reported_success") continue;
+      const key = who(e);
+      failures.set(key, (failures.get(key) ?? 0) + 1);
+    }
+    const noisy = [...failures.entries()].filter(([, n]) => n > FAILURE_LIMIT).map(([k, n]) => `${k} (${n} failures)`);
+    const observed = { windowDays: WINDOW_DAYS, events: events.length, limit: FAILURE_LIMIT, accounts: noisy.length, detail: noisy.slice(0, 10) };
+    return noisy.length === 0 ? pass(observed, events.length) : fail(observed, events.length);
+  })
+};
+var auditLogFlowing = {
+  code: "onepassword.audit.log_available",
+  provider: "onepassword",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.2", "iso:8.15", "iso:5.28", "nist-csf:DE.CM"],
+  run: (ctx) => guarded("api.onepassword.auditevents", async () => {
+    const events = await page(ctx, "auditevents", since(ctx));
+    if (events === null) return unknown("api.shape.auditevents");
+    const dated = events.filter((e) => typeof e.timestamp === "string").length;
+    const actions = [...new Set(events.map((e) => e.action).filter(Boolean))].slice(0, 10);
+    const observed = { windowDays: WINDOW_DAYS, events: events.length, dated, actions };
+    return events.length > 0 && dated > 0 ? pass(observed, events.length) : fail(observed, events.length);
+  })
+};
+var ONEPASSWORD_CHECKS = [secondFactorUsed, noRepeatedFailures, auditLogFlowing];
+var UA7 = "snoopios-check/1 (+https://snoopios.com)";
+var HOSTS = {
+  com: "https://events.1password.com",
+  ca: "https://events.1password.ca",
+  eu: "https://events.1password.eu",
+  ent: "https://events.ent.1password.com"
+};
+function onePasswordApi(token, region = "com", fetchImpl = readOnlyFetch) {
+  const base = HOSTS[region];
+  if (!base) throw new Error("scope:onepassword.region");
+  return {
+    async events(feature, body) {
+      const res = await fetchImpl(`${base}/api/v2/${feature}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${token}`, "content-type": "application/json", "user-agent": UA7 },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(3e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403) throw new Error("scope:onepassword.forbidden");
+      return res.json().catch(() => null);
+    }
+  };
+}
+async function runOnePasswordChecks(ctx) {
+  const out = [];
+  for (const c of ONEPASSWORD_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/doppler.ts
+var ROTATION_DAYS = 365;
+var need7 = (ctx) => {
+  if (!ctx.api) throw new Error("scope:doppler.unconfigured");
+  return ctx.api;
+};
+var MAX_PAGES7 = 10;
+async function projects4(ctx) {
+  const out = [];
+  for (let page2 = 1; page2 <= MAX_PAGES7; page2++) {
+    const r = await need7(ctx).get(`/v3/projects?page=${page2}&per_page=100`);
+    const body = r.json;
+    if (!body || !Array.isArray(body.projects)) return out.length > 0 ? out : null;
+    out.push(...body.projects);
+    if (body.projects.length < 100) return out;
+  }
+  return out;
+}
+async function configs(ctx, project2) {
+  const r = await need7(ctx).get(`/v3/configs?project=${encodeURIComponent(project2)}`);
+  const body = r.json;
+  return Array.isArray(body?.configs) ? body.configs : [];
+}
+async function serviceTokens(ctx) {
+  const list4 = await projects4(ctx);
+  if (list4 === null) return null;
+  const out = [];
+  for (const p of list4) {
+    const slug = p.slug ?? p.name;
+    if (!slug) continue;
+    for (const c of await configs(ctx, slug)) {
+      if (!c.name) continue;
+      const r = await need7(ctx).get(`/v3/configs/config/tokens?project=${encodeURIComponent(slug)}&config=${encodeURIComponent(c.name)}`);
+      const body = r.json;
+      if (!Array.isArray(body?.tokens)) continue;
+      for (const t of body.tokens) out.push({ ...t, project: slug, config: c.name });
+    }
+  }
+  return out;
+}
+var nameOf2 = (t) => `${t.project ?? "?"}/${t.config ?? "?"}: ${t.name ?? t.slug ?? "an unnamed token"}`;
+var tokensReadOnly = {
+  code: "doppler.tokens.read_only",
+  provider: "doppler",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "soc2:CC6.3", "iso:5.15", "iso:5.17", "iso:8.2", "ce:user-access", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.doppler.tokens", async () => {
+    const tokens = await serviceTokens(ctx);
+    if (tokens === null) return unknown("api.shape.projects");
+    if (tokens.length === 0) return unknown("api.doppler.no_tokens");
+    if (shapeMismatch(tokens, (t) => [t.access])) return unknown("api.shape.access");
+    const writable = tokens.filter((t) => (t.access ?? "").toLowerCase() !== "read").map(nameOf2);
+    const observed = { tokens: tokens.length, canWrite: writable.length, names: writable.slice(0, 10) };
+    return writable.length === 0 ? pass(observed, tokens.length) : fail(observed, tokens.length);
+  })
+};
+var tokensRotated = {
+  code: "doppler.tokens.rotated",
+  provider: "doppler",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "iso:5.17", "iso:8.24", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.doppler.tokens", async () => {
+    const tokens = await serviceTokens(ctx);
+    if (tokens === null) return unknown("api.shape.projects");
+    if (tokens.length === 0) return unknown("api.doppler.no_tokens");
+    if (shapeMismatch(tokens, (t) => [t.created_at])) return unknown("api.shape.created_at");
+    const cutoff = (ctx.now ?? /* @__PURE__ */ new Date()).getTime() - ROTATION_DAYS * 864e5;
+    const old = tokens.filter((t) => !t.created_at || Date.parse(t.created_at) < cutoff).map((t) => `${nameOf2(t)} (created ${(t.created_at ?? "date unknown").slice(0, 10)})`);
+    const observed = { tokens: tokens.length, withinDays: ROTATION_DAYS, overdue: old.length, names: old.slice(0, 10) };
+    return old.length === 0 ? pass(observed, tokens.length) : fail(observed, tokens.length);
+  })
+};
+var tokensNotRoot = {
+  code: "doppler.tokens.not_root_config",
+  provider: "doppler",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC6.1", "soc2:CC6.3", "iso:5.15", "iso:8.31", "nist-csf:PR.AA"],
+  run: (ctx) => guarded("api.doppler.tokens", async () => {
+    const tokens = await serviceTokens(ctx);
+    if (tokens === null) return unknown("api.shape.projects");
+    if (tokens.length === 0) return unknown("api.doppler.no_tokens");
+    const roots = /* @__PURE__ */ new Set();
+    for (const p of await projects4(ctx) ?? []) {
+      const slug = p.slug ?? p.name;
+      if (!slug) continue;
+      for (const c of await configs(ctx, slug)) if (c.root === true && c.name) roots.add(`${slug}/${c.name}`);
+    }
+    if (roots.size === 0) return unknown("api.shape.root");
+    const wide = tokens.filter((t) => roots.has(`${t.project}/${t.config}`)).map(nameOf2);
+    const observed = { tokens: tokens.length, rootConfigs: roots.size, onARootConfig: wide.length, names: wide.slice(0, 10) };
+    return wide.length === 0 ? pass(observed, tokens.length) : fail(observed, tokens.length);
+  })
+};
+var DOPPLER_CHECKS = [tokensReadOnly, tokensNotRoot, tokensRotated];
+var BASE5 = "https://api.doppler.com";
+var UA8 = "snoopios-check/1 (+https://snoopios.com)";
+function dopplerApi(token, fetchImpl = readOnlyFetch) {
+  return {
+    async get(path) {
+      const res = await fetchImpl(`${BASE5}${path}`, {
+        headers: { authorization: `Bearer ${token}`, accept: "application/json", "user-agent": UA8 },
+        signal: AbortSignal.timeout(2e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403) throw new Error(token.startsWith("dp.st.") ? "scope:doppler.service_token_given" : "scope:doppler.forbidden");
+      const json = await res.json().catch(() => null);
+      return { status: res.status, json };
+    }
+  };
+}
+async function runDopplerChecks(ctx) {
+  const out = [];
+  for (const c of DOPPLER_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
+// ../lib/checks/providers/sonarqube.ts
+var need8 = (ctx) => {
+  if (!ctx.api || !ctx.projectKey) throw new Error("scope:sonarqube.unconfigured");
+  return { api: ctx.api, projectKey: ctx.projectKey };
+};
+async function gate(ctx) {
+  const { api, projectKey } = need8(ctx);
+  const r = await api.get(`/api/qualitygates/project_status?projectKey=${encodeURIComponent(projectKey)}`);
+  const body = r.json;
+  return body?.projectStatus ?? null;
+}
+async function project(ctx) {
+  const { api, projectKey } = need8(ctx);
+  const r = await api.get(`/api/components/show?component=${encodeURIComponent(projectKey)}`);
+  const body = r.json;
+  return body?.component ?? null;
+}
+async function measures(ctx, metrics) {
+  const { api, projectKey } = need8(ctx);
+  const r = await api.get(`/api/measures/component?component=${encodeURIComponent(projectKey)}&metricKeys=${metrics.join(",")}`);
+  const body = r.json;
+  if (!body?.component) return null;
+  const info = await project(ctx);
+  return { measures: body.component.measures ?? [], analysedAt: info?.analysisDate ?? body.period?.date };
+}
+async function attachedGate(ctx) {
+  const { api, projectKey } = need8(ctx);
+  const info = await project(ctx);
+  const org = info?.organization ? `&organization=${encodeURIComponent(info.organization)}` : "";
+  const r = await api.get(`/api/qualitygates/get_by_project?project=${encodeURIComponent(projectKey)}${org}`);
+  const g = r.json?.qualityGate;
+  if (!g?.id) return null;
+  const d = await api.get(`/api/qualitygates/show?id=${encodeURIComponent(String(g.id))}${org}`);
+  const def = d.json;
+  if (!def) return null;
+  return { name: def.name ?? g.name ?? "gate", conditions: (def.conditions ?? []).length };
+}
+var metric = (list4, key) => list4.find((m) => m.metric === key)?.value;
+var gatePasses = {
+  code: "sonarqube.gate.passing",
+  provider: "sonarqube",
+  version: 2,
+  severity: "high",
+  maps: ["soc2:CC8.1", "soc2:CC7.1", "iso:8.32", "iso:8.28", "nist-csf:PR.PS"],
+  run: (ctx) => guarded("api.sonarqube.gate", async () => {
+    const status = await gate(ctx);
+    if (!status?.status) return unknown("api.shape.projectStatus");
+    const value = status.status.toUpperCase();
+    if (value === "NONE") return unknown("api.gate_not_evaluated");
+    const failing = (status.conditions ?? []).filter((c) => (c.status ?? "").toUpperCase() === "ERROR").map((c) => `${c.metricKey ?? "a condition"} is ${c.actualValue ?? "?"} against a limit of ${c.errorThreshold ?? "?"}`);
+    const observed = { gate: value, conditions: (status.conditions ?? []).length, failing: failing.slice(0, 10) };
+    return value === "OK" ? pass(observed, status) : fail(observed, status);
+  })
+};
+var gateHasConditions = {
+  code: "sonarqube.gate.has_conditions",
+  provider: "sonarqube",
+  version: 2,
+  severity: "medium",
+  maps: ["soc2:CC8.1", "iso:8.32", "iso:8.28", "nist-csf:PR.PS"],
+  run: (ctx) => guarded("api.sonarqube.gate", async () => {
+    const attached = await attachedGate(ctx);
+    if (attached === null) return unknown("api.shape.qualityGate");
+    const observed = { gate: attached.name, conditions: attached.conditions };
+    return attached.conditions > 0 ? pass(observed, attached) : fail(observed, attached);
+  })
+};
+var analysedRecently = {
+  code: "sonarqube.project.analysed_recently",
+  provider: "sonarqube",
+  version: 2,
+  severity: "medium",
+  maps: ["soc2:CC8.1", "iso:8.28", "iso:8.8", "nist-csf:DE.CM"],
+  run: (ctx) => guarded("api.sonarqube.measures", async () => {
+    const res = await measures(ctx, ["ncloc", "reliability_rating", "security_rating"]);
+    if (res === null) return unknown("api.shape.component");
+    if (!res.analysedAt) return unknown("api.sonarqube.no_analysis_date");
+    const age = Math.floor(((ctx.now ?? /* @__PURE__ */ new Date()).getTime() - Date.parse(res.analysedAt)) / 864e5);
+    if (!Number.isFinite(age)) return unknown("api.shape.period");
+    const observed = {
+      lastAnalysis: res.analysedAt.slice(0, 10),
+      daysAgo: age,
+      withinDays: SCAN_DAYS,
+      linesOfCode: metric(res.measures, "ncloc") ?? "unknown"
+    };
+    return age <= SCAN_DAYS ? pass(observed, res) : fail(observed, res);
+  })
+};
+var securityRating = {
+  code: "sonarqube.project.security_rating",
+  provider: "sonarqube",
+  version: 1,
+  severity: "medium",
+  maps: ["soc2:CC7.1", "iso:8.28", "iso:8.8", "nist-csf:ID.RA"],
+  run: (ctx) => guarded("api.sonarqube.measures", async () => {
+    const res = await measures(ctx, ["security_rating", "reliability_rating"]);
+    if (res === null) return unknown("api.shape.component");
+    const raw = metric(res.measures, "security_rating");
+    if (!raw) return unknown("api.shape.security_rating");
+    const grade = ["", "A", "B", "C", "D", "E"][Math.round(Number(raw))] ?? "unknown";
+    const observed = { securityRating: grade, reliabilityRating: ["", "A", "B", "C", "D", "E"][Math.round(Number(metric(res.measures, "reliability_rating") ?? 0))] ?? "unknown" };
+    if (grade === "unknown") return unknown("api.shape.security_rating");
+    return grade === "A" ? pass(observed, res) : fail(observed, res);
+  })
+};
+var SONARQUBE_CHECKS = [gatePasses, gateHasConditions, analysedRecently, securityRating];
+var UA9 = "snoopios-check/1 (+https://snoopios.com)";
+function sonarBase(raw) {
+  let url;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    throw new Error("scope:sonarqube.url");
+  }
+  if (url.protocol !== "https:") throw new Error("scope:sonarqube.url");
+  if (url.username || url.password) throw new Error("scope:sonarqube.url");
+  if (url.search || url.hash) throw new Error("scope:sonarqube.url");
+  if (url.pathname !== "/" && url.pathname !== "") throw new Error("scope:sonarqube.url");
+  return url.origin;
+}
+function sonarApi(baseUrl2, token, fetchImpl = readOnlyFetch) {
+  const base = sonarBase(baseUrl2);
+  const basic = Buffer.from(`${token}:`).toString("base64");
+  return {
+    async get(path) {
+      const res = await fetchImpl(`${base}${path}`, {
+        headers: { authorization: `Basic ${basic}`, accept: "application/json", "user-agent": UA9 },
+        signal: AbortSignal.timeout(2e4)
+      });
+      if (res.status === 401) throw new Error("scope:auth");
+      if (res.status === 403) throw new Error("scope:sonarqube.forbidden");
+      const json = await res.json().catch(() => null);
+      return { status: res.status, json };
+    }
+  };
+}
+async function runSonarChecks(ctx) {
+  const out = [];
+  for (const c of SONARQUBE_CHECKS) {
+    let result;
+    try {
+      result = await c.run(ctx);
+    } catch {
+      result = unknown("check.threw");
+    }
+    out.push({ code: c.code, version: c.version, result });
+  }
+  return out;
+}
+
 // ../lib/checks/providers/supabase.ts
 var SECRET_KEY2 = /(secret|smtp_pass|_token|api_key|password)/i;
 function scrubAuthConfig(cfg) {
@@ -1954,24 +3375,84 @@ var privateSchemaClosed = {
     return !r.anon_usage && !r.auth_usage ? pass(observed, rows2) : fail(observed, rows2);
   })
 };
+var MANAGED_SCHEMAS = [
+  "information_schema",
+  "auth",
+  "storage",
+  "realtime",
+  "supabase_functions",
+  "supabase_migrations",
+  "extensions",
+  "graphql",
+  "graphql_public",
+  "pgbouncer",
+  "vault",
+  "cron",
+  "net",
+  "pgsodium",
+  "pgsodium_masks",
+  "_analytics",
+  "_realtime",
+  "_supavisor"
+];
 var definerSearchPath = {
   code: "supabase.definer.search_path",
   provider: "supabase",
-  version: 1,
+  // v2 (14 Sep 2026): v1 looked only in `public` and `private`. A SECURITY
+  // DEFINER function in any other schema the customer created was invisible,
+  // and the search_path attack does not care which schema the function lives
+  // in — only that a caller can put a schema in front of it. Supabase's own
+  // lint 0011 covers every non-managed schema, so v1 could pass a project the
+  // dashboard was already failing. Now every schema is read except the ones
+  // Supabase owns.
+  version: 2,
   severity: "high",
   maps: ["soc2:CC6.1", "iso:8.28", "iso:8.2"],
   run: (ctx) => guarded("sql.catalogue", async () => {
     if (!ctx.sql) return unknown("sql.not_connected");
+    const excluded = MANAGED_SCHEMAS.map((x) => `'${x}'`).join(", ");
     const rows2 = await ctx.sql.query(`
         select n.nspname as schema, p.proname as name,
                coalesce(pg_catalog.array_to_string(p.proconfig, ','), '') as config
         from pg_catalog.pg_proc p
         join pg_catalog.pg_namespace n on n.oid = p.pronamespace
-        where p.prosecdef and n.nspname in ('public', 'private')
+        where p.prosecdef
+          and n.nspname not in (${excluded})
+          and n.nspname not like 'pg_%'
         order by n.nspname, p.proname`);
     const unpinned = rows2.filter((r) => !String(r.config).includes("search_path")).map((r) => `${r.schema}.${r.name}`);
     const observed = { definerFunctions: rows2.length, unpinned };
     return unpinned.length === 0 ? pass(observed, rows2) : fail(observed, rows2);
+  })
+};
+var viewsSecurityInvoker = {
+  code: "supabase.views.security_invoker",
+  provider: "supabase",
+  version: 1,
+  severity: "critical",
+  maps: ["soc2:CC6.1", "gdpr:art32", "iso:8.3", "iso:5.15"],
+  run: (ctx) => guarded("sql.catalogue", async () => {
+    if (!ctx.sql) return unknown("sql.not_connected");
+    const rows2 = await ctx.sql.query(`
+        select c.relname as name, c.relkind::text as kind,
+               coalesce(pg_catalog.array_to_string(c.reloptions, ','), '') as options,
+               current_setting('server_version_num')::int as server_version
+        from pg_catalog.pg_class c
+        join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'public' and c.relkind in ('v', 'm', 'f')
+        order by c.relname`);
+    if (rows2.length === 0) return pass({ views: 0, materialised: 0, foreign: 0 }, rows2);
+    const version = Number(rows2[0]?.server_version ?? 0);
+    if (version > 0 && version < 15e4) return unknown("sql.server_version_below_15", { serverVersion: version });
+    const views = rows2.filter((r) => r.kind === "v");
+    const definer = views.filter((r) => !/security_invoker\s*=\s*(on|true)/i.test(String(r.options))).map((r) => String(r.name));
+    const observed = {
+      views: views.length,
+      definerViews: definer,
+      materialised: rows2.filter((r) => r.kind === "m").map((r) => String(r.name)),
+      foreign: rows2.filter((r) => r.kind === "f").map((r) => String(r.name))
+    };
+    return definer.length === 0 ? pass(observed, rows2) : fail(observed, rows2);
   })
 };
 var noAnonCallableFunctions = {
@@ -2031,6 +3512,27 @@ var authConfirmations = {
     };
     const ok = cfg.mailer_autoconfirm === false && Number(cfg.mailer_otp_length ?? 0) >= 8;
     return ok ? pass(observed, scrubAuthConfig(cfg)) : fail(observed, scrubAuthConfig(cfg));
+  })
+};
+var MIN_PASSWORD_LENGTH_REQUIRED = 12;
+var authPasswordPolicy = {
+  code: "supabase.auth.password_policy",
+  provider: "supabase",
+  version: 1,
+  severity: "high",
+  maps: ["soc2:CC6.1", "iso:5.17", "iso:8.5"],
+  run: (ctx) => guarded("api.auth_config", async () => {
+    const cfg = await authConfig(ctx);
+    if (!cfg) return unknown("api.not_connected");
+    const min = Number(cfg.password_min_length ?? NaN);
+    if (!Number.isFinite(min)) return unknown("api.shape.password_min_length");
+    const required = String(cfg.password_required_characters ?? "");
+    const observed = {
+      minimumLength: min,
+      requiredMinimum: MIN_PASSWORD_LENGTH_REQUIRED,
+      compositionRule: required === "" ? "none" : "set"
+    };
+    return min >= MIN_PASSWORD_LENGTH_REQUIRED ? pass(observed, scrubAuthConfig(cfg)) : fail(observed, scrubAuthConfig(cfg));
   })
 };
 var authCaptcha = {
@@ -2119,10 +3621,12 @@ var SUPABASE_SQL_CHECKS = [
   noAnonWritePolicy,
   privateSchemaClosed,
   definerSearchPath,
+  viewsSecurityInvoker,
   noAnonCallableFunctions
 ];
 var SUPABASE_API_CHECKS = [
   authConfirmations,
+  authPasswordPolicy,
   authCaptcha,
   authSiteUrl,
   authSmtp,
@@ -2156,7 +3660,14 @@ var SECRET_PATTERNS = [
   { name: "Google API key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
   { name: "OpenAI key", re: /\bsk-(proj-)?[A-Za-z0-9_-]{32,}\b/ },
   { name: "Supabase service key", re: /\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]*"role":"service_role"|\bsb_secret_[A-Za-z0-9_-]{20,}\b/ },
-  { name: "Private key block", re: /-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/ },
+  // A BEGIN marker alone is not a key. Our own gcp.ts carries the literal
+  // "-----BEGIN PRIVATE KEY-----" as a guard on a service account field, and
+  // version 2 failed this repository on it: the detector detected itself.
+  // A real block has an END marker and a body between the two, so both are
+  // required. A key committed without its END line is missed, which is the
+  // right way round: a check that cries wolf is worse than one that cannot
+  // fail. (12 Sep 2026, found by running snoopios repo on snoopios)
+  { name: "Private key block", re: /-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----[\s\S]{40,4000}?-----END [A-Z ]*PRIVATE KEY-----/ },
   { name: "Resend key", re: /\bre_[A-Za-z0-9]{20,}\b/ },
   { name: "Vercel token", re: /\bvercel_[A-Za-z0-9]{20,}\b/ },
   { name: "npm token", re: /\bnpm_[A-Za-z0-9]{36}\b/ }
@@ -2207,7 +3718,7 @@ var TEST_PATH = /(^|\/)(__tests__|__fixtures__|__mocks__|fixtures?|tests?|specs?
 var secretsInHistory = {
   code: "repo.secrets_in_history",
   provider: "repo",
-  version: 2,
+  version: 3,
   severity: "critical",
   maps: ["soc2:CC6.1", "gdpr:art32", "iso:8.12", "iso:8.28"],
   run: (ctx) => guarded("repo.history", async () => {
@@ -2220,15 +3731,15 @@ var secretsInHistory = {
       const path = i < 0 ? "" : parts[i];
       const body = parts[i + 1] ?? "";
       const isTest = path !== "" && TEST_PATH.test(path);
-      for (const { name: name4, re } of SECRET_PATTERNS) {
+      for (const { name, re } of SECRET_PATTERNS) {
         const global = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
         const n = (body.match(global) ?? []).length;
         if (!n) continue;
         if (isTest) {
-          inTests[name4] = (inTests[name4] ?? 0) + n;
+          inTests[name] = (inTests[name] ?? 0) + n;
           testPaths.add(path);
         } else {
-          found[name4] = (found[name4] ?? 0) + n;
+          found[name] = (found[name] ?? 0) + n;
         }
       }
     }
@@ -2290,9 +3801,9 @@ var dependencyUpdates = {
   maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
   run: (ctx) => guarded("repo.files", async () => {
     const files = await src(ctx).files();
-    const configs = files.filter((f) => /^\.github\/dependabot\.ya?ml$|^(\.github\/)?renovate\.json5?$|^\.renovaterc(\.json)?$/.test(f));
-    const observed = { configured: configs.length > 0, configs };
-    return configs.length > 0 ? pass(observed, { configs }) : fail(observed, { configs });
+    const configs2 = files.filter((f) => /^\.github\/dependabot\.ya?ml$|^(\.github\/)?renovate\.json5?$|^\.renovaterc(\.json)?$/.test(f));
+    const observed = { configured: configs2.length > 0, configs: configs2 };
+    return configs2.length > 0 ? pass(observed, { configs: configs2 }) : fail(observed, { configs: configs2 });
   })
 };
 var vulnerableDependencies = {
@@ -2335,8 +3846,8 @@ import { resolve, join, dirname } from "node:path";
 // ../lib/copy.ts
 var COPY = {
   // ── meta ──────────────────────────────────────────────────────────────────
-  "meta.title": "Snoopios \u2014 continuous compliance for small software teams",
-  "meta.description": "Snoopios watches the stack you actually run on \u2014 Supabase, Vercel, Cloudflare, GitHub, Stripe \u2014 collects real evidence, and turns it into the documents customers and auditors ask for. Flat price. No sales call.",
+  "meta.title": "Snoopios: continuous compliance for small software teams",
+  "meta.description": "Snoopios watches the stack you actually run on, including Supabase, Vercel, Cloudflare, GitHub and Stripe. It collects real evidence and turns it into the documents customers and auditors ask for. Flat price. No sales call.",
   // ── accessibility ─────────────────────────────────────────────────────────
   "a11y.nav.primary": "Primary",
   "a11y.nav.menu": "Menu",
@@ -2363,19 +3874,18 @@ var COPY = {
   // dormant: first finding with a warning severity, Phase 2
   "status.warning": "Warning",
   // ── home: nav ─────────────────────────────────────────────────────────────
-  "home.nav.how": "How it works",
-  "home.nav.checks": "Checks",
   "home.nav.pricing": "Pricing",
   "home.nav.signin": "Sign in",
   "home.nav.start": "Start free",
   "home.nav.open": "Open app",
   // ── home: hero ────────────────────────────────────────────────────────────
-  "home.hero.eyebrow": "Early access \xB7 built in the UK",
-  "home.hero.title": "Two eyes on your stack. Evidence you can hand over.",
-  "home.hero.body": "Snoopios connects read-only to Supabase, Vercel, Cloudflare, GitHub and Stripe, runs real configuration checks every hour on Studio and Scale and every six hours on Solo, and keeps the evidence. When a customer sends a security questionnaire or the ICO asks a question, the answer is already written.",
+  "home.hero.title": "Eyes on your stack. Evidence in hand.",
+  "home.hero.body": "Snoopios connects read-only to what you already run: the hosting, databases and code, and also the laptops, the payroll, the password manager and the scanners. It checks their configuration every hour and keeps the evidence. When a customer sends a security questionnaire or a regulator asks a question, the answer is already written.",
   "home.hero.cta": "Start with one project, free",
   "home.hero.secondary": "See what it checks",
-  "home.hero.note": "For teams of one to twenty. Flat price by project, never by headcount. No sales call.",
+  "home.hero.note": "A flat price per project, never per seat. No sales call.",
+  "home.hero.cta.beta": "Ask for a place in the beta",
+  "home.hero.note.beta": "Sign-ups are closed while we finish the first release. An invitation is fourteen days of the full product, no card.",
   // ── home: product preview (an example project) ────────────────────────────
   "preview.project": "acme-app",
   "preview.lastrun": "Last run 14 minutes ago \xB7 next in 5h 46m",
@@ -2389,43 +3899,30 @@ var COPY = {
   "preview.c6.why": "Token expired \xB7 reconnect Supabase",
   "preview.evidence": "Evidence stored \xB7 sha256 3f9a\u2026c21e",
   // ── home: the problem ─────────────────────────────────────────────────────
-  "home.problem.title": "Compliance tools weren't built for your stack, or your budget.",
-  "home.problem.body": "Vanta and Drata start at five figures a year and are built around AWS and Okta. You're on Supabase and Vercel, you're the DPO and the on-call engineer, and the first enterprise customer just sent a forty-question spreadsheet.",
+  "home.problem.title": "Compliance tools were not built for your stack, or your budget.",
+  "home.problem.body": "The established compliance platforms start at five figures a year and were designed around large cloud accounts and enterprise identity providers. You run on modern hosting and a managed database, you are the data protection officer and the on-call engineer, and your first enterprise customer has just sent a forty-question spreadsheet.",
   "home.problem.p1.title": "The obligations don't wait",
-  "home.problem.p1.body": "UK GDPR applies from your first user. Since June 2026 every controller needs a complaints procedure. A Stripe review wants a privacy policy that matches the code.",
+  "home.problem.p1.body": "UK GDPR applies from your first user. The Data (Use and Access) Act 2025 added a complaints procedure every controller must have, in force from June 2026. A payment provider's review expects a privacy policy that matches the code.",
   "home.problem.p2.title": "Nobody checks the things that matter",
-  "home.problem.p2.body": "Is RLS on every table? Does any policy let anon write? Is a preview deployment open to the internet? The big platforms sync your user list and call it monitoring.",
+  "home.problem.p2.body": "Is row-level security on every table? Can an anonymous session write? Is a preview deployment open to the internet? The big platforms sync your user list and call it monitoring.",
   "home.problem.p3.title": "The documents rot",
-  "home.problem.p3.body": "A privacy policy written once says things the code stopped doing months ago. That gap is a misrepresentation, not a typo.",
+  "home.problem.p3.body": "A privacy policy written once still says things the code stopped doing months ago. That gap is a misrepresentation, not a typo.",
   // ── home: how it works ────────────────────────────────────────────────────
   "home.how.title": "How it works",
   "home.how.s1.title": "Connect, read-only",
   "home.how.s1.body": "Grant Snoopios read access through each provider's own consent screen. No write scope is ever requested. Revoke it from their dashboard any time.",
   "home.how.s2.title": "Checks run every hour",
-  "home.how.s2.body": "Each check is code with a recorded fixture. It returns pass, fail or unknown, and a check that can't run says unknown \u2014 it never says pass.",
+  "home.how.s2.body": "Each check is code with a recorded fixture. It returns pass, fail or unknown, and a check that cannot run says unknown. It never says pass.",
   "home.how.s3.title": "Evidence is kept, unchanged",
   "home.how.s3.body": "Every run stores the raw response, a timestamp and a hash. Nothing is edited after the fact. Corrections are new rows.",
   "home.how.s4.title": "Documents write themselves from the facts",
   "home.how.s4.body": "The sub-processor register comes from what's connected. Every policy claim links to a live check, so a sentence the code no longer honours is flagged in the document.",
   // ── home: checks ──────────────────────────────────────────────────────────
   "home.checks.title": "What it checks",
-  "home.checks.body": "Thirty-nine read-only checks across five providers, each with a recorded fixture, and each one exists because it caught a real problem on a real app. More as customers ask.",
-  "home.checks.supabase": "Supabase",
-  "home.checks.supabase.items": "RLS enabled on every public table \xB7 no policy admits anon writes \xB7 private schema closed to session roles \xB7 search_path pinned on definer functions \xB7 email confirmation on \xB7 captcha on \xB7 backups or PITR on \xB7 SSL enforced \xB7 production SMTP configured \xB7 no undeclared public bucket",
-  "home.checks.vercel": "Vercel",
-  "home.checks.vercel.items": "preview deployment protection on \xB7 git fork protection on \xB7 domains verified and configured \xB7 sensitive-variable policy enforced \xB7 cron routes reject unauthenticated calls \xB7 SAML enforced or members reviewed",
-  "home.checks.github": "GitHub",
-  "home.checks.github.items": "default branch protected \xB7 Dependabot alerts on, none critical \xB7 no .env committed \xB7 .gitignore covers .env \xB7 SECURITY.md and CODEOWNERS present \xB7 outside collaborators reviewed",
-  "home.checks.cloudflare": "Cloudflare",
-  "home.checks.cloudflare.items": "DNSSEC active \xB7 TLS mode strict, minimum 1.2 \xB7 always HTTPS with HSTS \xB7 no R2 bucket publicly exposed \xB7 WAF managed ruleset deployed \xB7 Bot Fight Mode on",
-  "home.checks.stripe": "Stripe",
-  "home.checks.stripe.items": "every webhook endpoint enabled and pinned to an API version \xB7 no failed deliveries in 30 days \xB7 live mode with charges enabled",
-  "home.checks.domain": "Your domain",
-  "home.checks.domain.items": "CSP, HSTS, frame-ancestors, nosniff \xB7 HTTP redirects to HTTPS \xB7 HSTS preload status \xB7 SPF, DMARC and CAA present \xB7 TLS 1.2 minimum, certificate not expiring \xB7 security.txt present \xB7 privacy page names a controller and a date",
   "home.checks.aside": "No model decides whether you pass. The full feasibility table, endpoint by endpoint, is published in the documentation.",
   // ── home: the pack ────────────────────────────────────────────────────────
   "home.pack.title": "The pack",
-  "home.pack.body": "The documents a customer, an auditor or the ICO asks for, generated from what's connected and checked against what's running. Every one is a draft for your review, and says so.",
+  "home.pack.body": "The documents a customer, an auditor or the ICO asks for, generated from what's connected and checked against what's running. That includes the three an ISO certification body opens with, and the SOC 2 system description firms normally charge four figures to draft. Every one is a draft for your review, and says so.",
   "home.pack.d1": "Privacy policy, with a real last-updated date",
   "home.pack.d2": "Record of processing activities",
   "home.pack.d3": "Sub-processor register, derived from your connections",
@@ -2443,36 +3940,36 @@ var COPY = {
   "home.trust.url": "snoopios.com/t/acme-app",
   // ── home: pricing ─────────────────────────────────────────────────────────
   "home.pricing.title": "Flat, published, by project.",
-  "home.pricing.body": "No per-seat pricing, no per-framework upsell, no renewal uplift. Annual pays for ten months. Cancel monthly plans any time.",
+  "home.pricing.body": "No per-seat pricing, no renewal uplift, and no charging you again for each standard. You buy a regime, not a framework: the UAE plan covers the federal law, the DIFC and ADGM regimes, Dubai's security regulation and the federal assurance standards, all from the same evidence. Annual pays for ten months. Cancel monthly plans any time.",
   "home.pricing.permonth": "/month",
   "home.pricing.free.note": "Evaluate on one project",
   "home.pricing.popular": "Most teams",
   "home.pricing.cta.free": "Start free",
   "home.pricing.cta.paid": "Start",
-  "home.pricing.compare": "For comparison: the cheapest enterprise platform starts around \xA34,400 a year. Vanta's entry tier for a team your size is about \xA310,000.",
+  "home.pricing.compare": "For comparison, the enterprise platforms do not publish a rate card. Reported entry pricing for a small team runs from about \xA35,500 a year to roughly \xA311,000, with extra frameworks charged on top at \xA31,100 to \xA33,700 each and the trust page and questionnaire tools sold as further add-ons. Figures gathered September 2026 from vendor pages and third-party pricing trackers; treat them as ranges rather than quotes.",
   // ── tiers (also read by lib/access-policy.ts) ────────────────────────────
   "tier.free.name": "Free",
-  "tier.free.f1": "One project",
-  "tier.free.f2": "Weekly checks",
-  "tier.free.f3": "Dashboard and findings",
-  "tier.free.f4": "No document exports",
+  "tier.free.f1": "One project, checked weekly",
+  "tier.free.f2": "Findings with the evidence behind each one",
+  "tier.free.f3": "One region pack: every framework for the country or region you choose",
+  "tier.free.f4": "Evidence kept for one month",
   "tier.solo.name": "Solo",
-  "tier.solo.f1": "One project",
-  "tier.solo.f2": "Checks every six hours",
-  "tier.solo.f3": "Evidence vault, 12 months",
-  "tier.solo.f4": "Full document pack",
-  "tier.solo.f5": "Public trust page",
+  "tier.solo.f1": "One project, checked every hour",
+  "tier.solo.f2": "One region pack, control by control: pick the United Kingdom, the European Union, the UAE, Saudi Arabia, the wider Gulf, North America or Asia",
+  "tier.solo.f3": "The full document pack, exportable: privacy notice, record of processing, sub-processor register, retention schedule, breach runbook, requests procedure, security summary and the eleven policies",
+  "tier.solo.f4": "Evidence vault: every run's raw response, hashed and kept twelve months, plus your own documents linked to the controls they evidence",
+  "tier.solo.f5": "Public trust page with gated document downloads",
   "tier.studio.name": "Studio",
-  "tier.studio.f1": "Up to five projects",
-  "tier.studio.f2": "Checks every hour",
-  "tier.studio.f3": "Everything in Solo, plus the questionnaire answer bank",
-  "tier.studio.f4": "Agency white-label trust pages",
+  "tier.studio.f1": "Everything in Solo",
+  "tier.studio.f2": "A second region pack, for the market you sell into as well as the one you are registered in",
+  "tier.studio.f3": "The Security pack: ISO 27001 and SOC 2, with ISO 27701 for privacy management, 27017 and 27018 for cloud, 22301 for continuity and the NIST framework",
+  "tier.studio.f4": "The questionnaire answer bank: written answers, each citing a live check",
   "tier.scale.name": "Scale",
-  "tier.scale.f1": "Unlimited projects",
-  "tier.scale.f2": "Checks every hour",
-  "tier.scale.f3": "Everything in Studio, plus SOC 2 and ISO 27001 readiness maps",
-  "tier.scale.f4": "Auditor export package",
-  "tier.scale.f5": "Priority support",
+  "tier.scale.f1": "Everything in Studio",
+  "tier.scale.f2": "Four region packs and two projects",
+  "tier.scale.f3": "Two specialist packs of your choosing: AI governance, children's data, or the NHS supplier bundle",
+  "tier.scale.f4": "Evidence vault extended to thirty-six months",
+  "tier.scale.f5": "Accepted risks with a review date, shown beside the fail rather than hiding it",
   // ── home: faq ─────────────────────────────────────────────────────────────
   "home.faq.title": "Questions we get asked",
   "home.faq.q1": "Does Snoopios need write access to anything?",
@@ -2490,8 +3987,8 @@ var COPY = {
   "home.cta.body": "Free for one project, weekly checks, no card. Upgrade when the evidence is worth paying for.",
   "home.cta.button": "Start free",
   // ── home: who ─────────────────────────────────────────────────────────────
-  "home.who.title": "Built by the kind of company it's for.",
-  "home.who.body": "Archema Labs runs five products on Supabase and Vercel with one developer. Every check in Snoopios exists because it caught something on one of them. The compliance pack is the one we wrote by hand, five times, before deciding to build the tool.",
+  "home.who.title": "Built on the stack it checks.",
+  "home.who.body": "Snoopios is built by the team behind several products that run on the same hosting, database and identity services it checks. Every check in it exists because it caught something real on one of those products. The document pack is the one the team wrote by hand, over and over, before deciding to build the tool properly.",
   // ── auth ──────────────────────────────────────────────────────────────────
   "auth.signup.title": "Create your account",
   "auth.signup.frame": "One project free, no card. Confirm your email and you're in.",
@@ -2501,12 +3998,31 @@ var COPY = {
   "auth.signup.closed.title": "Private beta",
   "auth.signup.closed.body": "Snoopios is running with a small group of founding customers while we finish the first release. If you have been invited, your invitation email has the sign-in link. If you would like to join, email us and we will be in touch.",
   "auth.signup.closed.signin": "Already have an account? Sign in",
+  "beta.title": "Ask for a place in the beta",
+  "beta.intro": "Snoopios is running with a small group while we finish the first release. Tell us what you run on and we will be in touch. An invitation gives you fourteen days of the full product, every framework pack your plan allows, hourly checks and the trust page. No card, and nothing starts until you confirm your email.",
+  "beta.email.label": "Email",
+  "beta.email.placeholder": "you@company.com",
+  "beta.platforms.label": "What do you run on?",
+  "beta.platforms.hint": "Tick anything you use. This is the most useful thing on the form: it tells us which checks your account will exercise, so we can have them right before you arrive.",
+  "beta.driver.label": "Who is asking you for this?",
+  "beta.driver.hint": "An enterprise customer, an investor, a tender, an auditor, or nobody yet. One line is plenty.",
+  "beta.driver.placeholder": "A customer has sent us a security questionnaire we cannot answer.",
+  "beta.submit": "Ask for a place",
+  "beta.sending": "Sending",
+  "beta.done.title": "Thank you, that is with us",
+  "beta.done.home": "Back to the homepage",
+  "beta.done.body": "We read every one of these ourselves. If what you run on is something we have not checked against a real account yet, we will say so rather than let you find out.",
+  "beta.error.email": "That does not look like an email address we can reply to.",
+  "beta.error.driver": "That is longer than the box allows. A line or two is plenty.",
+  "beta.error.rate": "That is more requests than we can take from here just now. Try again shortly, or email us.",
+  "beta.error.failed": "We could not record that. Nothing has been saved; try again, or email us.",
+  "beta.privacy": "We store your address, what you ticked and what you wrote, so that we can reply. Nothing else, and no tracking. See the privacy notice.",
   "auth.signup.closed.refused": "Sign-ups are closed for now. Email us to be invited.",
   "auth.signin.title": "Sign in",
   "auth.signin.cta": "Sign in",
   "auth.email.label": "Work email",
   "auth.password.label": "Password",
-  "auth.password.hint": "At least ten characters. A sentence you'll remember beats a word you won't.",
+  "auth.password.hint": "At least twelve characters. A sentence you'll remember beats a word you won't.",
   "a11y.password.show": "Show password",
   "a11y.password.hide": "Hide password",
   "auth.switch.tosignup": "No account yet? Create one",
@@ -2604,7 +4120,7 @@ var COPY = {
   "conn.supabase.title": "Connect Supabase",
   "conn.supabase.oauth.intro": "Grant read-only access through Supabase. The Snoopios app asks for four read scopes (Auth, Database, Projects, Storage) and Supabase itself refuses anything else, so the connection shows as read-only verified. Supabase grants apply to a whole organisation, not one project: Snoopios stores one project ref and reads only that project, but the grant could read the others. If that matters, keep production in its own organisation. Enter the project ref, then approve on Supabase.",
   "conn.supabase.oauth.cta": "Grant read-only access on Supabase",
-  "conn.supabase.oauth.fallback": "Or connect with a personal access token. A token cannot be limited to reads by Supabase, so that connection shows as read-only requested.",
+  "conn.supabase.oauth.fallback": "Or connect with a personal access token. Scope it to this project with the Read-only preset; that connection still shows as read-only requested, because Supabase will not tell us what you granted.",
   "conn.supabase.oauth.connected": "Supabase is connected through a read-only grant. The first run starts within a minute.",
   "conn.supabase.oauth.scope": "The grant does not cover that project ref. Approve with an account that belongs to the project's organisation, and check the ref.",
   "conn.supabase.oauth.denied": "The Supabase grant was cancelled, so nothing was connected. Try again from this page.",
@@ -2615,10 +4131,13 @@ var COPY = {
   "conn.supabase.ref.placeholder": "abcdefghijklmnopqrst",
   "conn.supabase.token.label": "Personal access token",
   "conn.supabase.token.placeholder": "sbp_\u2026",
-  "conn.supabase.token.hint": "Create one at supabase.com/dashboard/account/tokens. Give it an expiry; you'll be asked to reconnect when it lapses.",
+  "conn.supabase.token.hint": "Account, Access Tokens, Generate new token. Scope it: set Resource access to Project and pick only this project, set the permission preset to Read-only, and leave the expiry at seven days. Supabase calls an unrestricted token LEGACY now, and one of those carries everything your account can do. We still record this connection as read-only REQUESTED rather than verified, because Supabase gives no way to read a token's own permissions back, so we cannot prove what you granted. Scoping it is what makes that gap harmless.",
   "conn.supabase.cta": "Connect read-only",
   "conn.supabase.error.ref": "A project ref is twenty lowercase letters and digits.",
   "conn.supabase.error.token": "That doesn't look like a Supabase personal access token.",
+  "conn.supabase.error.auth": "Supabase refused that token. Check it was copied whole and has not expired. Nothing has been saved.",
+  "conn.supabase.error.project": "The token works, but that project ref belongs to no organisation it can see. The ref is the twenty characters in your project URL, and the token must belong to an account that is a member of that organisation. Nothing has been saved.",
+  "conn.supabase.error.unreachable": "Supabase did not answer in a way we could read. Nothing has been saved; try again shortly.",
   "conn.github.title": "Connect GitHub",
   "conn.github.intro": "Until the GitHub App is listed, connect with a fine-grained personal access token scoped to read: Metadata, Contents, Administration, Dependabot alerts and Secret scanning alerts, plus Members if the owner is an organisation (a personal account has no Members permission; leave it out). Classic tokens are refused because they cannot be made read-only.",
   "conn.github.org.label": "Organisation or username",
@@ -2628,10 +4147,13 @@ var COPY = {
   "conn.github.repos.hint": "Optional. Leave empty to check up to thirty active repositories.",
   "conn.github.token.label": "Fine-grained personal access token",
   "conn.github.token.placeholder": "github_pat_\u2026",
-  "conn.github.token.hint": "Create it at github.com/settings/personal-access-tokens with an expiry. It is encrypted before it reaches the database.",
+  "conn.github.token.hint": "Settings, Developer settings, Personal access tokens, Fine-grained tokens, Generate new token. Set Resource owner to the organisation, not your own account, or the token sees none of its repositories. Many organisations also have to approve a new token before it works, and until an owner does the token returns nothing and every check here says unknown rather than fail. Give it an expiry. It is encrypted before it reaches the database.",
   "conn.github.cta": "Connect read-only",
   "conn.github.error.org": "A GitHub organisation or username is letters, digits and hyphens.",
   "conn.github.error.token": "That isn't a fine-grained token. Classic tokens (ghp_) are refused because they can't be scoped read-only.",
+  "conn.github.error.auth": "GitHub refused that token. If it was created minutes ago, check it has not expired and that you copied the whole value; GitHub shows it once.",
+  "conn.github.error.owner": "GitHub has no organisation or username by that name. Check the spelling; it is the part of the repository URL before the slash. Nothing has been saved.",
+  "conn.github.error.no_access": "The token works, but it can see no repository belonging to that owner, so every check would report unknown. There are three usual causes and GitHub does not let us tell them apart. Resource owner: a fine-grained token defaults to your personal account, so an organisation is invisible unless you selected it. Approval: a token for an organisation stays pending until an owner approves it, and reads nothing meanwhile. Repository access: check the token actually lists the repositories you want, and has Metadata read. Nothing has been saved.",
   "conn.cloudflare.title": "Connect Cloudflare",
   "conn.cloudflare.intro": "Create an API token with read permissions only: Zone Read, DNS Read, Zone Settings Read, Zone WAF Read, Bot Management Read, Workers R2 Storage Read, Turnstile Read, Cloudflare Pages Read and Access: Apps and Policies Read, scoped to the zones you want checked. Set an expiry and, if you can, restrict it to our IP ranges.",
   "conn.cloudflare.account.label": "Account ID",
@@ -2641,17 +4163,23 @@ var COPY = {
   "conn.cloudflare.zones.hint": "Optional. Leave empty to check every active zone the token can see, up to ten.",
   "conn.cloudflare.token.label": "API token",
   "conn.cloudflare.token.placeholder": "Token value, shown once by Cloudflare",
-  "conn.cloudflare.token.hint": "Turnstile cannot be read by an account-owned token; that check will show unknown rather than fail.",
+  "conn.cloudflare.token.hint": "Manage Account, Account API Tokens, Create Token, then Custom token, because none of the templates match this set. Your Account ID is on the right of any zone overview page. Turnstile cannot be read by an account-owned token at all, so that one check shows unknown rather than fail, and that is Cloudflare rather than your token.",
   "conn.cloudflare.cta": "Connect read-only",
   "conn.cloudflare.error.account": "An account ID is 32 hexadecimal characters.",
   "conn.cloudflare.error.token": "That doesn't look like a Cloudflare API token.",
+  "conn.cloudflare.error.rate_limited": "Cloudflare is refusing to check that token for a moment, because it has seen several failed attempts from here. Wait a minute and try again. Nothing has been saved.",
+  "conn.cloudflare.error.auth": "Cloudflare refused that token. Check you copied the whole value: it is shown once, when you create it.",
+  "conn.cloudflare.error.account_invisible": "The token works but cannot see that account. Either the Account ID belongs to a different account, or the token was created under My Profile rather than Manage Account and is scoped to your user instead. Nothing has been saved.",
   "conn.stripe.title": "Connect Stripe",
-  "conn.stripe.intro": "Create a restricted key with Read on Webhook Endpoints, Events and Account, nothing else. Secret keys are refused: nothing here needs one.",
+  "conn.stripe.intro": "Create a restricted key with Read on Webhook Endpoints and Events, and nothing else. Those are the only two things Snoopios reads. Secret keys are refused, because nothing here needs one.",
   "conn.stripe.key.label": "Restricted key",
   "conn.stripe.key.placeholder": "rk_live_\u2026",
-  "conn.stripe.key.hint": "Developers \u2192 API keys \u2192 Create restricted key. Add an IP allow-list for our egress ranges if you can.",
+  "conn.stripe.key.hint": "Developers, API keys, Create restricted key. Stripe will offer to select permissions for you if you say the key is for a third-party application: that set runs to twenty-five and includes creating charges and moving balances. Decline it and tick the two above.",
   "conn.stripe.cta": "Connect read-only",
   "conn.stripe.error.key": "That isn't a restricted key. Secret keys (sk_) are refused; create a restricted key with Read permissions.",
+  "conn.stripe.error.auth": "Stripe does not recognise that key. Check it was copied whole, and that it belongs to the account you meant: a test key from one account looks exactly like a test key from another. Nothing has been saved.",
+  "conn.stripe.error.permission": "The key works, but Stripe will not let it read webhook endpoints, which is where both checks start. Edit the restricted key and set Webhook Endpoints and Events to Read. Nothing has been saved.",
+  "conn.stripe.error.unreachable": "Stripe did not answer in a way we could read. Nothing has been saved; try again shortly.",
   "conn.stripe.label.live": "Live mode",
   "conn.stripe.label.test": "Test mode",
   // ── pack ──────────────────────────────────────────────────────────────────
@@ -2770,6 +4298,7 @@ var COPY = {
   "trust.requests.downloads": "downloads",
   "trust.requests.accepted": "accepted the undertaking",
   "trust.requests.issued": "Approved. The link was emailed; if it does not arrive, pass this on yourself:",
+  "trust.requests.unsent": "Approved, but the email did not send. Pass this link on yourself:",
   "trust.requests.error": "That request could not be updated. It may already be decided.",
   "trust.mail.owner.subject": "New document access request",
   "trust.mail.owner.body": "Someone has asked for the documents on the trust page of",
@@ -2875,10 +4404,10 @@ var COPY = {
   "check.domain.headers.hsts.pass": "Strict-Transport-Security has max-age of at least a year and covers subdomains.",
   "check.domain.headers.hsts.fail": "Strict-Transport-Security is missing, shorter than a year, or leaves subdomains reachable over plain HTTP.",
   "check.domain.headers.hsts.fix": "Send Strict-Transport-Security: max-age=63072000; includeSubDomains on every HTTPS response. Without includeSubDomains a subdomain stays cookie-strippable. Add preload only once you're ready to submit at hstspreload.org; it is hard to reverse.",
-  "check.domain.headers.csp.title": "A Content-Security-Policy that stops exfiltration",
-  "check.domain.headers.csp.pass": "A CSP is present with object-src 'none', base-uri 'self' and frame-ancestors.",
-  "check.domain.headers.csp.fail": "No CSP, or one without object-src 'none', base-uri 'self' and frame-ancestors.",
-  "check.domain.headers.csp.fix": "Ship a policy even if it needs 'unsafe-inline' for hydration: object-src 'none', base-uri 'self', form-action 'self', frame-ancestors 'none', and a connect-src limited to your own backends. A policy that stops exfiltration is worth having even when it cannot stop execution.",
+  "check.domain.headers.csp.title": "A Content-Security-Policy that stops injected script",
+  "check.domain.headers.csp.pass": "A CSP is present with object-src 'none', base-uri 'self', a framing rule, and a script-src that does not allow inline script, eval or any origin.",
+  "check.domain.headers.csp.fail": "No CSP, or one missing object-src 'none', base-uri 'self' or a framing rule, or a script-src that allows inline script, eval or any origin.",
+  "check.domain.headers.csp.fix": "Ship object-src 'none', base-uri 'self', form-action 'self' and frame-ancestors 'none'. Then close script-src: a per-request nonce is the usual answer for a framework that needs inline bootstrap script, and 'strict-dynamic' or a hash also work. 'unsafe-inline' beside a nonce is ignored by browsers that honour the nonce, so it is safe to keep for older ones.",
   "check.domain.headers.basics.title": "nosniff, framing protection, referrer policy, no server fingerprint",
   "check.domain.headers.basics.pass": "X-Content-Type-Options, a framing rule and a Referrer-Policy are set, and no server version is advertised.",
   "check.domain.headers.basics.fail": "One or more of nosniff, a framing rule, Referrer-Policy is missing, or the Server or X-Powered-By header reveals software versions.",
@@ -2898,7 +4427,7 @@ var COPY = {
   "check.domain.dns.dmarc.title": "DMARC policy is quarantine or reject",
   "check.domain.dns.dmarc.pass": "_dmarc has a policy of quarantine or reject.",
   "check.domain.dns.dmarc.fail": "No DMARC record, or a policy of none, which only monitors.",
-  "check.domain.dns.dmarc.fix": "Publish a TXT record at _dmarc.<domain>: v=DMARC1; p=quarantine; rua=mailto:dmarc@<domain>. Start with quarantine and pct=100 once the reports show every legitimate sender aligns, then move to reject.",
+  "check.domain.dns.dmarc.fix": "Publish a TXT record at _dmarc.<domain>: v=DMARC1; p=quarantine; rua=mailto:dmarc@<domain>. Quarantine applies to every failing message from the moment you publish it; pct= exists to ramp that in more slowly and is not a later step. Read the aggregate reports until every legitimate sender aligns, then move to reject.",
   "check.domain.dns.caa.title": "CAA record limits who can issue certificates",
   "check.domain.dns.caa.pass": "A CAA record names the permitted certificate authorities.",
   "check.domain.dns.caa.fail": "No CAA record: any authority may issue a certificate for this domain.",
@@ -2925,9 +4454,13 @@ var COPY = {
   "check.supabase.private.closed.fail": "A session role has usage on the private schema, so its functions are one PostgREST setting away from being callable.",
   "check.supabase.private.closed.fix": "revoke usage on schema private from anon, authenticated; and expose only thin public wrappers that cannot name a user or an org.",
   "check.supabase.definer.search_path.title": "SECURITY DEFINER functions pin search_path",
-  "check.supabase.definer.search_path.pass": "Every SECURITY DEFINER function in public and private sets search_path.",
+  "check.supabase.definer.search_path.pass": "Every SECURITY DEFINER function you own sets search_path. Schemas Supabase manages are not counted, because you cannot alter them.",
   "check.supabase.definer.search_path.fail": "A SECURITY DEFINER function has no search_path, so a caller can put a schema in front and run their own code as the definer.",
   "check.supabase.definer.search_path.fix": "Add set search_path = '' to each function and schema-qualify every reference inside it. This is the most common SECURITY DEFINER vulnerability and the cheapest to fix.",
+  "check.supabase.views.security_invoker.title": "Views in public respect the caller, not their creator",
+  "check.supabase.views.security_invoker.pass": "Every view in the public schema is defined with security_invoker, so it runs with the permissions of whoever queries it and the row-level security on the tables underneath still applies.",
+  "check.supabase.views.security_invoker.fail": "At least one view in the public schema runs as the admin who created it. Postgres views default this way, so the view returns every row of the tables underneath regardless of the policies written on them, to anyone who can reach the API.",
+  "check.supabase.views.security_invoker.fix": "alter view public.<name> set (security_invoker = on); then read the view back as an anonymous user and confirm it returns what it should. Needs Postgres 15 or later. A materialised view or a foreign table cannot carry the option at all: move it out of public, or revoke select from anon and authenticated.",
   "check.supabase.functions.anon_callable.title": "Anon-callable SECURITY DEFINER functions are safe to expose",
   "check.supabase.functions.anon_callable.pass": "Every SECURITY DEFINER function the anon role can execute pins its search_path and takes no caller-supplied identity. They are listed for review.",
   "check.supabase.functions.anon_callable.fail": "An unauthenticated request can execute a definer function that has no pinned search_path, or that accepts a user, org or account id as an argument.",
@@ -2936,6 +4469,10 @@ var COPY = {
   "check.supabase.auth.confirmations.pass": "Sign-ups must confirm their address and the email OTP is at least 8 characters.",
   "check.supabase.auth.confirmations.fail": "Sign-ups are auto-confirmed or the OTP is short enough to guess.",
   "check.supabase.auth.confirmations.fix": "In Authentication settings turn on Confirm email and set the OTP length to 8 or more. Turning confirmation on is a product change too: make sure the app has a confirmation screen and the trial clock starts at confirmation.",
+  "check.supabase.auth.password_policy.title": "Password minimum of twelve or more",
+  "check.supabase.auth.password_policy.pass": "Passwords must be at least twelve characters. Length is what makes a password hard to guess, and this is the minimum the product asks of itself.",
+  "check.supabase.auth.password_policy.fail": "Passwords may be shorter than twelve characters. A short minimum is the one password setting an attacker can count on.",
+  "check.supabase.auth.password_policy.fix": "Authentication \u2192 Sign In / Providers \u2192 Email \u2192 Minimum password length: set 12 or more. Leave Password requirements at \u201CNo required characters (default)\u201D: composition rules make passwords predictable, and leaked-password protection does the job they were meant to do.",
   "check.supabase.auth.captcha.title": "Captcha on the auth doors",
   "check.supabase.auth.captcha.pass": "A captcha provider is enabled for sign-up and sign-in.",
   "check.supabase.auth.captcha.fail": "No captcha: sign-up and sign-in are open to scripted abuse.",
@@ -3062,6 +4599,9 @@ var COPY = {
   "conn.sentry.cta": "Connect read-only",
   "conn.sentry.error.org": "An organisation slug is lowercase letters, digits and hyphens.",
   "conn.sentry.error.token": "That isn't a Sentry auth token. Create one under Settings \u2192 Auth Tokens with read scopes only.",
+  "conn.sentry.error.auth": "Sentry refused that token. One cause is easy to miss: Sentry runs separate European and United States installations, and a token issued on one is unknown on the other. Check which one your organisation is on. Nothing has been saved.",
+  "conn.sentry.error.org_invisible": "The token works, but that organisation is not one it belongs to. The slug is the part of your Sentry URL after the host. Nothing has been saved.",
+  "conn.sentry.error.unreachable": "Sentry did not answer in a way we could read. Nothing has been saved; try again shortly.",
   "conn.slack.title": "Connect Slack",
   "conn.slack.intro": "Create a Slack app for your workspace with two user scopes, users:read and team:read, install it, and paste the token. Nothing else is requested: the checks read who has a second factor, who is an admin, who is a guest, and whether joining is restricted.",
   "conn.slack.workspace.label": "Workspace",
@@ -3120,6 +4660,9 @@ var COPY = {
   "conn.gitlab.error.owner": "A group path or username is letters, digits, dots, hyphens and underscores, with slashes between sub-groups.",
   "conn.gitlab.error.host": "The host must be an https:// origin, like https://gitlab.example.com.",
   "conn.gitlab.error.token": "That isn't a GitLab access token (glpat-\u2026).",
+  "conn.gitlab.error.auth": "GitLab refused that token. Check it was copied whole and has not expired, and that it is for the host above if you self-host. Nothing has been saved.",
+  "conn.gitlab.error.access": "The token works, but that group or username is not one it can reach. A token only sees groups you are a member of, and a public group being visible in a browser does not mean the token can read it. Nothing has been saved.",
+  "conn.gitlab.error.unreachable": "GitLab did not answer in a way we could read. Nothing has been saved; try again shortly.",
   "check.gitlab.group.2fa.title": "Two-factor authentication required on the group",
   "check.gitlab.group.2fa.pass": "The group requires every member to use two-factor authentication.",
   "check.gitlab.group.2fa.fail": "The group does not require two-factor authentication; a member with a phished password can push code.",
@@ -3149,11 +4692,11 @@ var COPY = {
   "check.gitlab.group.members_reviewed.fail": "An expired member is still present, or Owner rights are held too widely.",
   "check.gitlab.group.members_reviewed.fix": "Group \u2192 Manage \u2192 Members: remove expired members, and reduce Owners to the people who administer the group; give Maintainer to the rest.",
   "check.netlify.site.force_https.title": "HTTPS forced on every site",
-  "check.netlify.site.force_https.pass": "Every site has SSL on and forces HTTPS.",
-  "check.netlify.site.force_https.fail": "At least one site serves plain HTTP without redirecting to HTTPS.",
-  "check.netlify.site.force_https.fix": "Site settings \u2192 Domain management \u2192 HTTPS \u2192 Force HTTPS, on every site.",
+  "check.netlify.site.force_https.pass": "Plain HTTP on every site answered with a redirect to the HTTPS origin, asked of each site in turn.",
+  "check.netlify.site.force_https.fail": "At least one site answered plain HTTP without redirecting to HTTPS.",
+  "check.netlify.site.force_https.fix": "For a site on your own domain: Site configuration \u2192 Domain management \u2192 HTTPS \u2192 Force HTTPS. A site on its default netlify.app address has no such switch, because Netlify already redirects and preloads HSTS there, so a failure on one of those is worth reporting to us rather than fixing.",
   "check.netlify.site.protected.title": "Sites are behind site protection",
-  "check.netlify.site.protected.pass": "Every site has password protection set, so previews and branch deploys are not public.",
+  "check.netlify.site.protected.pass": "Every site requires a password or a team login before it can be viewed, so previews and branch deploys are not public.",
   "check.netlify.site.protected.fail": "At least one site is open to anyone, so its deploy previews and branch deploys are public too.",
   "check.netlify.site.protected.fix": "Site settings \u2192 Access control \u2192 Site protection: set a password or restrict to team members. Read-only on Netlify's Pro plan and above; on the free plan, keep previews private by not publishing them or accept the risk with a review date.",
   "check.netlify.env.secrets_marked.title": "Secret-looking variables are marked secret",
@@ -3254,7 +4797,7 @@ var COPY = {
   "provider.atlas": "MongoDB Atlas",
   "check.atlas.project.ip_access_list.title": "Database reachable only from listed addresses",
   "check.atlas.project.ip_access_list.pass": "The project's IP access list names specific addresses; nothing admits the whole internet.",
-  "check.atlas.project.ip_access_list.fail": "The project's IP access list admits every address (0.0.0.0/0) or is empty, so the password is the only barrier, or nothing can connect at all.",
+  "check.atlas.project.ip_access_list.fail": "The project's IP access list admits every address (0.0.0.0/0), so the password is the only barrier.",
   "check.atlas.project.ip_access_list.fix": "Atlas \u2192 Network Access: replace 0.0.0.0/0 with your application's egress addresses, or use private endpoints and peering. For a serverless host with changing addresses, use a static egress IP or a private endpoint.",
   "check.atlas.cluster.backups_enabled.title": "Backups on every cluster",
   "check.atlas.cluster.backups_enabled.pass": "Every cluster has cloud backup enabled.",
@@ -3268,9 +4811,9 @@ var COPY = {
   "check.atlas.cluster.termination_protection.pass": "Every cluster has termination protection on, so it cannot be deleted by a stray click or script.",
   "check.atlas.cluster.termination_protection.fail": "At least one cluster can be deleted without a second step.",
   "check.atlas.cluster.termination_protection.fix": "Atlas \u2192 cluster \u2192 Edit configuration \u2192 Additional settings \u2192 Termination protection: on.",
-  "check.atlas.db_users.least_privilege.title": "No database user holds an admin role",
+  "check.atlas.db_users.least_privilege.title": "No database user holds a cluster-wide role",
   "check.atlas.db_users.least_privilege.pass": "Every database user holds only database-scoped roles.",
-  "check.atlas.db_users.least_privilege.fail": "At least one database user holds an admin role (atlasAdmin, root, readWriteAnyDatabase, dbAdminAnyDatabase, userAdminAnyDatabase or clusterAdmin), so a leaked application credential is a full takeover.",
+  "check.atlas.db_users.least_privilege.fail": "At least one database user holds an admin or cluster-wide role (atlasAdmin, root, readWriteAnyDatabase, readAnyDatabase, dbAdminAnyDatabase, userAdminAnyDatabase or clusterAdmin), so a leaked application credential reaches every database, not just its own.",
   "check.atlas.db_users.least_privilege.fix": "Atlas \u2192 Database Access: give application users readWrite on their own database only; keep admin roles for people, protected by Atlas login and MFA.",
   "stack.blurb.atlas": "MongoDB: IP access list, backups, version, termination protection, roles",
   "conn.atlas.title": "Connect MongoDB Atlas",
@@ -3405,10 +4948,6 @@ var COPY = {
   "check.bitbucket.repos.default_reviewers.pass": "Every repository has at least one effective default reviewer, so every pull request starts with a reviewer assigned.",
   "check.bitbucket.repos.default_reviewers.fail": "At least one repository has no default reviewer, so a pull request can be raised and merged with nobody asked to look.",
   "check.bitbucket.repos.default_reviewers.fix": "Bitbucket \u2192 the repository \u2192 Repository settings \u2192 Default reviewers: add at least one person other than the usual author. Workspace-level defaults count.",
-  "check.bitbucket.deploy_keys.recent.title": "Deploy keys in use",
-  "check.bitbucket.deploy_keys.recent.pass": "Every deploy key was used in the last ninety days or added in the last thirty.",
-  "check.bitbucket.deploy_keys.recent.fail": "At least one deploy key has not been used for ninety days, so it is a standing credential nobody is watching.",
-  "check.bitbucket.deploy_keys.recent.fix": "Bitbucket \u2192 the repository \u2192 Repository settings \u2192 Access keys: delete the stale keys. Prefer short-lived pipeline credentials to standing keys.",
   "check.bitbucket.pipelines.secured_variables.title": "Pipeline secrets marked secured",
   "check.bitbucket.pipelines.secured_variables.pass": "Every pipeline variable named like a credential is marked secured, so its value is never shown in logs or the API.",
   "check.bitbucket.pipelines.secured_variables.fail": "At least one pipeline variable named like a credential is not secured, so its value is readable by anyone with pipeline access and can appear in logs.",
@@ -3419,7 +4958,7 @@ var COPY = {
   "check.bitbucket.account.two_factor.fix": "Atlassian account \u2192 Security \u2192 Two-step verification: enable it with an authenticator app or a security key.",
   "stack.blurb.bitbucket": "Bitbucket Cloud: private repos, forks, reviewers, deploy keys, pipeline secrets",
   "conn.bitbucket.title": "Connect Bitbucket",
-  "conn.bitbucket.intro": "Create an Atlassian API token with scopes (Account settings \u2192 Security \u2192 API tokens \u2192 Create API token with scopes \u2192 Bitbucket) and tick only read:repository, read:pullrequest, read:pipeline, read:ssh-key, read:user and read:workspace. Bitbucket sometimes reports a token's scopes back; when it does, a write scope is refused. Otherwise the connection shows as read-only requested and every request is limited to reads by code.",
+  "conn.bitbucket.intro": "Create an Atlassian API token with scopes (Account settings \u2192 Security \u2192 API tokens \u2192 Create API token with scopes \u2192 Bitbucket) and tick only read:repository, read:pullrequest, read:pipeline, read:user and read:workspace. Bitbucket sometimes reports a token's scopes back; when it does, a write scope is refused. Otherwise the connection shows as read-only requested and every request is limited to reads by code.",
   "conn.bitbucket.workspace.label": "Workspace ID",
   "conn.bitbucket.workspace.placeholder": "acme",
   "conn.bitbucket.token.label": "API token",
@@ -3489,6 +5028,9 @@ var COPY = {
   "conn.azure.subscription.label": "Subscription ID",
   "conn.azure.subscription.hint": "Azure Portal \u2192 Subscriptions. One connection per subscription.",
   "conn.azure.cta": "Connect read-only",
+  "conn.azure.error.no_role": "Snoopios reached your tenant but has no role on that subscription. Two things are needed and one of them is probably missing: the application's service principal in your tenant, and the Reader role assigned to it on this subscription. The commands are above. Role assignments can take a minute to take effect, so if you have just made one, wait and try again.",
+  "conn.azure.error.write": "That service principal holds more than Reader on the subscription. Snoopios refuses a connection that could change anything, so nothing has been saved. Remove the wider assignment, leave Reader, and try again.",
+  "conn.azure.error.auth": "Snoopios could not get a token for that tenant. Check the tenant id, and that the application's service principal exists in your directory.",
   "conn.azure.error.tenant": "A tenant id is 36 characters: eight, four, four, four and twelve hex digits separated by hyphens.",
   "conn.azure.error.subscription": "A subscription id is 36 characters: eight, four, four, four and twelve hex digits separated by hyphens.",
   "provider.pagerduty": "PagerDuty",
@@ -3501,7 +5043,7 @@ var COPY = {
   "check.pagerduty.services.escalation_wired.fail": "At least one active service has no escalation policy, or a policy with no targets, so its incidents page nobody.",
   "check.pagerduty.services.escalation_wired.fix": "PagerDuty \u2192 Services \u2192 the service \u2192 Settings \u2192 Escalation policy: assign a policy whose first level targets a schedule or a person.",
   "check.pagerduty.escalation.backup_level.title": "Unanswered pages escalate",
-  "check.pagerduty.escalation.backup_level.pass": "Every escalation policy has a second level or repeats, so an unanswered page reaches somebody else.",
+  "check.pagerduty.escalation.backup_level.pass": "Every escalation policy has a second level or repeats, so an unanswered page is not simply dropped. A second level reaches somebody else; a repeat pages the same responder again.",
   "check.pagerduty.escalation.backup_level.fail": "At least one escalation policy has a single level and never repeats, so an unanswered page stops there.",
   "check.pagerduty.escalation.backup_level.fix": "PagerDuty \u2192 People \u2192 Escalation policies \u2192 the policy: add a second level (another schedule, a manager) or set the policy to repeat at least once.",
   "check.pagerduty.incidents.none_stale.title": "No incident open for more than a day",
@@ -3569,7 +5111,7 @@ var COPY = {
   "check.okta.signon.sessions_bounded.fix": "Okta Admin \u2192 Security \u2192 Global session policy \u2192 the rule \u2192 Session management: Maximum idle time 24 hours or less, Maximum lifetime set (30 days is generous), and expire on browser close where the app allows.",
   "stack.blurb.okta": "Workforce identity: MFA required and enrolled, super admins, dormant users, sessions",
   "conn.okta.title": "Connect Okta",
-  "conn.okta.intro": "Create a dedicated user, give it only the Read-only Administrator role, sign in as that user and create an API token (Security \u2192 API \u2192 Tokens). Okta tokens inherit their creator's role and cannot be scoped, so every run reads the token's own user and roles first and stops if any role could write: the connection shows as read-only verified. Note that Okta revokes a token unused for thirty days; Snoopios uses it hourly.",
+  "conn.okta.intro": "Create a dedicated user, give it only the Read-only Administrator role, sign in as that user and create an API token (Security \u2192 API \u2192 Tokens). Okta tokens inherit their creator's role and cannot be scoped, so every run reads the token's own user first and stops if any role it can see could write. Okta refuses to show a read-only administrator its own roles, so that reading usually cannot be made: the connection shows as read-only requested. Note that Okta revokes a token unused for thirty days; Snoopios uses it hourly.",
   "conn.okta.org.label": "Okta org domain",
   "conn.okta.org.placeholder": "acme.okta.com",
   "conn.okta.token.label": "API token",
@@ -3677,6 +5219,9 @@ var COPY = {
   "conn.fly.cta": "Connect read-only",
   "conn.fly.error.org": "An organisation slug is lowercase letters, digits and hyphens.",
   "conn.fly.error.token": "That isn't a Fly token (FlyV1 fm2_\u2026). Create one with fly tokens create readonly.",
+  "conn.fly.error.auth": "Fly refused that token. Check it was copied whole, including the FlyV1 prefix, which is easy to leave behind. Nothing has been saved.",
+  "conn.fly.error.org_invisible": "The token works, but it does not cover an organisation by that slug. Either the slug is wrong, and it is the one in your Fly dashboard URL rather than the display name, or the token was issued for a different organisation: a read-only token names one org when you create it. Nothing has been saved.",
+  "conn.fly.error.unreachable": "Fly did not answer in a way we could read. Nothing has been saved; try again shortly.",
   "check.fly.services.force_https.title": "Plain HTTP redirects to HTTPS on every service",
   "check.fly.services.force_https.pass": "Every machine service that listens on plain HTTP has force_https on, or listens on TLS only.",
   "check.fly.services.force_https.fail": "At least one service accepts plain HTTP without redirecting to HTTPS.",
@@ -3809,9 +5354,13 @@ var COPY = {
   "check.email.dmarc.reporting.fail": "The DMARC record has no rua= address. Failures and spoofing attempts are invisible.",
   "check.email.dmarc.reporting.fix": "Add rua=mailto:dmarc@yourdomain (or a report processor's address) to the _dmarc TXT record. Receivers send daily aggregate reports there; read them before tightening the policy.",
   "check.email.mta_sts.title": "MTA-STS enforces TLS on mail delivered to you",
-  "check.email.mta_sts.pass": "An MTA-STS record exists and the policy at mta-sts.yourdomain is in enforce mode.",
-  "check.email.mta_sts.fail": "No MTA-STS policy in enforce mode. Mail sent to this domain can be downgraded to plain text by an attacker on the path.",
-  "check.email.mta_sts.fix": "Publish _mta-sts.yourdomain TXT v=STSv1; id=<date>, and serve https://mta-sts.yourdomain/.well-known/mta-sts.txt with version: STSv1, mode: enforce, your mx: lines and max_age: 604800. Run in testing mode for a week first if you receive mail through more than one provider.",
+  "check.email.mta_sts.pass": "An MTA-STS policy is published in enforce mode, served directly as text/plain, and its mx: lines cover every MX record for the domain.",
+  "check.email.mta_sts.fail": "No MTA-STS policy a sending server will act on. Either there is no policy in enforce mode, or the policy is published in a way conforming senders reject: reached through a redirect, not served as text/plain, missing a usable max_age, or listing exchangers that do not match this domain's MX records. Mail sent to this domain can be downgraded to plain text by an attacker on the path.",
+  "check.email.mta_sts.fix": "Publish _mta-sts.yourdomain TXT v=STSv1; id=<date>, and serve https://mta-sts.yourdomain/.well-known/mta-sts.txt with version: STSv1, mode: enforce, your mx: lines and max_age: 604800. Serve it directly as text/plain with no redirect, and check the mx: lines against your live MX records before you switch to enforce: in enforce mode an exchanger the policy does not list makes senders reject your mail rather than deliver it. Run in testing mode for a week first if you receive mail through more than one provider, and change the id when you change the policy or senders keep the cached one until max_age expires.",
+  "check.email.mta_sts.mx_match.title": "Your enforcing MTA-STS policy lists the right mail exchangers",
+  "check.email.mta_sts.mx_match.pass": "Either no MTA-STS policy is in force, or the one that is lists every MX record this domain publishes.",
+  "check.email.mta_sts.mx_match.fail": "Your MTA-STS policy is in enforce mode and does not list every mail exchanger for this domain. Senders that honour the policy are rejecting mail to the missing ones rather than delivering it, so mail is being lost now.",
+  "check.email.mta_sts.mx_match.fix": "Add the missing exchangers to the mx: lines at https://mta-sts.yourdomain/.well-known/mta-sts.txt, or switch mode: to testing until they match. Then change the id in the _mta-sts.yourdomain TXT record, because senders keep the policy they already fetched until max_age runs out and will go on rejecting until they refresh.",
   "check.email.tlsrpt.title": "TLS reporting is configured",
   "check.email.tlsrpt.pass": "A TLS-RPT record names where senders should report failed TLS negotiations to your mail servers.",
   "check.email.tlsrpt.fail": "No TLS-RPT record. If TLS to your mail servers breaks, nobody is told.",
@@ -3849,6 +5398,9 @@ var COPY = {
   "conn.vercel.label.personal": "Vercel personal account",
   "conn.vercel.connected": "Vercel is connected. The first run starts within a minute.",
   "conn.vercel.error": "The Vercel install did not complete. Try again from this page; if it repeats, email us.",
+  "conn.vercel.error.no_projects": "The install completed, but it can see no projects, so there would be nothing to check. If Vercel asked you to choose specific projects, install again and include the ones you want checked. Nothing has been saved.",
+  "conn.vercel.error.auth": "Vercel would not let the new installation read your projects. That usually means the install was removed on Vercel's side before it finished. Install again from this page. Nothing has been saved.",
+  "conn.vercel.error.unreachable": "Vercel did not answer in a way we could read. Nothing has been saved; try again shortly.",
   "check.vercel.projects.preview_protection.title": "Preview deployments are protected",
   "check.vercel.projects.preview_protection.pass": "Every project protects its preview deployments with Vercel Authentication or a password.",
   "check.vercel.projects.preview_protection.fail": "Some projects serve preview deployments to anyone with the link, including branches with unreleased features and test data.",
@@ -4068,10 +5620,12 @@ var COPY = {
   // Every sentence here describes code that exists. Change the code, change
   // the sentence, change the date. In that order.
   "privacy.title": "Privacy notice",
-  "privacy.updated": "Last updated 8 September 2026",
+  "privacy.updated": "Last updated 12 September 2026",
   "privacy.intro": "This notice describes what Snoopios does with personal data today. Every sentence describes code that exists. A solicitor reviews it before launch; until then it is a draft that is nonetheless true.",
   "privacy.s1.h": "Who we are",
   "privacy.s1.p": "Snoopios is a product of Archema Labs, a company in the United Kingdom and the controller for the data described here. Archema Labs is registered with the Information Commissioner's Office.",
+  "privacy.s10.h": "Asking for a place in the beta",
+  "privacy.s10.p": "While sign-ups are closed you can ask for a place using the form at /beta. It records three things: your email address, which platforms you ticked, and the line you wrote about who is asking you for compliance. We use them to decide who to invite and to reply to you, and for nothing else. There is no marketing list and nothing is shared with anyone. Your address is the key, so asking twice updates what you sent rather than adding a second entry. We keep a request until we invite you or close it, and for twelve months after that, then it is deleted by the same nightly job that applies every other retention rule here. Ask us at any time and we will delete it sooner.",
   "privacy.s2.h": "Accounts",
   "privacy.s2.p": "When you create an account we hold your email address, the name you give, and a password hash kept by our authentication provider. We use them to sign you in, to send the emails the product needs (confirmation, a check that starts failing, a document access decision), and for nothing else. There is no marketing list.",
   "privacy.s3.h": "Projects and connections",
@@ -4094,6 +5648,1670 @@ var COPY = {
   // iOS never fires beforeinstallprompt, so this is real instructions rather
   // than a button that does nothing. See the pwa-offline skill.
   "pwa.ios.hint": "Tap the share button, then Add to Home Screen.",
+  "pwa.hint.title": "Install Snoopios",
+  "pwa.hint.why": "It opens in its own window, keeps you signed in, and works offline for the pages you have already seen.",
+  "pwa.hint.ios": "In Safari, tap the share button at the bottom of the screen, scroll down, then tap Add to Home Screen.",
+  "pwa.hint.safari": "In Safari, open the File menu and choose Add to Dock. On iPhone and iPad, use the share button, then Add to Home Screen.",
+  "pwa.hint.firefox": "Firefox on the desktop does not install web apps. Snoopios works normally in the browser, and Chrome, Edge or Safari will install it if you want it in its own window.",
+  "pwa.hint.other": "Look for an install icon in the address bar, or an Install app item in the browser menu.",
+  "pwa.hint.close": "Close",
+  "check.gcp.storage.public_access_prevention.title": "No bucket can be made public, whatever its permissions say",
+  "check.gcp.storage.public_access_prevention.pass": "Every bucket enforces public access prevention.",
+  "check.gcp.storage.public_access_prevention.fail": "At least one bucket does not enforce public access prevention. Nothing is public today, but one permission change makes it so, and that change does not need a deployment or a review.",
+  "check.gcp.storage.public_access_prevention.fix": "Open the bucket, Permissions, then Public access, and set prevention to enforced. It overrides the bucket's own permissions, so nothing can expose it later by mistake. Set it on the organisation or folder instead if you want it to cover buckets nobody has made yet.",
+  "check.aws.s3.account_public_access_blocked.title": "No bucket can be made public, including the next one",
+  "check.aws.s3.account_public_access_blocked.pass": "The account blocks public access to S3 for every bucket, present and future.",
+  "check.aws.s3.account_public_access_blocked.fail": "The account-wide block on public S3 access is not fully on. Each bucket is then only as safe as its own settings, and the next bucket somebody creates starts without any.",
+  "check.aws.s3.account_public_access_blocked.fix": "Open S3, then Block Public Access settings for this account, and turn on all four. It overrides individual buckets, so nothing can be shared publicly by mistake afterwards. Check first that you do not deliberately serve a public website from a bucket, because that will stop working.",
+  "check.aws.s3.access_logging.title": "You could tell who read a file",
+  "check.aws.s3.access_logging.pass": "Every bucket records who accessed it.",
+  "check.aws.s3.access_logging.fail": "At least one bucket has no access logging, so there is no record of who read or wrote anything in it.",
+  "check.aws.s3.access_logging.fix": "Open the bucket, Properties, then Server access logging, and point it at a logging bucket. Logs cost storage, so it is reasonable to enable it on the buckets that hold anything sensitive and note why the others are exempt in your risk register.",
+  "check.aws.config.recording.title": "Changes to your AWS setup are recorded",
+  "check.aws.config.recording.pass": "AWS Config is recording the configuration of this region and delivering it successfully.",
+  "check.aws.config.recording.fail": "AWS Config is not recording, or is recording and failing to deliver. Either way there is no history of how the account was configured, so a question about when a setting changed cannot be answered from evidence.",
+  "check.aws.config.recording.fix": "Open AWS Config and set up the recorder for this region, with a delivery bucket it can write to. If it is already on, check the last status: a delivery failure usually means the bucket policy does not allow Config to write.",
+  "check.aws.accessanalyzer.enabled.title": "Something is watching for access from outside the account",
+  "check.aws.accessanalyzer.enabled.pass": "An IAM Access Analyzer is active in this region.",
+  "check.aws.accessanalyzer.enabled.fail": "No Access Analyzer is active, so nothing is telling you when a bucket, role, key or queue becomes reachable from outside the account.",
+  "check.aws.accessanalyzer.enabled.fix": "Open IAM, Access Analyzer, and create an analyzer with the account as its zone of trust. It is free for external access findings and it is the only thing in AWS that answers the question across every resource type at once.",
+  "check.aws.lambda.no_public_urls.title": "No function is answering the open internet",
+  "check.aws.lambda.no_public_urls.pass": "No Lambda function URL is open without authentication.",
+  "check.aws.lambda.no_public_urls.fail": "At least one Lambda function has a URL with authentication set to NONE. That is a public HTTPS endpoint with no firewall in front of it and no record of it in DNS, reachable by anybody who learns the address.",
+  "check.aws.lambda.no_public_urls.fix": "Open Lambda, the function, then Configuration, Function URL, and set auth type to AWS_IAM, or remove the URL. If it is meant to be public, such as a webhook receiver, keep the finding and note what it does and what validates the caller.",
+  "check.aws.regions.resources_localised.title": "Your servers and databases are all in one region",
+  "check.aws.regions.resources_localised.pass": "Every EC2 instance and database in your account is in the region this connection names.",
+  "check.aws.regions.resources_localised.fail": "You are running compute or databases in a region Snoopios is not reading. Two things follow: those resources are not being checked at all, and if the region is outside the jurisdiction you told your customers about, that is a data transfer you may need to be able to explain.",
+  "check.aws.regions.resources_localised.fix": "Either move the resources, or add a second Snoopios connection for that region so it is checked too. If the resources are meant to be there, the finding is still worth keeping: it is the list an assessor asks for when they ask where personal data lives.",
+  "check.aws.ec2.snapshots_not_public.title": "No disk snapshot is shared publicly",
+  "check.aws.ec2.snapshots_not_public.pass": "No EBS snapshot in this account is shared with all AWS accounts.",
+  "check.aws.ec2.snapshots_not_public.fail": "At least one disk snapshot is public. That is a whole volume, readable by anybody with an AWS account, including everything that was on it when the snapshot was taken.",
+  "check.aws.ec2.snapshots_not_public.fix": "Open EC2, Snapshots, select it, then Actions, Modify permissions, and set it back to private. Then work out how long it was public and what was on it, because that is the question you will be asked.",
+  "check.aws.ec2.amis_not_public.title": "No machine image is shared publicly",
+  "check.aws.ec2.amis_not_public.pass": "No AMI owned by this account is public.",
+  "check.aws.ec2.amis_not_public.fail": "At least one machine image is public. An AMI carries whatever was on the disk when it was made, which frequently includes keys, configuration and application code nobody meant to publish.",
+  "check.aws.ec2.amis_not_public.fix": "Open EC2, AMIs, select it, then Actions, Edit AMI permissions, and set it to private. Check what the image contains before deciding whether anything needs rotating.",
+  "check.aws.rds.snapshots_not_public.title": "No database snapshot is shared publicly",
+  "check.aws.rds.snapshots_not_public.pass": "No database snapshot owned by this account is public.",
+  "check.aws.rds.snapshots_not_public.fail": "At least one database snapshot is public. Anybody with an AWS account can restore it and read every row that was in the database when it was taken.",
+  "check.aws.rds.snapshots_not_public.fix": "Open RDS, Snapshots, select it, then Actions, Share snapshot, and remove the public entry. Treat the contents as disclosed until you know how long it was open.",
+  "check.aws.ec2.ebs_encryption_default.title": "New disks are encrypted without anybody remembering",
+  "check.aws.ec2.ebs_encryption_default.pass": "This region encrypts new EBS volumes by default.",
+  "check.aws.ec2.ebs_encryption_default.fail": "New disks are not encrypted by default, so protection depends on whoever creates the next one remembering to tick the box.",
+  "check.aws.ec2.ebs_encryption_default.fix": "Open EC2, then EBS encryption in the account settings for this region, and turn on Always encrypt new EBS volumes. It applies to new volumes only, so the existing ones still need attention separately.",
+  "check.aws.iam.credentials_used.title": "Every access key is actually being used",
+  "check.aws.iam.credentials_used.pass": "Every active access key has been used in the last ninety days.",
+  "check.aws.iam.credentials_used.fail": "At least one active access key has not been used for ninety days, or has never been used at all. An unused credential is all risk and no benefit: it can still open the door and nobody would notice it being used.",
+  "check.aws.iam.credentials_used.fix": "Delete the keys nobody needs. If one belongs to something seasonal, note that beside it in your access review so the next reader knows it is deliberate rather than forgotten.",
+  "conn.least_privilege": "Grant only the permissions listed above. Providers often pre-select a wider set and present it as the usual choice, and that set frequently includes the ability to write. If Snoopios needed more than this list, this screen would say so.",
+  "home.checks.providers": "providers",
+  "home.family.infrastructure": "What you run on",
+  "home.family.infrastructure.body": "The hosting, databases, domains, monitoring and payments a small software team actually deploys to. This is the layer every compliance tool covers, and the one where being wrong is loudest.",
+  "home.family.development": "How you build",
+  "home.family.development.body": "Where the code lives, what your scanners found, and whether the work of fixing it has an owner and a date. Snoopios never rescans your code: it reads what your own tools found and asks how quickly anybody acted, which is the question a framework actually poses.",
+  "home.family.organisation": "How you are run",
+  "home.family.organisation.body": "The half of every framework that is not infrastructure at all: who has access, who joined, who left, what the laptops are doing, where the credentials live, and whether your policies have an owner and a review date. Most tools ask you to type this in. These read it.",
+  "home.role.scanning": "Scanning",
+  "home.role.secrets": "Secrets",
+  "provider.snyk": "Snyk",
+  "stack.blurb.snyk": "Runs on the CLI. Reads the issues Snyk already found: open criticals, how long they have been open, and whether the scan still runs.",
+  "provider.gitguardian": "GitGuardian",
+  "stack.blurb.gitguardian": "Runs on the CLI. Reads open secret incidents, and separates the ones whose credential still works from the ones that no longer do.",
+  "provider.semgrep": "Semgrep",
+  "stack.blurb.semgrep": "Runs on the CLI. Reads the findings Semgrep already produced, judged by the same window as every other scanner here.",
+  "provider.aikido": "Aikido",
+  "stack.blurb.aikido": "Runs on the CLI. Reads open issues and their age. Its own risk score is deliberately ignored, because a composite score is a judgement we cannot show the working for.",
+  "provider.sonarqube": "SonarQube",
+  "stack.blurb.sonarqube": "Runs on the CLI. Reads the quality gate, which is change management written as code, plus whether the project is still being analysed.",
+  "provider.bitwarden": "Bitwarden",
+  "stack.blurb.bitwarden": "Runs on the CLI. Reads members, their second factor and your organisation policies. Never a vault item.",
+  "provider.onepassword": "1Password",
+  "stack.blurb.onepassword": "Runs on the CLI. Reads the sign in log, which says whether a second factor was actually used rather than whether one is required.",
+  "provider.doppler": "Doppler",
+  "stack.blurb.doppler": "Runs on the CLI. Reads the names and scope of your service tokens. Never a secret value.",
+  "conn.local.title": "Run on your own machine",
+  "cli.local.why": "These run on your own machine because their credentials cannot be made read-only, or because handing a compliance tool a key to your password manager is an ask most companies should refuse. The token stays with you. Only the verdicts travel, and only when you ask for that with --push.",
+  "check.snyk.issues.no_critical.title": "Nothing critical is open",
+  "check.snyk.issues.no_critical.pass": "No critical issue is open.",
+  "check.snyk.issues.no_critical.fail": "At least one critical issue is open. This is the shortest sentence an assessor wants to hear the other answer to, and it is the one your own tool is already telling you.",
+  "check.snyk.issues.no_critical.fix": "Fix it, or record it as an accepted risk so the file says somebody decided rather than nobody looked. An accepted risk with a name and a date reads far better than an open critical with neither.",
+  "check.snyk.issues.within_window.title": "Serious findings are closed within thirty days",
+  "check.snyk.issues.within_window.pass": "Every open critical and high issue was raised within the last thirty days.",
+  "check.snyk.issues.within_window.fail": "At least one critical or high issue has been open for more than thirty days. The gap between your tool finding something and somebody fixing it is the number an assessor writes down.",
+  "check.snyk.issues.within_window.fix": "Work through the list, or accept the risks formally. The window runs from when the finding was first seen, so rescanning does not reset it.",
+  "check.snyk.issues.no_ancient.title": "Nothing has been open for more than ninety days",
+  "check.snyk.issues.no_ancient.pass": "No open issue is older than ninety days, whatever its severity.",
+  "check.snyk.issues.no_ancient.fail": "At least one issue has been open for more than ninety days. A medium is never urgent enough to reach the top of the list, and that is exactly how it stays open for two years.",
+  "check.snyk.issues.no_ancient.fix": "Triage the backlog. Anything genuinely not worth fixing should be marked as such in the tool, which is a decision; leaving it open is not.",
+  "check.semgrep.findings.no_critical.title": "Nothing critical is open",
+  "check.semgrep.findings.no_critical.pass": "No critical finding is open.",
+  "check.semgrep.findings.no_critical.fail": "At least one critical finding is open. This is the shortest sentence an assessor wants to hear the other answer to, and it is the one your own tool is already telling you.",
+  "check.semgrep.findings.no_critical.fix": "Fix it, or record it as an accepted risk so the file says somebody decided rather than nobody looked. An accepted risk with a name and a date reads far better than an open critical with neither.",
+  "check.semgrep.findings.within_window.title": "Serious findings are closed within thirty days",
+  "check.semgrep.findings.within_window.pass": "Every open critical and high finding was raised within the last thirty days.",
+  "check.semgrep.findings.within_window.fail": "At least one critical or high finding has been open for more than thirty days. The gap between your tool finding something and somebody fixing it is the number an assessor writes down.",
+  "check.semgrep.findings.within_window.fix": "Work through the list, or accept the risks formally. The window runs from when the finding was first seen, so rescanning does not reset it.",
+  "check.semgrep.findings.no_ancient.title": "Nothing has been open for more than ninety days",
+  "check.semgrep.findings.no_ancient.pass": "No open finding is older than ninety days, whatever its severity.",
+  "check.semgrep.findings.no_ancient.fail": "At least one finding has been open for more than ninety days. A medium is never urgent enough to reach the top of the list, and that is exactly how it stays open for two years.",
+  "check.semgrep.findings.no_ancient.fix": "Triage the backlog. Anything genuinely not worth fixing should be marked as such in the tool, which is a decision; leaving it open is not.",
+  "check.aikido.issues.no_critical.title": "Nothing critical is open",
+  "check.aikido.issues.no_critical.pass": "No critical issue is open.",
+  "check.aikido.issues.no_critical.fail": "At least one critical issue is open. This is the shortest sentence an assessor wants to hear the other answer to, and it is the one your own tool is already telling you.",
+  "check.aikido.issues.no_critical.fix": "Fix it, or record it as an accepted risk so the file says somebody decided rather than nobody looked. An accepted risk with a name and a date reads far better than an open critical with neither.",
+  "check.aikido.issues.within_window.title": "Serious findings are closed within thirty days",
+  "check.aikido.issues.within_window.pass": "Every open critical and high issue was raised within the last thirty days.",
+  "check.aikido.issues.within_window.fail": "At least one critical or high issue has been open for more than thirty days. The gap between your tool finding something and somebody fixing it is the number an assessor writes down.",
+  "check.aikido.issues.within_window.fix": "Work through the list, or accept the risks formally. The window runs from when the finding was first seen, so rescanning does not reset it.",
+  "check.aikido.issues.no_ancient.title": "Nothing has been open for more than ninety days",
+  "check.aikido.issues.no_ancient.pass": "No open issue is older than ninety days, whatever its severity.",
+  "check.aikido.issues.no_ancient.fail": "At least one issue has been open for more than ninety days. A medium is never urgent enough to reach the top of the list, and that is exactly how it stays open for two years.",
+  "check.aikido.issues.no_ancient.fix": "Triage the backlog. Anything genuinely not worth fixing should be marked as such in the tool, which is a decision; leaving it open is not.",
+  "check.snyk.projects.scanned_recently.title": "Every project has been scanned in the last fortnight",
+  "check.snyk.projects.scanned_recently.pass": "Every active Snyk project has been scanned within the last fourteen days.",
+  "check.snyk.projects.scanned_recently.fail": "At least one project has not been scanned for over a fortnight. Until it is, the other Snyk checks are describing the code as it was, and a project nobody scans reports no issues at all.",
+  "check.snyk.projects.scanned_recently.fix": "Reconnect the project or run a scan. This check exists to stop the others quietly reporting a clean bill of health for a scanner that was switched off.",
+  "check.semgrep.projects.scanned_recently.title": "Every project has been scanned in the last fortnight",
+  "check.semgrep.projects.scanned_recently.pass": "Every Semgrep project has been scanned within the last fourteen days.",
+  "check.semgrep.projects.scanned_recently.fail": "At least one project has not been scanned for over a fortnight. Until it is, the other Semgrep checks are describing the code as it was, and a project nobody scans reports no findings at all.",
+  "check.semgrep.projects.scanned_recently.fix": "Run the scan in your pipeline rather than by hand. This check exists to stop the others quietly reporting a clean bill of health for a scanner that was switched off.",
+  "check.gitguardian.secrets.none_live.title": "No committed credential still works",
+  "check.gitguardian.secrets.none_live.pass": "No open secret incident involves a credential GitGuardian can confirm is still valid.",
+  "check.gitguardian.secrets.none_live.fail": "At least one credential found in your code still works. Whoever has a copy of that repository can use it right now, and rotating it is more urgent than anything else on this page.",
+  "check.gitguardian.secrets.none_live.fix": "Rotate the credential first and remove it from the code second. Deleting the commit does not help: it is in every clone and every fork already, which is why rotation is the fix and tidying up is the follow up.",
+  "check.gitguardian.secrets.no_critical.title": "No critical secret incident is open",
+  "check.gitguardian.secrets.no_critical.pass": "No critical secret incident is open.",
+  "check.gitguardian.secrets.no_critical.fail": "At least one critical secret incident is open. A credential in source control is a credential shared with everyone who has ever cloned the repository.",
+  "check.gitguardian.secrets.no_critical.fix": "Rotate the secret, then resolve the incident in GitGuardian so the record shows when it was handled.",
+  "check.gitguardian.secrets.within_window.title": "Secret incidents are closed within thirty days",
+  "check.gitguardian.secrets.within_window.pass": "Every open critical and high secret incident was raised within the last thirty days.",
+  "check.gitguardian.secrets.within_window.fail": "At least one serious secret incident has been open for more than thirty days. Secrets do not get safer with age: the window since it was committed is the window somebody had to find it.",
+  "check.gitguardian.secrets.within_window.fix": "Rotate and resolve. If an incident is a false positive, mark it as one in GitGuardian, which is a decision the record can show.",
+  "check.gitguardian.secrets.no_ancient.title": "No secret incident has been open for more than ninety days",
+  "check.gitguardian.secrets.no_ancient.pass": "No open secret incident is older than ninety days, whatever its severity.",
+  "check.gitguardian.secrets.no_ancient.fail": "At least one secret incident has been open for more than ninety days. An unresolved incident is one nobody has decided about, which is different from one somebody decided was harmless.",
+  "check.gitguardian.secrets.no_ancient.fix": "Work through the backlog and resolve or ignore each one in GitGuardian. Either is a decision; leaving them open is not.",
+  "check.bitwarden.members.two_factor.title": "Everyone with vault access has a second factor",
+  "check.bitwarden.members.two_factor.pass": "Every confirmed member of the organisation has two step login enabled.",
+  "check.bitwarden.members.two_factor.fail": "At least one person with access to the company's passwords signs in with a password alone. That account is the shortest path to every credential you hold.",
+  "check.bitwarden.members.two_factor.fix": "Ask them to set up two step login in their account settings, then turn on the two step login policy so it cannot happen again.",
+  "check.bitwarden.policy.two_factor.title": "A second factor is required, not just used",
+  "check.bitwarden.policy.two_factor.pass": "The two step login policy is enabled for the organisation.",
+  "check.bitwarden.policy.two_factor.fail": "Two step login is not required. Everyone having it today is true of every company right up to the day somebody joins, and this is the setting that keeps it true.",
+  "check.bitwarden.policy.two_factor.fix": "Turn on the Require two step login policy in your organisation settings. Members without it are removed from the organisation until they set it up, so tell people first. Policies need the Enterprise plan: a Teams organisation has no Policies page, so there the choice is to upgrade or to record this as an accepted risk.",
+  "check.bitwarden.policy.organisation_ownership.title": "Company credentials belong to the company",
+  "check.bitwarden.policy.organisation_ownership.pass": "The organisation ownership policy is enabled, so items are saved to the organisation rather than to personal vaults.",
+  "check.bitwarden.policy.organisation_ownership.fail": "Members can save company credentials to their own personal vault. Anything saved there walks out of the door when they leave, and no offboarding step you write can reach it.",
+  "check.bitwarden.policy.organisation_ownership.fix": "Turn on the Organisation ownership policy. Ask people to move anything already in a personal vault into a collection first, because the policy applies to new items. Policies need the Enterprise plan: a Teams organisation has no Policies page, so there the choice is to upgrade or to record this as an accepted risk.",
+  "check.bitwarden.members.least_privilege.title": "Nobody sees every collection by accident",
+  "check.bitwarden.members.least_privilege.pass": "No member below administrator has access to every collection.",
+  "check.bitwarden.members.least_privilege.fail": "At least one ordinary member can see every collection in the organisation, which makes the collection structure something that exists on paper only.",
+  "check.bitwarden.members.least_privilege.fix": "Edit the member and give them the collections they need rather than all of them. Owners and administrators are expected to see everything and are not counted here.",
+  "check.bitwarden.policy.master_password.title": "Master passwords have to meet a standard",
+  "check.bitwarden.policy.master_password.pass": "A master password policy is enabled for the organisation.",
+  "check.bitwarden.policy.master_password.fail": "No master password policy is set, so the strength of the password protecting your entire vault is whatever each person felt like typing.",
+  "check.bitwarden.policy.master_password.fix": "Turn on the Master password requirements policy and set a minimum length and complexity. A long passphrase beats a short complicated one. Policies need the Enterprise plan: a Teams organisation has no Policies page, so there the choice is to upgrade or to record this as an accepted risk.",
+  "check.bitwarden.policy.vault_timeout.title": "Vaults lock themselves",
+  "check.bitwarden.policy.vault_timeout.pass": "A maximum vault timeout policy is enabled for the organisation.",
+  "check.bitwarden.policy.vault_timeout.fail": "No vault timeout is enforced, so a vault unlocked on a laptop in a cafe stays unlocked until somebody closes it.",
+  "check.bitwarden.policy.vault_timeout.fix": "Turn on the Vault timeout policy and choose a timeout and an action. Lock is usually right; log out is stricter and more annoying. Policies need the Enterprise plan: a Teams organisation has no Policies page, so there the choice is to upgrade or to record this as an accepted risk.",
+  "check.bitwarden.members.no_stale_invites.title": "Nobody is stuck halfway through joining",
+  "check.bitwarden.members.no_stale_invites.pass": "Every member has finished joining the organisation.",
+  "check.bitwarden.members.no_stale_invites.fail": "At least one person is invited or accepted but not confirmed. An invitation nobody completed is a live route into the organisation's passwords that belongs to no one.",
+  "check.bitwarden.members.no_stale_invites.fix": "Confirm the people who should be there and remove the invitations that were a mistake or are no longer needed.",
+  "check.onepassword.signins.second_factor.title": "Every sign in used a second factor",
+  "check.onepassword.signins.second_factor.pass": "Every successful sign in over the last thirty days completed a second factor or single sign on.",
+  "check.onepassword.signins.second_factor.fail": "At least one account signed in successfully with no second factor. A settings page can say a second factor is required; this is the log saying whether one was actually used.",
+  "check.onepassword.signins.second_factor.fix": "Turn on the two factor requirement for the account, then check the people named have enrolled. This reads the sign in log rather than the setting, so it will keep failing until real sign ins change.",
+  "check.onepassword.signins.no_repeated_failures.title": "No account is being guessed at",
+  "check.onepassword.signins.no_repeated_failures.pass": "No account had more than ten failed sign in attempts in the last thirty days.",
+  "check.onepassword.signins.no_repeated_failures.fail": "At least one account failed to sign in an unusual number of times. Mistyping a password a few times is a Monday; ten failures against one account in a month is somebody trying.",
+  "check.onepassword.signins.no_repeated_failures.fix": "Check with the person named. If it was not them, rotate their credentials and review the sign in locations in 1Password, which records the country and client for every attempt.",
+  "check.onepassword.audit.log_available.title": "The audit log can be produced on request",
+  "check.onepassword.audit.log_available.pass": "The audit log returned events for the last thirty days, each with a timestamp.",
+  "check.onepassword.audit.log_available.fail": "No audit events could be read for the last thirty days. A log nobody can produce on request is not a log, and it is the first thing an assessor asks to see.",
+  "check.onepassword.audit.log_available.fix": "Check the Events API token still has the audit events feature enabled. If the account genuinely had no activity, that is worth knowing too.",
+  "check.doppler.tokens.read_only.title": "No service token can write secrets",
+  "check.doppler.tokens.read_only.pass": "Every service token has read access only.",
+  "check.doppler.tokens.read_only.fail": "At least one service token can write as well as read. A service token exists so a running application can read its configuration; one that can also write is a deployment that can rewrite its own secrets, and it is almost always a misclick.",
+  "check.doppler.tokens.read_only.fix": "Delete the token and create a new one with read access, then update wherever it is used. Access cannot be changed on an existing token.",
+  "check.doppler.tokens.not_root_config.title": "No service token points at a root config",
+  "check.doppler.tokens.not_root_config.pass": "No service token is scoped to a root config.",
+  "check.doppler.tokens.not_root_config.fail": "At least one token reads a root config. Every branch config inherits from it, so that token reads production, staging and everything anybody adds later, which is the opposite of what scoping a token is for.",
+  "check.doppler.tokens.not_root_config.fix": "Create a token against the specific config the application uses, such as prd or stg, and retire the one on the root.",
+  "check.doppler.tokens.rotated.title": "No service token is more than a year old",
+  "check.doppler.tokens.rotated.pass": "Every service token was created within the last year.",
+  "check.doppler.tokens.rotated.fail": "At least one service token is over a year old. A credential that has never been rotated has been copied into more places than anybody now remembers.",
+  "check.doppler.tokens.rotated.fix": "Create a replacement, update the places that use it, then delete the old one. Doing it in that order avoids an outage.",
+  "check.sonarqube.gate.passing.title": "The quality gate is passing",
+  "check.sonarqube.gate.passing.pass": "The project's quality gate is passing.",
+  "check.sonarqube.gate.passing.fail": "The quality gate is failing, or no gate is attached to the project. A gate is change management written as code, and it is the evidence an assessor wants instead of a document describing your process.",
+  "check.sonarqube.gate.passing.fix": "Fix the failing conditions, or attach a gate if the project has none. The finding names which conditions failed and what the limits were.",
+  "check.sonarqube.gate.has_conditions.title": "The quality gate actually tests something",
+  "check.sonarqube.gate.has_conditions.pass": "The project's quality gate has at least one condition.",
+  "check.sonarqube.gate.has_conditions.fail": "The quality gate has no conditions, so it passes every build and proves nothing. This is the compliance equivalent of a policy document nobody reads, and it is easy to end up with by accident.",
+  "check.sonarqube.gate.has_conditions.fix": "Edit the gate and add conditions. The Sonar way default is a sensible starting point and takes a minute to apply.",
+  "check.sonarqube.project.analysed_recently.title": "The project has been analysed in the last fortnight",
+  "check.sonarqube.project.analysed_recently.pass": "The project was last analysed within the last fourteen days.",
+  "check.sonarqube.project.analysed_recently.fail": "The project has not been analysed for over a fortnight. Without this, a gate that passed in March keeps passing for ever, and a green tick on a project nobody analyses is worse than no tick at all.",
+  "check.sonarqube.project.analysed_recently.fix": "Run the analysis in your pipeline rather than by hand, so it happens on every change instead of when somebody remembers.",
+  "check.sonarqube.project.security_rating.title": "The security rating is an A",
+  "check.sonarqube.project.security_rating.pass": "The project's security rating is A, meaning Sonar found no vulnerabilities it is confident about.",
+  "check.sonarqube.project.security_rating.fail": "The security rating is below A, which means Sonar found at least one issue it classes as a vulnerability rather than a smell.",
+  "check.sonarqube.project.security_rating.fix": "Open the Security Hotspots and Vulnerabilities views in Sonar and work through them. The rating is set by the worst single finding, so one fix can move it.",
+  "home.role.tracker": "Issue tracking",
+  "home.role.documents": "Documents",
+  "provider.linear": "Linear",
+  "stack.blurb.linear": "Read-only checks on issue metadata: whether security work is tracked, owned and closed inside your remediation window.",
+  "conn.linear.title": "Linear",
+  "conn.linear.body": "Snoopios reads issue metadata only: identifiers, states, labels and dates. Never a description, never a comment. What it answers is whether security work has an owner and gets closed, which is the question every framework asks about corrective action.",
+  "conn.linear.token.label": "Linear API key",
+  "conn.linear.token.hint": "Create one in Linear under Settings, Security and access, and give it the Read permission only. Snoopios never sends a mutation: its GraphQL requests are parsed and refused before they leave the machine if they are anything but a query.",
+  "conn.linear.cta": "Connect read-only",
+  "conn.linear.error.token": "That does not look like a Linear API key. Copy the whole value from Settings, Security and access.",
+  "conn.linear.error.auth": "Linear would not accept that key. Check it has not been revoked and that it was created in the workspace you want to check.",
+  "provider.jira": "Jira",
+  "stack.blurb.jira": "Read-only checks on issue metadata: whether security work is tracked, owned and closed inside your remediation window.",
+  "conn.jira.title": "Jira",
+  "conn.jira.body": "Snoopios reads issue metadata only: keys, statuses, labels and dates. Never a description, never a comment, because that is where a ticket ends up holding somebody's personal data. Jira and Linear are judged by the same code, so the two give the same verdict about the same practice.",
+  "conn.jira.cloud.label": "Cloud ID",
+  "conn.jira.cloud.placeholder": "11112222-3333-4444-5555-666677778888",
+  "conn.jira.cloud.hint": "Not your site name. Sign in and open https://yoursite.atlassian.net/_edge/tenant_info, which prints it.",
+  "conn.jira.token.label": "Scoped API token",
+  "conn.jira.token.hint": "Create it at id.atlassian.com under Security, API tokens, choosing Create API token with scopes, and grant read:jira-work only. A classic token carries every permission you have, which is a write credential, and Snoopios will not hold one.",
+  "conn.jira.cta": "Connect read-only",
+  "conn.jira.error.cloud": "That does not look like a Cloud ID. It is a GUID, thirty six characters with hyphens, not your site name.",
+  "conn.jira.error.token": "That does not look like an API token. Copy the whole value from id.atlassian.com.",
+  "conn.jira.error.auth": "Atlassian would not accept that token for that Cloud ID. Check both, and that the token was created with scopes rather than as a classic one.",
+  "conn.jira.error.scope": "That token cannot read issues. It needs the read:jira-work scope, and scopes cannot be changed after a token is made, so create a new one.",
+  "provider.notion": "Notion",
+  "stack.blurb.notion": "Read-only checks on page metadata: whether anything is published to the web, and whether your policies have an owner and a review date.",
+  "conn.notion.title": "Notion",
+  "conn.notion.body": "Snoopios reads page metadata only: titles, properties, dates, and whether a page is published to the web. It never reads what a page says, because there is no code here that can: the blocks endpoint is not called from anywhere in this connector. The integration also only ever sees pages you explicitly share with it.",
+  "conn.notion.token.label": "Internal integration secret",
+  "conn.notion.token.hint": "Create a connection at notion.so/my-integrations with the Access token method. Set its capabilities to Read content only, untick Update content and Insert content, and set user information to without email addresses: Snoopios reads a name to say who owns a page and never needs an address. Then open each page you want checked, use its Connections menu, and add the connection, or it sees an empty workspace.",
+  "conn.notion.cta": "Connect read-only",
+  "conn.notion.error.token": "That does not look like a Notion integration secret. Copy the whole value from your integration's Configuration tab.",
+  "conn.notion.error.auth": "Notion would not accept that secret. Check it has not been rotated, and that the integration still exists.",
+  "conn.notion.error.shared": "The secret works but the integration cannot see anything. Open a page you want checked, use Connections, and add the integration. Notion shows an integration nothing until you do.",
+  "provider.jamf": "Jamf Pro",
+  "stack.blurb.jamf": "Read-only checks on your Mac fleet: FileVault and its recovery key, System Integrity Protection, Gatekeeper, the firewall and how far behind any machine has fallen.",
+  "conn.jamf.title": "Jamf Pro",
+  "conn.jamf.body": "Snoopios reads your computer inventory and nothing else. The check worth connecting for is the recovery key: every device manager reports whether a disk is encrypted, and almost nobody looks at whether the key came back, which is the difference between a lost laptop and lost data.",
+  "conn.jamf.host.label": "Jamf Pro address",
+  "conn.jamf.host.placeholder": "yourcompany.jamfcloud.com",
+  "conn.jamf.host.hint": "Just the hostname, with no https and no trailing slash.",
+  "conn.jamf.client.label": "API client ID",
+  "conn.jamf.secret.label": "API client secret",
+  "conn.jamf.secret.hint": "In Jamf Pro, open Settings, API roles and clients. Create a role holding only Read privileges for computers, then a client that uses it. The secret is shown once.",
+  "conn.jamf.cta": "Connect read-only",
+  "conn.jamf.error.host": "That does not look like a Jamf Cloud address. It ends in jamfcloud.com, with no https and no path.",
+  "conn.jamf.error.auth": "Jamf would not issue a token for those credentials. Check the client ID and secret, and that the client is still enabled.",
+  "conn.jamf.error.scope": "The client works but cannot read the computer inventory. Give its API role the Read Computers and Read Computer Inventory Collection privileges, then connect again.",
+  "provider.kandji": "Kandji",
+  "stack.blurb.kandji": "Read-only checks on your Apple fleet: whether every device is still managed, in a blueprint, running the agent and reasonably up to date.",
+  "conn.kandji.title": "Kandji",
+  "conn.kandji.body": "Snoopios reads your device list and nothing else. It never calls the endpoint that hands over a FileVault recovery key: a compliance tool has no business holding one. Disk encryption is not yet checked here, because Kandji reports it on a per device endpoint whose shape we will not guess at.",
+  "conn.kandji.host.label": "Kandji API address",
+  "conn.kandji.host.placeholder": "yourcompany.api.kandji.io",
+  "conn.kandji.host.hint": "Shown in Kandji under Settings, Access, API token. European tenants have a region in the middle, such as yourcompany.api.eu.kandji.io.",
+  "conn.kandji.token.label": "API token",
+  "conn.kandji.token.hint": "Create it in Kandji under Settings, Access, and tick the Device list permission only. Nothing else is needed and nothing else is used.",
+  "conn.kandji.cta": "Connect read-only",
+  "conn.kandji.error.host": "That does not look like a Kandji API address. It ends in kandji.io, with no https and no path.",
+  "conn.kandji.error.auth": "Kandji would not accept that token for that address. Check both, and that the token has not been revoked.",
+  "conn.kandji.error.scope": "The token works but cannot list devices. Give it the Device list permission in Kandji, then connect again.",
+  "provider.rippling": "Rippling",
+  "stack.blurb.rippling": "Read-only checks on your people records: who joined, who left, and whether anyone closed their access afterwards.",
+  "conn.rippling.title": "Rippling",
+  "conn.rippling.body": "Rippling is one of two connections that compare payroll against your roster, and it is judged by the same code as Deel so the two give the same verdict about the same practice. Snoopios reads who works here and who has left. Never pay, never benefits, never bank details.",
+  "conn.rippling.token.label": "Rippling API key",
+  "conn.rippling.token.hint": "Create one in Rippling under Company settings, API access, and grant the workers read scope only. Scopes cannot be changed afterwards, so a token with more than that needs replacing rather than editing.",
+  "conn.rippling.cta": "Connect read-only",
+  "conn.rippling.error.token": "That does not look like a Rippling API key. Copy the whole value from Company settings, API access.",
+  "conn.rippling.error.auth": "Rippling would not accept that key. Check it has not been revoked and that it belongs to the company you want to check.",
+  "conn.rippling.error.scope": "That key cannot read your worker list. It needs the workers read scope, then connect again.",
+  "check.linear.security.within_window.title": "Security issues are closed within thirty days",
+  "check.linear.security.within_window.pass": "Every open issue labelled as security work was raised within the last thirty days.",
+  "check.linear.security.within_window.fail": "At least one security issue has been open for more than thirty days. The gap between raising a security problem and fixing it is the number an assessor writes down, and most companies have never measured it.",
+  "check.linear.security.within_window.fix": "Work through the overdue issues, or accept the risk formally so the record says somebody decided rather than forgot. The window runs from the day the issue was opened, so commenting on it does not reset the clock.",
+  "check.linear.security.labelled.title": "Security work has somewhere to go",
+  "check.linear.security.labelled.pass": "At least one label marks work as security related.",
+  "check.linear.security.labelled.fail": "No label marks security work, so there is no way to answer the first question an assessor asks a tracker: show me everything security related.",
+  "check.linear.security.labelled.fix": "Add a label called Security and apply it to the issues that deserve it. This is about being able to find the work later, not about house style.",
+  "check.linear.issues.assigned.title": "Work in progress has an owner",
+  "check.linear.issues.assigned.pass": "Every issue the team has started has somebody assigned to it.",
+  "check.linear.issues.assigned.fail": "At least one started issue has nobody assigned. Work in progress that belongs to no one is how a corrective action becomes a list somebody writes up afterwards.",
+  "check.linear.issues.assigned.fix": "Assign the issues, or move them back to the backlog if nobody is actually working on them. The backlog is not held to this.",
+  "check.linear.issues.not_stale.title": "Started work is actually moving",
+  "check.linear.issues.not_stale.pass": "Every issue the team has started has been touched within the last forty five days.",
+  "check.linear.issues.not_stale.fail": "At least one started issue has not been touched for over forty five days. It is neither done nor abandoned, which makes the board a poor description of what is happening.",
+  "check.linear.issues.not_stale.fix": "Close it, park it back in the backlog, or pick it up again. An in progress column that has not moved in two months tells a reader nothing.",
+  "check.jira.security.within_window.title": "Security issues are closed within thirty days",
+  "check.jira.security.within_window.pass": "Every open issue labelled as security work was raised within the last thirty days.",
+  "check.jira.security.within_window.fail": "At least one security issue has been open for more than thirty days. The gap between raising a security problem and fixing it is the number an assessor writes down, and most companies have never measured it.",
+  "check.jira.security.within_window.fix": "Work through the overdue issues, or accept the risk formally so the record says somebody decided rather than forgot. The window runs from the day the issue was created, so commenting on it does not reset the clock.",
+  "check.jira.security.labelled.title": "Security work has somewhere to go",
+  "check.jira.security.labelled.pass": "At least one label marks work as security related.",
+  "check.jira.security.labelled.fail": "No label marks security work, so there is no way to answer the first question an assessor asks a tracker: show me everything security related.",
+  "check.jira.security.labelled.fix": "Add a label called security and apply it to the issues that deserve it. This is about being able to find the work later, not about house style.",
+  "check.jira.issues.assigned.title": "Work in progress has an owner",
+  "check.jira.issues.assigned.pass": "Every issue in an In Progress status has somebody assigned to it.",
+  "check.jira.issues.assigned.fail": "At least one issue the team has started has nobody assigned. Work in progress that belongs to no one is how a corrective action becomes a list somebody writes up afterwards.",
+  "check.jira.issues.assigned.fix": "Assign the issues, or move them back to To Do if nobody is actually working on them. Only statuses in the In Progress category are judged here.",
+  "check.jira.issues.not_stale.title": "Started work is actually moving",
+  "check.jira.issues.not_stale.pass": "Every issue in an In Progress status has been updated within the last forty five days.",
+  "check.jira.issues.not_stale.fail": "At least one started issue has not been updated for over forty five days. It is neither done nor abandoned, which makes the board a poor description of what is happening.",
+  "check.jira.issues.not_stale.fix": "Close it, move it back to To Do, or pick it up again. An In Progress column that has not moved in two months tells a reader nothing.",
+  "check.notion.pages.not_public.title": "No page is published to the web",
+  "check.notion.pages.not_public.pass": "No page in the workspace is shared publicly on the internet.",
+  "check.notion.pages.not_public.fail": "At least one page is published to the web, so anybody with the link can read it without signing in. This is invisible from inside Notion: the page looks the same to the person who published it.",
+  "check.notion.pages.not_public.fix": "Open each page listed, go to Share, and turn off Share to web. If a page is meant to be public, move it to a workspace that holds nothing else, because the risk is what sits beside it tomorrow.",
+  "check.notion.documents.reviewed.title": "Policies in Notion have been reviewed this year",
+  "check.notion.documents.reviewed.pass": "Every page whose title marks it as a policy or procedure has been edited within the last twelve months.",
+  "check.notion.documents.reviewed.fail": "At least one policy or procedure has not been touched for over a year. A policy nobody has read in that time is a document an assessor will ask pointed questions about.",
+  "check.notion.documents.reviewed.fix": "Review each one and edit it, even if only to confirm it is still right. A dated review note in the page is what turns an old document into a current one.",
+  "check.notion.documents.owned.title": "Policies in Notion name an owner",
+  "check.notion.documents.owned.pass": "Every page whose title marks it as a policy or procedure names a person in one of its properties.",
+  "check.notion.documents.owned.fail": "At least one policy or procedure names nobody. A document with no owner is one nobody is accountable for reviewing, and that is what the review period depends on.",
+  "check.notion.documents.owned.fix": "Add a person property to the page or the database it sits in, and put a name in it. Snoopios reads any property of type Person, so it does not matter what you call it.",
+  "check.jamf.devices.encrypted.title": "Every Mac encrypts its disk",
+  "check.jamf.devices.encrypted.pass": "Every Mac in Jamf reports its boot disk as encrypted with FileVault.",
+  "check.jamf.devices.encrypted.fail": "At least one Mac reports an unencrypted boot disk, so a laptop left in a taxi is a data breach rather than a lost asset. A disk part way through encrypting is not yet encrypted and is counted here.",
+  "check.jamf.devices.encrypted.fix": "Assign a FileVault configuration profile to the Macs listed and check they complete. Encryption starts at the next login, so a machine can sit in the encrypting state for a while before it finishes.",
+  "check.jamf.devices.key_escrowed.title": "Every encrypted Mac has its recovery key escrowed",
+  "check.jamf.devices.key_escrowed.pass": "Every encrypted Mac has a valid recovery key held in Jamf, either its own or an institutional one.",
+  "check.jamf.devices.key_escrowed.fail": "At least one encrypted Mac has no valid recovery key in Jamf. FileVault with no way back to the key is not security, it is a way to lose the contents of a laptop the first time somebody forgets a password or leaves without warning.",
+  "check.jamf.devices.key_escrowed.fix": "Reissue the recovery key from the FileVault profile. Every device manager reports encryption and almost nobody looks at the escrow, which is why this is worth fixing before anything else on this page.",
+  "check.jamf.devices.sip.title": "System Integrity Protection is on",
+  "check.jamf.devices.sip.pass": "Every Mac reports System Integrity Protection as enabled.",
+  "check.jamf.devices.sip.fail": "At least one Mac has System Integrity Protection turned off. That is the Mac equivalent of a rooted phone: the machine can no longer be trusted to report its own state honestly, so no other check on it means anything.",
+  "check.jamf.devices.sip.fix": "Boot the Mac into recovery and run csrutil enable, then restart. If it was turned off for a piece of software, that software needs replacing rather than the protection staying off.",
+  "check.jamf.devices.gatekeeper.title": "Gatekeeper checks what is being opened",
+  "check.jamf.devices.gatekeeper.pass": "Every Mac has Gatekeeper checking signatures before an application runs.",
+  "check.jamf.devices.gatekeeper.fail": "At least one Mac has Gatekeeper off or has never reported its state, so an application from anywhere can run without its signature being checked.",
+  "check.jamf.devices.gatekeeper.fix": "Turn Gatekeeper back on with a configuration profile rather than by hand, so it stays on. A Mac reporting nothing has usually not run an inventory recently.",
+  "check.jamf.devices.firewall.title": "The firewall is on",
+  "check.jamf.devices.firewall.pass": "Every Mac reports its firewall as enabled.",
+  "check.jamf.devices.firewall.fail": "At least one Mac has its firewall off, so anything listening on that machine is reachable from whatever network it joins next.",
+  "check.jamf.devices.firewall.fix": "Enable the firewall through a configuration profile so it applies to every Mac rather than the ones somebody remembered.",
+  "check.jamf.devices.secure_boot.title": "Secure boot is at full security",
+  "check.jamf.devices.secure_boot.pass": "Every Mac that supports secure boot has it set to full security.",
+  "check.jamf.devices.secure_boot.fail": "At least one Mac that supports secure boot has it turned down, which allows an operating system Apple has not signed to start on it.",
+  "check.jamf.devices.secure_boot.fix": "Set the security policy back to Full Security in recovery. Macs with no secure boot hardware are not counted here, because they cannot have it.",
+  "check.jamf.devices.os_consistent.title": "No Mac is far behind the rest of the fleet",
+  "check.jamf.devices.os_consistent.pass": "No Mac is more than two major macOS versions behind the newest one you run.",
+  "check.jamf.devices.os_consistent.fail": "At least one Mac is more than two major versions behind the newest Mac in your fleet, so it is almost certainly missing security updates the others have.",
+  "check.jamf.devices.os_consistent.fix": "Upgrade the machines listed, or retire them. This is measured against your own newest Mac rather than against a version number written into Snoopios, which would be out of date within a year.",
+  "check.jamf.devices.recent_contact.title": "Every Mac has reported recently",
+  "check.jamf.devices.recent_contact.pass": "Every Mac has contacted Jamf within the last thirty days.",
+  "check.jamf.devices.recent_contact.fail": "At least one Mac has not contacted Jamf for over thirty days, so its last known state is frozen and may be wrong.",
+  "check.jamf.devices.recent_contact.fix": "Find the machine and get it back online, or remove it from Jamf. A Mac that stopped reporting is the one an attacker would most like you to keep counting as healthy.",
+  "check.kandji.devices.mdm_enabled.title": "Every device is still under management",
+  "check.kandji.devices.mdm_enabled.pass": "Every device in Kandji still has its management profile installed.",
+  "check.kandji.devices.mdm_enabled.fail": "At least one device has lost its management profile. It still appears in the list and enforces nothing, which is the worst of both: a row in your inventory that answers for a machine nobody controls.",
+  "check.kandji.devices.mdm_enabled.fix": "Re enrol the device. A management profile does not usually disappear by accident, so it is worth asking how it went.",
+  "check.kandji.devices.blueprint.title": "Every device is in a blueprint",
+  "check.kandji.devices.blueprint.pass": "Every device is assigned to a blueprint.",
+  "check.kandji.devices.blueprint.fail": "At least one device is in no blueprint. A blueprint is where every setting Kandji enforces actually lives, so a device outside one is configured by nobody and will look healthy because there is nothing for it to fail.",
+  "check.kandji.devices.blueprint.fix": "Assign the device to a blueprint. This is the most common Kandji gap, because the device looks perfectly normal in the list.",
+  "check.kandji.devices.not_missing.title": "No device is marked as missing",
+  "check.kandji.devices.not_missing.pass": "No device in the fleet is flagged as missing.",
+  "check.kandji.devices.not_missing.fail": "At least one device is flagged as missing and is still in the fleet. That is either a lost machine nobody has wiped or a flag nobody has cleared, and both need a decision.",
+  "check.kandji.devices.not_missing.fix": "Wipe the device remotely if it is genuinely gone, or clear the flag if it came back. Leaving it flagged means the next reader cannot tell which.",
+  "check.kandji.devices.agent_installed.title": "Every Mac runs the Kandji agent",
+  "check.kandji.devices.agent_installed.pass": "Every Mac in the fleet has the Kandji agent installed.",
+  "check.kandji.devices.agent_installed.fail": "At least one Mac has no agent, so Kandji can enrol it but cannot enforce or report most of what it should.",
+  "check.kandji.devices.agent_installed.fix": "Reinstall the agent on the Macs listed. Only Macs are counted here: iPhones and iPads do not run one.",
+  "check.kandji.devices.os_consistent.title": "No device is far behind the rest of its kind",
+  "check.kandji.devices.os_consistent.pass": "No device is more than two major versions behind the newest one you run on the same platform.",
+  "check.kandji.devices.os_consistent.fail": "At least one device is more than two major versions behind the newest device of its kind, so it is almost certainly missing security updates the others have.",
+  "check.kandji.devices.os_consistent.fix": "Update the devices listed, or retire them. Macs are compared with Macs and iPhones with iPhones, because the two are not on the same version line.",
+  "check.kandji.devices.recent_contact.title": "Every device has checked in recently",
+  "check.kandji.devices.recent_contact.pass": "Every device has checked in with Kandji within the last thirty days.",
+  "check.kandji.devices.recent_contact.fail": "At least one device has not checked in for over thirty days, so its last known state is frozen and may be wrong.",
+  "check.kandji.devices.recent_contact.fix": "Find the device and get it back online, or remove it from Kandji. A device that stopped reporting is the one an attacker would most like you to keep counting as healthy.",
+  "check.rippling.leavers.access_removed.title": "Everyone payroll says has left has had their access confirmed closed",
+  "check.rippling.leavers.access_removed.pass": "Every person Rippling records as having left is on the roster as a leaver, with every system recorded and confirmed.",
+  "check.rippling.leavers.access_removed.fail": "At least one person Rippling says has left still has no confirmation that their access was closed. This is the finding assessors look for first, because a former colleague with a working login is the most common way a small company loses control of its data.",
+  "check.rippling.leavers.access_removed.fix": "Open the roster, mark the person as a leaver if they are not already, list the systems they had access to, and confirm each one as you remove it. Rippling knows the date they left; the roster is what shows somebody acted on it.",
+  "check.rippling.leavers.closed_promptly.title": "Access is closed within a week of somebody leaving",
+  "check.rippling.leavers.closed_promptly.pass": "Every departure recorded in Rippling more than a week ago has its access removal confirmed.",
+  "check.rippling.leavers.closed_promptly.fail": "At least one person left over a week ago and their access removal is still unfinished. The gap between the leaving date and the day access was closed is the number an assessor writes down.",
+  "check.rippling.leavers.closed_promptly.fix": "Finish the outstanding offboarding rows. If a system genuinely takes longer to close, record the date it was actually done rather than leaving the row open, because an honest late date reads far better than a blank one.",
+  "check.rippling.leavers.recorded.title": "Payroll and the roster agree on who has left",
+  "check.rippling.leavers.recorded.pass": "Everyone Rippling records as having left is marked as a leaver on the roster.",
+  "check.rippling.leavers.recorded.fail": "At least one person has left according to Rippling but is still shown as working here on the roster. Every control that counts your people is now counting somebody who is gone.",
+  "check.rippling.leavers.recorded.fix": "Mark them as a leaver on the roster with the date Rippling holds. This is the point of connecting payroll: the roster stops being a list somebody remembers to update.",
+  "check.rippling.people.on_roster.title": "Everyone on payroll is on the roster",
+  "check.rippling.people.on_roster.pass": "Everyone Rippling records as currently working here appears on the roster.",
+  "check.rippling.people.on_roster.fail": "At least one person is on payroll but not on the roster, so they are missing from your training rounds, your policy acceptances and your access reviews.",
+  "check.rippling.people.on_roster.fix": "Add them to the roster. Snoopios matches on name and tries the preferred name as well as the legal one, so Samuel will find a roster entry that says Sam.",
+  "check.rippling.people.start_dates.title": "Every current person has a joining date",
+  "check.rippling.people.start_dates.pass": "Everyone currently working here has a start date recorded in Rippling.",
+  "check.rippling.people.start_dates.fail": "At least one current person has no start date recorded, so there is no way to show that their checks and their induction happened when they joined.",
+  "check.rippling.people.start_dates.fix": "Add the start date in Rippling. It is the date every onboarding control is measured from, and a blank one turns a simple question into an argument.",
+  "provider.deel": "Deel",
+  "stack.blurb.deel": "Read-only checks on your people records: who joined, who left, and whether anyone closed their access afterwards.",
+  "home.role.people": "People",
+  "conn.deel.title": "Deel",
+  "conn.deel.body": "Deel is the only connection that compares two things: your payroll and your roster. It reads who works here and who has left, then checks that somebody actually closed the access of everyone who has gone. Snoopios never sees pay, contracts or bank details.",
+  "conn.deel.token.label": "Deel API token",
+  "conn.deel.token.hint": "Create one in Deel under Settings \u2192 Developer \u2192 Tokens. Grant one scope, people:read, and nothing else. Choose Organization-level access, not the Group-level the form offers first, because a group token returns only part of your roster and the checks would then report on an incomplete list. On the Sensitive data step turn ON \u201CHide Sensitive Employment Information\u201D, which is off by default: that is what keeps salary out of reach, and without it the token can read compensation. Deel does not tell us which scopes a token carries, so this connection is shown as read-only requested rather than proved; every request Snoopios makes is a read, refused before it leaves the machine if it is not.",
+  "conn.deel.cta": "Connect read-only",
+  "conn.deel.error.token": "That does not look like a Deel token. Copy the whole value from the Developer Center.",
+  "conn.deel.error.auth": "Deel would not accept that token. Check it has not expired and that it was created in the organisation you want to check.",
+  "conn.deel.error.scope": "That token cannot read your people list. Add the people read scope to it in Deel, or create a new token with it, then connect again.",
+  "check.deel.leavers.access_removed.title": "Everyone payroll says has left has had their access confirmed closed",
+  "check.deel.leavers.access_removed.pass": "Every person Deel records as having left is on the roster as a leaver, with every system recorded and confirmed.",
+  "check.deel.leavers.access_removed.fail": "At least one person Deel says has left still has no confirmation that their access was closed. This is the finding assessors look for first, because a former colleague with a working login is the most common way a small company loses control of its data.",
+  "check.deel.leavers.access_removed.fix": "Open the roster, mark the person as a leaver if they are not already, list the systems they had access to, and confirm each one as you remove it. Deel knows the date they left; the roster is what shows somebody acted on it.",
+  "check.deel.leavers.closed_promptly.title": "Access is closed within a week of somebody leaving",
+  "check.deel.leavers.closed_promptly.pass": "Every departure recorded in Deel more than a week ago has its access removal confirmed.",
+  "check.deel.leavers.closed_promptly.fail": "At least one person left over a week ago and their access removal is still unfinished. The gap between the leaving date and the day access was closed is the number an assessor writes down.",
+  "check.deel.leavers.closed_promptly.fix": "Finish the outstanding offboarding rows. If a system genuinely takes longer to close, record the date it was actually done rather than leaving the row open, because an honest late date reads far better than a blank one.",
+  "check.deel.leavers.recorded.title": "Payroll and the roster agree on who has left",
+  "check.deel.leavers.recorded.pass": "Everyone Deel records as having left is marked as a leaver on the roster.",
+  "check.deel.leavers.recorded.fail": "At least one person has left according to Deel but is still shown as working here on the roster. Every control that counts your people is now counting somebody who is gone.",
+  "check.deel.leavers.recorded.fix": "Mark them as a leaver on the roster with the date Deel holds. This is the point of connecting payroll: the roster stops being a list somebody remembers to update.",
+  "check.deel.people.on_roster.title": "Everyone on payroll is on the roster",
+  "check.deel.people.on_roster.pass": "Everyone Deel records as currently working here appears on the roster.",
+  "check.deel.people.on_roster.fail": "At least one person is on payroll but not on the roster, so they are missing from your training rounds, your policy acceptances and your access reviews.",
+  "check.deel.people.on_roster.fix": "Add them to the roster. Anybody paid to work here is somebody an assessor expects to see accepting policies and appearing in access reviews.",
+  "check.deel.people.start_dates.title": "Every current person has a joining date",
+  "check.deel.people.start_dates.pass": "Everyone currently working here has a start date recorded in Deel.",
+  "check.deel.people.start_dates.fail": "At least one current person has no start date recorded, so there is no way to show that their checks and their induction happened when they joined.",
+  "check.deel.people.start_dates.fix": "Add the start date in Deel. It is the date every onboarding control is measured from, and a blank one turns a simple question into an argument.",
+  "provider.intune": "Microsoft Intune",
+  "stack.blurb.intune": "Read-only checks on the laptops and phones you manage: encryption, screen lock, patch level and compliance.",
+  "home.role.devices": "Devices",
+  "conn.intune.title": "Microsoft Intune",
+  "conn.intune.body": "Intune uses the same Microsoft tenant as Microsoft 365, with two further read-only permissions for device management. Your administrator grants them once, and Snoopios reads back what was actually granted on every run.",
+  "conn.intune.tenant.label": "Directory (tenant) ID",
+  "conn.intune.tenant.hint": "The same tenant ID as your Microsoft 365 connection. Find it in Entra ID under Overview.",
+  "conn.intune.enrolment.title": "If Snoopios says you have no devices",
+  "conn.intune.enrolment.body": "Adding a work account under Settings, Accounts, Access work or school REGISTERS a Windows machine without enrolling it, and a registered device never appears in Intune. Automatic enrolment is the thing that turns one into the other, and Microsoft only offers it to tenants with Entra ID Premium. Without it, enrol each machine directly: on the device, press Windows+R and run ms-device-enrollment:?mode=mdm then sign in with the work account. The device appears in Intune within a few minutes. This is the single most common reason a fleet looks unmanaged when it is not.",
+  "conn.intune.cta": "Connect read-only",
+  "conn.intune.error.tenant": "That does not look like a tenant ID. It is a GUID, thirty-six characters with hyphens.",
+  "conn.intune.error.auth": "Microsoft would not issue a token for that tenant. Check the ID, and that the Snoopios application is still consented in your directory.",
+  "conn.intune.error.not_licensed": 'The permissions are granted, but that tenant has no Intune. Microsoft answers every device request with "Request not applicable to target tenant", which means no device management licence is assigned. Add Intune licences to the tenant, or connect a different tenant. Nothing has been saved.',
+  "conn.intune.error.consent": "The token works but does not carry the device management permissions. Ask your administrator to grant DeviceManagementManagedDevices.Read.All and DeviceManagementConfiguration.Read.All, then connect again.",
+  "check.intune.devices.encrypted.title": "Every managed device encrypts its disk",
+  "check.intune.devices.encrypted.pass": "Every device Intune manages reports an encrypted disk.",
+  "check.intune.devices.encrypted.fail": "At least one managed device reports an unencrypted disk, so a laptop left in a taxi is a data breach rather than a lost asset.",
+  "check.intune.devices.encrypted.fix": "Assign a compliance policy that requires storage encryption, then check the devices that failed. On Windows this is BitLocker and on macOS it is FileVault, and both need the recovery key escrowed to Intune or you will be locked out of your own machine.",
+  "check.intune.devices.compliant.title": "Every managed device meets your own policy",
+  "check.intune.devices.compliant.pass": "Every device reports as compliant against the policies assigned to it.",
+  "check.intune.devices.compliant.fail": "At least one device is not compliant. A device Intune has never evaluated reports its state as unknown, and that is counted here rather than assumed to be fine.",
+  "check.intune.devices.compliant.fix": "Open Devices, filter by compliance, and work through the list. A device stuck at unknown has usually stopped checking in, which is a different problem from failing a rule.",
+  "check.intune.devices.recent_sync.title": "Every device has reported recently",
+  "check.intune.devices.recent_sync.pass": "Every managed device has checked in within the last thirty days.",
+  "check.intune.devices.recent_sync.fail": "At least one device has not checked in for over thirty days, so its last known state is frozen and may be wrong.",
+  "check.intune.devices.recent_sync.fix": "Find the device and get it back online, or retire it in Intune. A device that stopped reporting is the one an attacker would most like you to keep counting as compliant.",
+  "check.intune.devices.not_jailbroken.title": "No device is jailbroken or rooted",
+  "check.intune.devices.not_jailbroken.pass": "No managed device reports as jailbroken or rooted.",
+  "check.intune.devices.not_jailbroken.fail": "At least one device reports as jailbroken or rooted, which removes the protections every other control on this page assumes.",
+  "check.intune.devices.not_jailbroken.fix": "Retire the device from Intune and wipe it. A rooted device cannot be trusted to report its own state honestly, so no other check on it means anything.",
+  "check.intune.devices.all_managed.title": "Every company device is actually managed",
+  "check.intune.devices.all_managed.pass": "Every machine joined to your directory is under management.",
+  "check.intune.devices.all_managed.fail": "A machine is joined to your directory and nothing manages it.",
+  "check.intune.devices.all_managed.fix": "A joined device that nothing manages has your sign-in and none of your controls: no encryption requirement, no screen lock, no patch floor, and no way to wipe it. Enrol it, or remove its join if it should not have one. If the list looks wrong, note that adding a work account under Settings, Accounts, Access work or school registers a machine without enrolling it, and automatic enrolment needs Entra ID Premium. This check also counts personal devices carrying a work account, and does not fail them, because that is a legitimate arrangement.",
+  "check.intune.devices.ownership_known.title": "Every device records who owns it",
+  "check.intune.devices.ownership_known.pass": "Every managed device is recorded as company owned or personal.",
+  "check.intune.devices.ownership_known.fail": "At least one device has no ownership recorded, so your asset inventory has a row it cannot describe.",
+  "check.intune.devices.ownership_known.fix": "Set the ownership on the device in Intune. This is not a judgement on personal devices, which are a legitimate choice; it is that an unrecorded one cannot be described to an assessor.",
+  "check.intune.policy.assigned.title": "A compliance policy is actually assigned to somebody",
+  "check.intune.policy.assigned.pass": "At least one compliance policy is assigned to a group.",
+  "check.intune.policy.assigned.fail": "No compliance policy is assigned. A policy that exists but reaches nobody protects nothing, and every device will report as compliant because there is nothing to fail.",
+  "check.intune.policy.assigned.fix": "Assign your compliance policies to a group that contains your users or devices. This is the most common Intune mistake, because the policy looks finished in the list.",
+  "check.intune.policy.screen_lock.title": "Every assigned policy requires a screen lock",
+  "check.intune.policy.screen_lock.pass": "Every assigned compliance policy requires a password or passcode.",
+  "check.intune.policy.screen_lock.fail": "At least one assigned policy does not require a screen lock, so a device left open on a train is open to whoever picks it up.",
+  "check.intune.policy.screen_lock.fix": "Edit the policy and require a password or passcode. Windows and macOS call the setting a password and iOS calls it a passcode; both are read here.",
+  "check.intune.policy.encryption.title": "A policy requires the disk to be encrypted",
+  "check.intune.policy.encryption.pass": "At least one assigned compliance policy requires storage encryption.",
+  "check.intune.policy.encryption.fail": "No assigned policy requires storage encryption, so a device that turns it off will still report as compliant.",
+  "check.intune.policy.encryption.fix": "Edit the compliance policy and require storage encryption. Checking the devices is not enough on its own: without the rule, a device that stops encrypting is never marked non-compliant.",
+  "check.intune.policy.os_minimum.title": "Every assigned policy sets a minimum operating system",
+  "check.intune.policy.os_minimum.pass": "Every assigned compliance policy sets a minimum operating system version.",
+  "check.intune.policy.os_minimum.fail": "At least one assigned policy sets no minimum version, so a machine three years behind on patches can still report itself compliant.",
+  "check.intune.policy.os_minimum.fix": "Set a minimum operating system version on the policy and raise it when a vendor stops supporting a release. This is what turns patching from a hope into a rule.",
+  "stack.cli.title": "Not listed here?",
+  "stack.cli.body": "Thirteen more are checked by the command line rather than by a connection: Netlify, Neon, Render, Heroku, Clerk, Upstash, Better Stack, Railway, CircleCI, Checkly, Turso, WorkOS and your local repository. Run them on your own machine or in CI, and push the results in with an ingest key.",
+  "home.frameworks.where": "Every guide is listed in the footer of this page, grouped by what it covers, and the full index explains each one in plain English.",
+  "home.pack.d11": "Statement of Applicability: all 93 ISO Annex A controls, read from live evidence rather than typed",
+  "home.pack.d12": "Internal audit and management review records, ISO clauses 9.2 and 9.3",
+  "home.pack.d13": "SOC 2 system description: Section III, the part your auditor asks for first",
+  "home.people.title": "The half most tools ask you to type in",
+  "home.people.body": "Every framework asks two questions a server cannot answer: who has access, and did the people who work here actually do what your policies say. Snoopios keeps the register for both, so an assessor can sample it rather than take your word. Where a system does know the answer, it is read rather than retyped.",
+  "home.people.p1.title": "Who works here, and who left",
+  "home.people.p1.body": "For every leaver, the day access to each system was actually closed and who closed it. A confirmed line is superseded, never rewritten. Connect your payroll and the register is checked against it, so somebody who left three weeks ago with their access still open becomes a finding rather than an oversight.",
+  "home.people.p2.title": "Access reviews",
+  "home.people.p2.body": "Every person against every system, keep or remove, with a decision required on each before the review can be signed off. Frozen once complete.",
+  "home.people.p3.title": "Training and policy acceptance",
+  "home.people.p3.body": "Per person and per policy version, confirmed by them through their own link or recorded by an admin. The register says which, because an assessor treats those two differently.",
+  "home.people.p4.title": "A seat for your auditor",
+  "home.people.p4.body": "Read-only by construction, not by hidden buttons: the database refuses their writes. Give your assessor one instead of sharing your password.",
+  "footer.blurb": "Continuous compliance for small software teams. Read-only checks on the stack you already run, and the evidence behind every answer.",
+  "footer.youtube": "Snoopios on YouTube",
+  "footer.facebook": "Snoopios on Facebook",
+  "footer.instagram": "Snoopios on Instagram",
+  "footer.linkedin": "Snoopios on LinkedIn",
+  "footer.nav.product": "Snoopios",
+  "footer.nav.integrations": "All integrations",
+  "footer.nav.research": "Research",
+  "footer.nav.blog": "Notes",
+  "footer.nav.allframeworks": "All frameworks",
+  "footer.nav.pricing": "Pricing",
+  "footer.nav.faq": "Questions",
+  "footer.nav.start": "Start free",
+  "pack.doc.systemdesc.title": "SOC 2 system description",
+  "pack.doc.systemdesc.body": "Section III of a SOC 2 report, the part the company writes rather than the auditor, and the first thing a firm asks for. Drafted from your live configuration: the connected providers become the infrastructure and the subservice organisations, the pack becomes the procedures, and every criterion with a running check is listed against what it collects. The parts only you can write are left blank and marked as the ones that decide whether the report says anything: what you promise customers, what changed this period, and what you expect customers to do at their end.",
+  "conn.gcp.title": "Google Cloud",
+  "conn.gcp.body": "Create a service account in the project, give it the Viewer and Security Reviewer roles, and paste its JSON key below. Before the key is saved, Snoopios asks Google whether it holds any permission that could change anything, and refuses it if the answer is yes. That question is asked again on every run, so a role added later stops the connection rather than going unnoticed.",
+  "conn.gcp.field": "Service account key file",
+  "conn.gcp.hint": "The whole JSON file, pasted. Snoopios keeps the private key encrypted with a key that is not in the database, and uses it only to mint a read-only token for each run.",
+  "conn.gcp.cta": "Connect Google Cloud",
+  "conn.gcp.error.key": "That is not a service account key file. Look for a JSON file whose type is service_account and whose client_email ends in iam.gserviceaccount.com. An OAuth client secret is a different file and will not work here.",
+  "conn.gcp.error.auth": "Google would not accept that key. It may have been deleted or the service account disabled.",
+  "conn.gcp.error.roles": "The key works, but the service account cannot read the project. Grant it Viewer and Security Reviewer, then try again.",
+  "conn.gcp.error.write": "That service account can write. Snoopios asked Google which permissions it holds and Google named at least one that changes things, so the key has not been saved. Give it Viewer and Security Reviewer only, remove Editor or Owner if either is attached, and try again.",
+  "conn.gcp.error.api": "The Cloud Resource Manager API is not enabled on that project. Enable it, then connect again.",
+  "provider.gcp": "Google Cloud",
+  "stack.blurb.gcp": "Read-only checks across IAM, Compute, Cloud Storage, Cloud SQL, KMS and Logging.",
+  "check.gcp.iam.no_public_members.title": "Nothing in the project is granted to the whole internet",
+  "check.gcp.iam.no_public_members.pass": "No role is granted to allUsers or allAuthenticatedUsers.",
+  "check.gcp.iam.no_public_members.fail": "A role is granted to allUsers or allAuthenticatedUsers, which means anyone with a Google account, or none at all, holds it.",
+  "check.gcp.iam.no_public_members.fix": "Open IAM on the project, find the binding whose member is allUsers or allAuthenticatedUsers, and remove it. This is the most serious finding Google Cloud can produce.",
+  "check.gcp.iam.owners_limited.title": "Owner is held by a small number of named people",
+  "check.gcp.iam.owners_limited.pass": "Between one and three human accounts hold the Owner role.",
+  "check.gcp.iam.owners_limited.fail": "Either nobody holds Owner, or more than three people do. Both are findings: none means nobody can recover the project, and many means one compromised account takes the whole project with it.",
+  "check.gcp.iam.owners_limited.fix": "Grant Owner to one or two named people. Everyone else gets a role that fits what they actually do, and service accounts get none.",
+  "check.gcp.iam.no_sa_owners.title": "No service account holds Owner or Editor",
+  "check.gcp.iam.no_sa_owners.pass": "No service account carries a primitive role.",
+  "check.gcp.iam.no_sa_owners.fail": "A service account holds Owner or Editor. Those roles are broad, and a leaked key for that account is a leak of the whole project.",
+  "check.gcp.iam.no_sa_owners.fix": "Replace the primitive role with the narrowest predefined role that lets the workload do its job. Google's own recommender will suggest one from observed usage. If the account named ends in compute@developer.gserviceaccount.com, that is the default Compute Engine service account and Google gave it Editor the moment you switched Compute on. Nothing is using it in most projects, so remove the binding. If something is, give that workload its own service account first.",
+  "check.gcp.iam.audit_logs.title": "Data access is logged, not just administrative activity",
+  "check.gcp.iam.audit_logs.pass": "Data Access audit logs are enabled for all services.",
+  "check.gcp.iam.audit_logs.fail": "Data Access logging is off. Administrative activity is always recorded, but reads and writes of customer data are not, so nobody can answer who looked at what.",
+  "check.gcp.iam.audit_logs.fix": "In IAM, open Audit Logs, select All services, and tick Data Read and Data Write. Expect a bill for the log volume, and set a retention that matches your evidence period.",
+  "check.gcp.iam.sa_keys_absent.title": "No service account carries a downloadable key",
+  "check.gcp.iam.sa_keys_absent.pass": "No enabled service account has a user-managed key.",
+  "check.gcp.iam.sa_keys_absent.fail": "At least one service account has a user-managed key. That is a long-lived credential which can be copied, emailed or committed, and it does not rotate.",
+  "check.gcp.iam.sa_keys_absent.fix": "Delete the key and move the workload to Workload Identity Federation or an attached service account. Where a key is unavoidable, rotate it on a schedule and record where it lives. One account in the list will usually be the one you made for Snoopios: we connect with a service account key, so this check reports us too, and that is the honest answer rather than an exemption we granted ourselves.",
+  "check.gcp.compute.ssh_restricted.title": "SSH is not open to the whole internet",
+  "check.gcp.compute.ssh_restricted.pass": "No enabled firewall rule allows port 22 from the whole internet.",
+  "check.gcp.compute.ssh_restricted.fail": "A firewall rule allows SSH from anywhere. Every scanner on the internet finds this within hours.",
+  "check.gcp.compute.ssh_restricted.fix": "Narrow the source range to your own addresses, or remove the rule and use Identity-Aware Proxy, which needs no open port at all.",
+  "check.gcp.compute.rdp_restricted.title": "Remote desktop is not open to the whole internet",
+  "check.gcp.compute.rdp_restricted.pass": "No enabled firewall rule allows port 3389 from the whole internet.",
+  "check.gcp.compute.rdp_restricted.fail": "A firewall rule allows remote desktop from anywhere.",
+  "check.gcp.compute.rdp_restricted.fix": "Narrow the source range, or remove the rule and reach the machine through Identity-Aware Proxy instead.",
+  "check.gcp.compute.oslogin.title": "SSH access is tied to a Google identity",
+  "check.gcp.compute.oslogin.pass": "OS Login is enabled across the project.",
+  "check.gcp.compute.oslogin.fail": "OS Login is off, so SSH access lives in per-instance authorised-keys files rather than in IAM.",
+  "check.gcp.compute.oslogin.fix": "Set enable-oslogin to TRUE in the project metadata. It matters most at offboarding: without it, removing somebody's Google account leaves their SSH key working.",
+  "check.gcp.compute.serial_port_off.title": "The interactive serial console is disabled",
+  "check.gcp.compute.serial_port_off.pass": "Serial port access is not enabled across the project.",
+  "check.gcp.compute.serial_port_off.fail": "Serial port access is enabled across the project, which is a console reachable without passing the firewall.",
+  "check.gcp.compute.serial_port_off.fix": "Remove serial-port-enable from the project metadata, or set it to FALSE, and enable it on one instance only while debugging.",
+  "check.gcp.storage.no_public_buckets.title": "No storage bucket is readable by the public",
+  "check.gcp.storage.no_public_buckets.pass": "No bucket grants access to allUsers or allAuthenticatedUsers.",
+  "check.gcp.storage.no_public_buckets.fail": "At least one bucket is granted to allUsers or allAuthenticatedUsers, so its contents can be read without credentials.",
+  "check.gcp.storage.no_public_buckets.fix": "Remove the public member from the bucket's policy. If the bucket genuinely serves a public website, record it in accepted risks rather than leaving it looking like a mistake.",
+  "check.gcp.storage.uniform_access.title": "Buckets use uniform access, not per-object permissions",
+  "check.gcp.storage.uniform_access.pass": "Every bucket has uniform bucket-level access enabled.",
+  "check.gcp.storage.uniform_access.fail": "At least one bucket still allows per-object permissions, so who can read a file has two answers and only one of them appears in IAM.",
+  "check.gcp.storage.uniform_access.fix": "Enable uniform bucket-level access on the bucket. Check first that nothing depends on a per-object permission, because the switch is one-way for ninety days.",
+  "check.gcp.storage.versioning.title": "Buckets keep previous versions of an object",
+  "check.gcp.storage.versioning.pass": "Every bucket has object versioning enabled.",
+  "check.gcp.storage.versioning.fail": "At least one bucket has versioning off, so an overwrite or a delete is final.",
+  "check.gcp.storage.versioning.fix": "Enable versioning on the bucket and add a lifecycle rule to expire old versions, so the protection does not become a storage bill.",
+  "check.gcp.sql.not_public.title": "No database accepts connections from the whole internet",
+  "check.gcp.sql.not_public.pass": "No Cloud SQL instance authorises the whole internet.",
+  "check.gcp.sql.not_public.fail": "A Cloud SQL instance authorises the whole internet, so anyone who learns the address can attempt to connect.",
+  "check.gcp.sql.not_public.fix": "Replace the authorised network with your own addresses, or move the instance to a private address and reach it through the Cloud SQL Auth Proxy.",
+  "check.gcp.sql.require_ssl.title": "Databases refuse unencrypted connections",
+  "check.gcp.sql.require_ssl.pass": "Every Cloud SQL instance requires an encrypted connection.",
+  "check.gcp.sql.require_ssl.fail": "At least one instance accepts unencrypted connections, so credentials and data can cross the network in the clear.",
+  "check.gcp.sql.require_ssl.fix": "Set the instance to accept encrypted connections only. Check your clients first, because an application without a certificate will stop connecting.",
+  "check.gcp.sql.backups.title": "Databases are backed up automatically",
+  "check.gcp.sql.backups.pass": "Every Cloud SQL instance has automated backups enabled.",
+  "check.gcp.sql.backups.fail": "At least one instance has automated backups switched off.",
+  "check.gcp.sql.backups.fix": "Enable automated backups on the instance, and add point-in-time recovery if losing a day of data would matter. A backup nobody has restored is a plan, not a capability.",
+  "check.gcp.sql.deletion_protection.title": "Databases cannot be deleted by accident",
+  "check.gcp.sql.deletion_protection.pass": "Every Cloud SQL instance has deletion protection enabled.",
+  "check.gcp.sql.deletion_protection.fail": "At least one instance can be deleted without an extra confirmation.",
+  "check.gcp.sql.deletion_protection.fix": "Enable deletion protection on the instance. It costs nothing and it has saved more production databases than any other setting on this page.",
+  "check.gcp.kms.key_rotation.title": "Encryption keys rotate on a schedule",
+  "check.gcp.kms.key_rotation.pass": "Every symmetric key has a rotation period set.",
+  "check.gcp.kms.key_rotation.fail": "At least one symmetric encryption key has no rotation period, so it will be used indefinitely.",
+  "check.gcp.kms.key_rotation.fix": "Set a rotation period on the key. Ninety days suits most uses, and existing data stays readable because old key versions are retained.",
+  "check.gcp.logging.sink.title": "Logs are exported somewhere they outlive thirty days",
+  "check.gcp.logging.sink.pass": "At least one log sink exports to storage or an analytics destination.",
+  "check.gcp.logging.sink.fail": "No log sink exports anywhere. Logs sit in the default bucket for thirty days and are then gone.",
+  "check.gcp.logging.sink.fix": "Create a sink to a Cloud Storage bucket or BigQuery, with a retention matching the evidence period your framework expects. An auditor asking about last quarter needs those logs to still exist.",
+  "confirm.title": "Confirm",
+  "confirm.training.title": "Have you completed this training?",
+  "confirm.training.body": "Pressing the button records today's date against your name, and that you confirmed it yourself rather than somebody recording it for you. Only do it once you have actually finished.",
+  "confirm.training.cta": "Yes, I have completed it",
+  "confirm.policy.title": "Do you accept this policy?",
+  "confirm.policy.body": "Pressing the button records that you have read and accepted this version of the policy, on today's date. If a new version is published later you will be asked again, because accepting an old version says nothing about the current one.",
+  "confirm.policy.cta": "I have read and accept it",
+  "confirm.field.course": "Course",
+  "confirm.field.policy": "Policy",
+  "confirm.field.you": "For",
+  "confirm.field.due": "Due by",
+  "confirm.thanks": "Thank you, that is recorded.",
+  "confirm.already": "This is already recorded.",
+  "confirm.recorded": "Recorded",
+  "confirm.byadmin": "recorded by an administrator",
+  "confirm.note": "This link is personal to you and works once. It records a date and your name for your employer's compliance records, and nothing else: no tracking, no account, and no other information about you.",
+  "confirm.unknown.title": "This link is not valid",
+  "confirm.unknown.body": "It may have been replaced by a newer one, or copied incompletely. Ask whoever sent it for a fresh link.",
+  "assign.links.cta": "Get links for the outstanding",
+  "assign.links.title": "Personal links, shown once",
+  "assign.links.body": "One per person still to confirm, in the order they appear above. Send each to the right person. Asking again issues new links and retires these.",
+  "assign.links.error.none": "Everyone on this round has already confirmed.",
+  "assign.source.person": "confirmed by them",
+  "assign.source.admin": "recorded by an admin",
+  "team.seats.title": "Who can sign in",
+  "team.seats.body": "An auditor seat is read-only by construction, not by hidden buttons: an auditor is a member and is not an admin, so every read is allowed and every write is refused by the database itself. Give your assessor one instead of sharing your password.",
+  "team.seats.unknown": "Invited, not yet signed in",
+  "team.seats.remove": "Remove",
+  "team.role.owner": "Owner",
+  "team.role.admin": "Admin",
+  "team.role.member": "Member",
+  "team.role.auditor": "Auditor",
+  "team.invite.title": "Invite someone",
+  "team.invite.hint": "The link works once, expires in seven days, and only for the address you name. Forwarding it to anyone else achieves nothing.",
+  "team.invite.email": "Their work email",
+  "team.invite.role": "Seat",
+  "team.invite.cta": "Create the invite",
+  "team.invite.once": "Copy this now. It is shown once and never again.",
+  "team.invite.send": "Send it to them yourself, however you normally would. Snoopios does not email it, so the link never sits in a mailbox we control.",
+  "team.invite.pending": "Invited, not yet accepted",
+  "team.invite.expires": "expires",
+  "team.invite.revoke": "Withdraw",
+  "team.invite.error.email": "That does not look like an email address.",
+  "team.invite.error.member": "That person is already in your organisation.",
+  "team.invite.error.duplicate": "There is already a live invite for that address. Withdraw it first if you want to change the seat.",
+  "team.invite.error.toomany": "There are already ten invites waiting. Withdraw some before sending more.",
+  "team.invite.error.owner": "Only the account owner can invite people.",
+  "invite.title": "You have been invited",
+  "invite.body": "Accepting adds you to this organisation with the seat you were given. An auditor seat can read everything and change nothing.",
+  "invite.signedin": "Signed in as",
+  "invite.cta": "Accept the invitation",
+  "invite.wrong": "Wrong account?",
+  "invite.problem.expired": "This invitation has expired. Ask for a new one; they last seven days.",
+  "invite.problem.used": "This invitation has already been used.",
+  "invite.problem.withdrawn": "This invitation was withdrawn.",
+  "invite.problem.address": "This invitation was sent to a different address. Sign in as the person it names.",
+  "invite.problem.member": "You already belong to an organisation, and somebody can only belong to one.",
+  "invite.problem.invalid": "That invitation link is not valid.",
+  "app.readonly.title": "You are viewing as an auditor",
+  "app.readonly.body": "You can read every check, document and register here. Nothing on any screen can be changed, and the database refuses the attempt rather than a button hiding it.",
+  "assign.title": "Training and policy acceptance",
+  "assign.intro": "ISO asks for awareness training and for policies that are communicated and acknowledged; SOC 2 asks the same. Neither is answerable by a check, and an assessor samples both by person rather than accepting one sentence covering the team.",
+  "assign.kind.training": "Training",
+  "assign.kind.policy": "Policy",
+  "assign.due": "due",
+  "assign.cancel": "Abandon",
+  "assign.record": "Record",
+  "assign.nobody": "Add people to the roster first. A round with nobody in it records nothing.",
+  "assign.training.title": "Run a training round",
+  "assign.training.hint": "Everyone on the roster gets a line. Record the date each person actually finished, not the date you asked them to.",
+  "assign.policy.title": "Ask people to accept a policy",
+  "assign.policy.hint": "Acceptance is of a version. Once you publish a new version, run another round, because everyone accepting an old one proves nothing about the current policy.",
+  "assign.training.cta": "Start the round",
+  "assign.policy.cta": "Ask for acceptance",
+  "assign.field.course": "Course",
+  "assign.field.course.placeholder": "Security awareness 2026",
+  "assign.field.policy": "Policy",
+  "assign.field.policy.placeholder": "Information security policy",
+  "assign.field.version": "Version",
+  "assign.field.due": "Due (optional)",
+  "assign.field.completed": "Date completed",
+  "assign.error.title": "Give the round a name.",
+  "assign.error.version": "Say which version people are accepting. Acceptance of an unnamed version proves nothing later.",
+  "assign.error.nobody": "There is nobody on the roster to assign this to.",
+  "review.title": "Access reviews",
+  "review.intro": "Offboarding proves a leaver lost access. A review proves the people still here still need what they hold. An assessor sampling a quarter asks for this one by name, and a review cannot be completed while any row is undecided.",
+  "review.field.period": "What period does this cover?",
+  "review.field.period.placeholder": "Q3 2026",
+  "review.field.systems": "Systems to review",
+  "review.field.reviewer": "Reviewed by",
+  "review.field.note": "Note (optional)",
+  "review.start.cta": "Start a review",
+  "review.complete.cta": "Complete the review",
+  "review.cancel": "Abandon",
+  "review.started": "started",
+  "review.completed": "completed",
+  "review.rows": "rows",
+  "review.removed": "to remove",
+  "review.undecided": "still undecided",
+  "review.nobody": "Add people to the roster first. A review with nobody in it proves nothing.",
+  "review.decision.keep": "Keep",
+  "review.decision.remove": "Remove",
+  "review.decision.none": "No access",
+  "review.error.period": "Say what period this review covers.",
+  "review.error.systems": "Choose at least one system to review.",
+  "review.error.open": "A review is already open. Finish or abandon it first. Two half-done reviews is how an organisation ends up with neither.",
+  "review.error.nobody": "There is nobody on the roster to review.",
+  "review.error.undecided": "Some rows are still undecided. A review signed off half-answered is worse than no review, because it produces a document saying access was reviewed when part of it never was.",
+  "coverage.kind.record": "Register",
+  "attest.internal_audit.statement": "{org} has completed an internal audit of its information security management system within the last twelve months, carried out by someone independent of the activities audited, and every finding has an owner and a due date.",
+  "attest.internal_audit.reference": "The audit reference and the date it was completed",
+  "attest.internal_audit.hint": "Independence is the part small teams struggle with, and a stated limitation is accepted where a pretended independence is not. A non-executive, an adviser, or a colleague who does not run the systems under review all count.",
+  "attest.mgmt_review.statement": "Top management at {org} has reviewed the information security management system within the last twelve months, considering each input ISO/IEC 27001 clause 9.3.2 names, and has recorded decisions on improvement, on changes to the system, and on the resources it needs.",
+  "attest.mgmt_review.reference": "The date of the review and where the record is kept",
+  "attest.mgmt_review.hint": "The resources decision is the output assessors most often find missing, because it is the one that costs something. A review that records no decision is not a review.",
+  "attest.isms_scope.statement": "{org} has defined and documented the scope of its information security management system, naming the products, teams, locations and information inside it and anything deliberately outside it.",
+  "attest.isms_scope.reference": "Where the scope statement is recorded and when it was last revised",
+  "attest.isms_scope.hint": "The scope decides what everything else is measured against, so an assessor reads it first. A scope that quietly omits a product the company sells is the finding they are looking for.",
+  "pack.doc.soa.title": "Statement of Applicability",
+  "pack.doc.soa.body": "Every one of the ninety-three Annex A controls, whether it applies to you, why, and what stands behind it today. Generated from the same evidence the coverage page reads, so it is a reading taken on the day you export it rather than a document that went stale the day after it was written. The scope of the management system and any exclusions are fill-ins, because only you can state those.",
+  "pack.doc.audit.title": "Internal audit record",
+  "pack.doc.audit.body": "Clause 9.2: that audits happen on a programme, against stated criteria, by someone independent of what they audit, and that findings are followed to closure. The scope and the evidence counts are drafted for you; the auditor, the findings and the conclusion are fill-ins, because inventing them would forge the record.",
+  "pack.doc.review.title": "Management review record",
+  "pack.doc.review.body": "Clause 9.3, with every input the clause names set out so none is left to memory, and the outputs it requires: improvements, changes and resources. The monitoring results are filled from your live checks; the decisions are yours.",
+  "privacy.s9.h": "People your customers add to their roster",
+  "privacy.s9.p": "If you use the people list, you give us the name and, if you choose, the work email, role and joining date of each person who can reach your systems, together with the date anyone left and the date each of their accounts was closed. We hold this because every security standard asks who has access and how a leaver lost it, and a list is the only honest answer. You are the controller of that information and we process it only on your instructions. It is visible to the members of your organisation and to nobody else: it never appears on your public trust page, is never sent to a model, and is never used for anything but showing it back to you and including it in your export. It is kept for the life of your account and deleted with it, because a record of a leaver whose access was closed is the evidence that it was, and deleting it early would destroy the thing it exists to prove. Tell the people on your list that you keep it; that duty is yours, not ours.",
+  "team.title": "People",
+  "team.lede": "Who works here, who left, and for each leaver the day access to each system was actually removed and who removed it. Every framework asks both questions; until this list existed the answer was a sentence somebody ticked.",
+  "team.note": "This list is organisational rather than per project, because a person works for the company. It is never shown on your public trust page and never leaves the app except in your own account export.",
+  "team.current.title": "Working here now",
+  "team.current.empty": "Nobody on the list yet. Add the people who can reach your systems, including contractors.",
+  "team.since": "since",
+  "team.remove": "Remove from the list",
+  "team.add.title": "Add someone",
+  "team.add.intro": "Include anyone who can reach a system you would have to close if they left. That usually means more people than the payroll does.",
+  "team.add.cta": "Add to the list",
+  "team.field.name": "Full name",
+  "team.field.email": "Work email",
+  "team.field.title": "Role",
+  "team.field.started": "Started",
+  "team.field.engagement": "Engagement",
+  "team.engagement.employee": "Employee",
+  "team.engagement.contractor": "Contractor",
+  "team.left.intro": "When someone leaves, tick every system they could reach. Each one becomes a line to close, with a date and a name.",
+  "team.left.cta": "Record that they left",
+  "team.field.left": "Last day",
+  "team.field.systems": "Systems they could reach",
+  "team.system.email": "Email and calendar",
+  "team.system.laptop": "Laptop and devices",
+  "team.system.passwords": "Password manager",
+  "team.leavers.title": "People who have left",
+  "team.leavers.intro": "This is what an auditor samples. They pick a leaver and ask to see the day each account was closed, so a line without a date is a finding rather than an oversight.",
+  "team.leavers.empty": "Nobody has left yet.",
+  "team.leftOn": "left",
+  "team.closed": "closed",
+  "team.removedOn": "removed",
+  "team.outstanding": "Access still open for:",
+  "team.step.removed": "Date removed from",
+  "team.step.by": "Removed by",
+  "team.step.cta": "Confirm",
+  "team.error.name": "Enter the person's name.",
+  "team.error.full": "This list holds five hundred people. Get in touch if you need more.",
+  "team.error.admin": "Only an owner or admin can change this list.",
+  "team.error.leftdate": "Enter the person's last day.",
+  "team.error.systems": "Tick at least one system. A leaver with nothing to close is the record this list exists to prevent.",
+  "team.error.beforejoin": "That last day is before the day they joined.",
+  "team.error.faraway": "That last day is more than a year away.",
+  "team.error.removedate": "Enter the date access was removed.",
+  "team.error.future": "That date is in the future. Record it once the access is actually gone.",
+  "nav.tab.team": "People",
+  "conn.aws.title": "Amazon Web Services",
+  "conn.aws.intro": "Snoopios reads your AWS account with an access key that carries the SecurityAudit policy and nothing wider. It never asks for ReadOnlyAccess, because that grants permission to read the contents of every bucket, which no compliance check needs.",
+  "conn.aws.step1": "In IAM, create a user called snoopios-audit with no console access.",
+  "conn.aws.step2": "Attach the AWS-managed SecurityAudit policy to it, and nothing else. If anything wider is attached, Snoopios will refuse the key rather than store it.",
+  "conn.aws.step3": "Create an access key for that user and paste both halves below.",
+  "conn.aws.key.label": "Access key ID",
+  "conn.aws.key.placeholder": "AKIA...",
+  "conn.aws.secret.label": "Secret access key",
+  "conn.aws.secret.hint": "Encrypted before it is stored, with a key that is not in the database. It is never logged and never appears in an error message.",
+  "conn.aws.region.label": "Region",
+  "conn.aws.region.placeholder": "eu-west-2",
+  "conn.aws.region.hint": "The region your infrastructure runs in. IAM, S3 and CloudTrail are read account-wide; EC2, RDS, KMS, GuardDuty, Config, Access Analyzer and Lambda are read in this region. One check asks every other region whether it holds servers or databases, so you are told about anything running outside this one.",
+  "conn.aws.cta": "Connect AWS",
+  "conn.aws.error.key": "That does not look like an AWS access key ID. It begins with AKIA and is at least sixteen characters.",
+  "conn.aws.error.secret": "That does not look like an AWS secret access key.",
+  "conn.aws.error.region": "Enter a region code such as eu-west-2 or us-east-1.",
+  "conn.aws.error.identity": "AWS did not accept that key. Check both halves, and check the key is active in IAM.",
+  "conn.aws.error.wide": "That key carries more than SecurityAudit. Snoopios will not store a credential that can change your account. Attach only the SecurityAudit policy and try again.",
+  "conn.aws.error.unverified": "Snoopios could not confirm what that key is allowed to do, so it will not store it. Use an IAM user with the SecurityAudit policy attached directly, rather than a role or a group.",
+  "check.aws.iam.root_mfa.title": "The root user has multi-factor authentication",
+  "check.aws.iam.root_mfa.pass": "The account root has MFA enabled.",
+  "check.aws.iam.root_mfa.fail": "The account root can sign in with a password alone.",
+  "check.aws.iam.root_mfa.fix": "Sign in as root, open Security credentials, and assign an MFA device. The root user can do anything in the account and cannot be restricted by policy, so this is the single most important control AWS offers. Use a hardware key or an authenticator app, not SMS, and store the recovery codes somewhere the whole founding team can reach.",
+  "check.aws.iam.root_no_keys.title": "The root user has no access keys",
+  "check.aws.iam.root_no_keys.pass": "The account root holds no access keys.",
+  "check.aws.iam.root_no_keys.fail": "The account root holds an access key.",
+  "check.aws.iam.root_no_keys.fix": "Delete the root access key in Security credentials. A root key cannot be scoped, cannot be restricted by policy, and does not appear in most access reviews. Anything a script needs it for should be an IAM role instead. AWS has recommended against root keys for over a decade and auditors treat one as an automatic finding.",
+  "check.aws.iam.password_policy.title": "The password policy asks for length and stops reuse",
+  "check.aws.iam.password_policy.pass": "The account password policy requires at least fourteen characters and prevents reuse.",
+  "check.aws.iam.password_policy.fail": "The account password policy is weaker than fourteen characters, or allows a password to be reused.",
+  "check.aws.iam.password_policy.fix": "Set the IAM account password policy to a minimum of fourteen characters and remember at least five previous passwords. Length is what matters; the character-class rules are theatre by comparison and NIST stopped recommending them in 2017. An account with no policy at all is on the eight-character default.",
+  "check.aws.iam.users_mfa.title": "Every IAM user with a sign-in has MFA",
+  "check.aws.iam.users_mfa.pass": "Every IAM user has an MFA device.",
+  "check.aws.iam.users_mfa.fail": "One or more IAM users can sign in without MFA.",
+  "check.aws.iam.users_mfa.fix": "Assign an MFA device to each user listed, or delete the user if nobody is using it. Better still, move people to identity centre single sign-on and keep IAM users only for the few things that cannot use it, because a user with a password is a credential that outlives the person.",
+  "check.aws.iam.keys_rotated.title": "Access keys are younger than ninety days",
+  "check.aws.iam.keys_rotated.pass": "Every active access key was created within the last ninety days.",
+  "check.aws.iam.keys_rotated.fail": "An active access key is older than ninety days.",
+  "check.aws.iam.keys_rotated.fix": "Create a replacement key, deploy it, confirm the old one has stopped being used in its last-used record, then delete the old one. Ninety days is the benchmark auditors cite. A key that has never been rotated is one that has been in a developer's shell history, a CI variable and a laptop backup for as long as it has existed.",
+  "check.aws.iam.admins_limited.title": "Nobody carries AdministratorAccess as a standing permission",
+  "check.aws.iam.admins_limited.pass": "No IAM user has AdministratorAccess attached directly.",
+  "check.aws.iam.admins_limited.fail": "An IAM user has AdministratorAccess attached directly.",
+  "check.aws.iam.admins_limited.fix": "Detach AdministratorAccess from the users listed and give them a role to assume when they need it. Administrator through a role is at least deliberate and shows up in CloudTrail as an assumption; attached to a user it is simply how they work every day, and every review has to take it on trust.",
+  "check.aws.ec2.admin_ports_restricted.title": "No security group opens an admin port to the internet",
+  "check.aws.ec2.admin_ports_restricted.pass": "No security group allows the whole internet to reach an administrative port.",
+  "check.aws.ec2.admin_ports_restricted.fail": "A security group allows 0.0.0.0/0 or ::/0 to an administrative port.",
+  "check.aws.ec2.admin_ports_restricted.fix": "Narrow the rule to the addresses that need it, or remove it and reach the instance through Systems Manager Session Manager, which needs no inbound rule at all. SSH, RDP, and the database ports listed are scanned continuously; an open one is found in minutes, not months.",
+  "check.aws.ec2.default_sg_closed.title": "The default security group carries no rules",
+  "check.aws.ec2.default_sg_closed.pass": "Every default security group is empty.",
+  "check.aws.ec2.default_sg_closed.fail": "A default security group has allow rules on it.",
+  "check.aws.ec2.default_sg_closed.fix": "Remove every inbound and outbound rule from the default security group in each VPC. Anything launched without an explicit choice lands in it, so a rule there is one nobody meant to write and one that quietly applies to the next thing anyone starts.",
+  "check.aws.vpc.flow_logs.title": "Every VPC records its network flows",
+  "check.aws.vpc.flow_logs.pass": "Every VPC has an active flow log.",
+  "check.aws.vpc.flow_logs.fail": "A VPC has no active flow log.",
+  "check.aws.vpc.flow_logs.fix": "Turn on flow logs for the VPCs listed, to CloudWatch Logs or to S3. Without them there is no record of what talked to what, which is the first thing anyone asks for during an incident and the first thing an auditor asks for afterwards.",
+  "check.aws.ec2.volumes_encrypted.title": "Every EBS volume is encrypted",
+  "check.aws.ec2.volumes_encrypted.pass": "Every EBS volume is encrypted at rest.",
+  "check.aws.ec2.volumes_encrypted.fail": "An EBS volume is not encrypted.",
+  "check.aws.ec2.volumes_encrypted.fix": "Snapshot the volume, copy the snapshot with encryption enabled, and replace the volume from the copy. Then turn on EBS encryption by default for the region so the next one is encrypted without anyone remembering. Unencrypted disks are the finding that turns a lost laptop of a data centre into a notifiable breach.",
+  "check.aws.ec2.imdsv2_required.title": "Instances require the token-based metadata service",
+  "check.aws.ec2.imdsv2_required.pass": "Every running instance requires IMDSv2.",
+  "check.aws.ec2.imdsv2_required.fail": "A running instance still allows the version 1 metadata service.",
+  "check.aws.ec2.imdsv2_required.fix": "Set the instance metadata options to require tokens, with HttpTokens set to required. Version 1 answers any request that reaches it from the instance, so a single server-side request forgery bug in your application hands out the instance's AWS credentials. This is how the 2019 Capital One breach worked.",
+  "check.aws.s3.public_access_blocked.title": "Every bucket blocks public access",
+  "check.aws.s3.public_access_blocked.pass": "Every bucket has all four public access blocks on.",
+  "check.aws.s3.public_access_blocked.fail": "A bucket does not have all four public access blocks on.",
+  "check.aws.s3.public_access_blocked.fix": "Turn on Block Public Access for the buckets listed, and turn it on at the account level so it applies to buckets nobody has made yet. All four settings matter: two stop public ACLs, two stop public policies. A bucket with none of them is one policy edit away from being on the open internet.",
+  "check.aws.s3.versioning.title": "Buckets keep previous versions",
+  "check.aws.s3.versioning.pass": "Every bucket has versioning enabled.",
+  "check.aws.s3.versioning.fail": "A bucket does not keep previous versions.",
+  "check.aws.s3.versioning.fix": "Enable versioning on the buckets listed. Without it a deletion is final, which makes accidental loss unrecoverable and makes ransomware trivial. Add a lifecycle rule to expire old versions if the storage cost worries you, rather than leaving versioning off.",
+  "check.aws.s3.policy_not_public.title": "No bucket policy makes a bucket public",
+  "check.aws.s3.policy_not_public.pass": "No bucket policy grants public access.",
+  "check.aws.s3.policy_not_public.fail": "A bucket policy grants access to the whole internet.",
+  "check.aws.s3.policy_not_public.fix": "Read the policy on the buckets listed and remove the statement whose principal is a bare asterisk, or whose condition matches everyone. If the bucket is genuinely meant to be public, serve it through CloudFront with origin access control instead, so the bucket itself stays closed.",
+  "check.aws.rds.not_public.title": "No database is reachable from the internet",
+  "check.aws.rds.not_public.pass": "No RDS instance is publicly accessible.",
+  "check.aws.rds.not_public.fail": "An RDS instance is publicly accessible.",
+  "check.aws.rds.not_public.fix": "Set PubliclyAccessible to false on the instances listed and reach them from inside the VPC, through a bastion or through Session Manager port forwarding. A public database endpoint is scanned within hours of being created and is the shortest path anyone will find to your data.",
+  "check.aws.rds.encrypted.title": "Every database is encrypted at rest",
+  "check.aws.rds.encrypted.pass": "Every RDS instance is encrypted at rest.",
+  "check.aws.rds.encrypted.fail": "An RDS instance is not encrypted at rest.",
+  "check.aws.rds.encrypted.fix": "Encryption cannot be turned on in place: take a snapshot, copy it with encryption enabled, and restore a new instance from the copy. Plan the cutover, because this one needs downtime. Then set the region default so the next database is encrypted without anyone deciding.",
+  "check.aws.rds.backups.title": "Databases keep at least a week of backups",
+  "check.aws.rds.backups.pass": "Every RDS instance keeps at least seven days of automated backups.",
+  "check.aws.rds.backups.fail": "An RDS instance keeps fewer than seven days of backups, or none at all.",
+  "check.aws.rds.backups.fix": "Set the backup retention period to seven days or more on the instances listed. A retention of zero means automated backups are switched off entirely, which is a different and worse thing than a short window. Then restore one, because a backup nobody has restored is a hypothesis.",
+  "check.aws.rds.deletion_protection.title": "Databases cannot be deleted by accident",
+  "check.aws.rds.deletion_protection.pass": "Every RDS instance has deletion protection on.",
+  "check.aws.rds.deletion_protection.fail": "An RDS instance can be deleted without an extra step.",
+  "check.aws.rds.deletion_protection.fix": "Turn on deletion protection for the instances listed. It costs nothing and it stops the console click and the stray terraform destroy that has ended more than one company's afternoon. Turning it off is a deliberate act, which is exactly the point.",
+  "check.aws.cloudtrail.enabled.title": "A multi-region trail is recording API activity",
+  "check.aws.cloudtrail.enabled.pass": "A multi-region CloudTrail trail is logging.",
+  "check.aws.cloudtrail.enabled.fail": "No multi-region trail is logging.",
+  "check.aws.cloudtrail.enabled.fix": "Create a trail that applies to all regions and confirm it is logging, not merely present. A trail in one region leaves every other region unrecorded, which is exactly where someone holding a stolen key would work. Without CloudTrail there is no answer to what happened, and no SOC 2 or ISO audit will pass without one.",
+  "check.aws.cloudtrail.log_validation.title": "Trail log files can be proved unaltered",
+  "check.aws.cloudtrail.log_validation.pass": "Every trail has log file validation enabled.",
+  "check.aws.cloudtrail.log_validation.fail": "A trail does not have log file validation enabled.",
+  "check.aws.cloudtrail.log_validation.fix": "Enable log file validation on the trails listed. It has AWS sign a digest of each log file, so you can show an investigator that the record was not edited after the fact. Evidence nobody can prove is intact is evidence an auditor can decline.",
+  "check.aws.kms.key_rotation.title": "Customer-managed keys rotate",
+  "check.aws.kms.key_rotation.pass": "Every enabled customer-managed key has automatic rotation on.",
+  "check.aws.kms.key_rotation.fail": "An enabled customer-managed key does not rotate.",
+  "check.aws.kms.key_rotation.fix": "Turn on automatic annual rotation for the keys listed. AWS keeps the old key material so nothing you encrypted before becomes unreadable. Keys AWS manages for you rotate on their own schedule and are left out of this check, because nobody can act on them.",
+  "check.aws.guardduty.enabled.title": "GuardDuty is watching the account",
+  "check.aws.guardduty.enabled.pass": "GuardDuty has an enabled detector in this region.",
+  "check.aws.guardduty.enabled.fail": "GuardDuty is not enabled in this region.",
+  "check.aws.guardduty.enabled.fix": "Enable GuardDuty. It reads CloudTrail, VPC flow logs and DNS logs you are already producing and looks for the patterns that mean a credential has been stolen or an instance is mining cryptocurrency. It needs no agent and it is the cheapest detection you will buy.",
+  "provider.aws": "AWS",
+  "stack.blurb.aws": "Read-only checks across IAM, S3, EC2, RDS, CloudTrail, KMS and GuardDuty.",
+  "app.regimes.title": "Tell us which regimes apply to you",
+  "app.regimes.body": "Four questions about the business, and we will say which frameworks apply to you, which are worth having, and which you can leave alone. Until you answer, we have assumed the United Kingdom.",
+  "app.regimes.cta": "Answer four questions",
+  "baseline.count.paper": "statements confirmed",
+  "baseline.count.paper.of": "of",
+  "baseline.title": "Baseline",
+  "baseline.lede": "One reading of the stack, before anyone has named a framework. It is computed from the checks already running and the statements you have already confirmed, so it needs nothing new from you. The framework percentages underneath are the specific answers.",
+  "baseline.domains.title": "Six ways of looking at it",
+  "baseline.domain.identity": "Identity",
+  "baseline.domain.identity.blurb": "Who can get in, and what happens to the accounts of people who left.",
+  "baseline.domain.application": "Application",
+  "baseline.domain.application.blurb": "The code, the pipeline, and what the running app hands to a browser.",
+  "baseline.domain.infrastructure": "Infrastructure",
+  "baseline.domain.infrastructure.blurb": "The machines, the network edge, the certificates and the DNS in front of them.",
+  "baseline.domain.data": "Data",
+  "baseline.domain.data.blurb": "Where personal data sits, who can reach it, and whether it can be restored.",
+  "baseline.domain.governance": "Governance",
+  "baseline.domain.governance.blurb": "The two things a machine can check, plus every statement a person has confirmed in writing.",
+  "baseline.domain.operations": "Operations",
+  "baseline.domain.operations.blurb": "Whether anyone finds out when it breaks, and whether someone is on the end of it.",
+  "baseline.band.strong": "Strong",
+  "baseline.band.fair": "Fair",
+  "baseline.band.weak": "Needs work",
+  "baseline.band.none": "Nothing yet",
+  "baseline.method": "The average of the areas that have something behind them. It is an average rather than a straight tally so that one provider with forty checks cannot outweigh one with three. Covering",
+  "baseline.method.of": "of",
+  "baseline.nodata": "Nothing has run yet. Connect a provider, or add a domain, and this fills in on the first run.",
+  "baseline.nodata.dash": "\u2014",
+  "baseline.domain.empty": "nothing connected here yet",
+  "baseline.count.pass": "passing",
+  "baseline.count.fail": "failing",
+  "baseline.count.unknown": "could not run",
+  "baseline.unknown.note": "A check that could not run counts as neither a pass nor a fail. It is left out of the percentage and shown on its own, because a check that saw nothing tells you nothing.",
+  "baseline.frameworks.title": "What that means for each framework",
+  "baseline.frameworks.body": "The same evidence, read against the regimes you hold. A percentage here counts every control with something behind it: an automated check, a document, a report from your host, or a statement you confirmed.",
+  "app.project.baseline": "Baseline",
+  "packs.allowance.region.one": "region",
+  "packs.allowance.region.many": "regions",
+  "packs.allowance.specialist.one": "specialist pack",
+  "packs.allowance.specialist.many": "specialist packs",
+  "coverage.locked.swap": "Swap to it free",
+  "coverage.locked.upgrade": "On a higher plan",
+  "coverage.locked.choose": "Choose your regimes",
+  "regimes.title": "Regimes",
+  "regimes.q1": "Where is the company registered?",
+  "regimes.q1.hint": "The seat of the business. Its own law applies to you whether or not you sell there.",
+  "regimes.q2": "Where are your customers?",
+  "regimes.q2.hint": "Pick every market you sell into. A customer's law reaches you through them, which is the part most founders are surprised by.",
+  "regimes.q3": "Do you handle any of these?",
+  "regimes.q3.hint": "Each one carries a regime of its own, on top of wherever you are.",
+  "regimes.q3.children": "Data about children",
+  "regimes.q3.ai": "AI systems, ours or a provider's",
+  "regimes.q3.health": "NHS or health data",
+  "regimes.q4": "Has anyone asked you to prove it?",
+  "regimes.q4.hint": "This decides how urgent the security standards are, not whether they are worth having.",
+  "regimes.q4.none": "Not yet",
+  "regimes.q4.asked": "A buyer asked for ISO 27001 or SOC 2",
+  "regimes.q4.audited": "We are in an audit now",
+  "regimes.cta": "Show me what applies",
+  "regimes.cta.hint": "Nothing is saved until you press Save below.",
+  "regimes.missed.title": "Your plan does not cover everything that applies to you",
+  "regimes.missed.body": "We would rather say so than quietly leave it off the list. These obligations exist whether or not you buy them from us, and the free guides at /frameworks explain each one in full.",
+  "regimes.missed.cta": "See what each plan holds",
+  "rec.verdict.required": "Required",
+  "rec.verdict.recommended": "Recommended",
+  "rec.verdict.useful": "Worth having",
+  "rec.verdict.later": "Not yet",
+  "rec.reason.registered": "You are registered here, so this law applies to you directly.",
+  "rec.reason.customers": "You sell here. The law follows your customers, not your office.",
+  "rec.reason.noregion": "Nothing you told us puts you in this regime. Come back when that changes.",
+  "rec.reason.audited": "You are in an audit. This is the pack the auditor is working from.",
+  "rec.reason.asked": "A buyer has asked. This is what they are asking for by name.",
+  "rec.reason.nobuyer": "Nobody has asked yet, but the first enterprise buyer will, and the evidence takes months to accumulate rather than days.",
+  "rec.reason.ai": "You run or resell AI systems, so the AI regimes apply. One system inventory answers the first control of all three.",
+  "rec.reason.noai": "You told us you do not run AI systems. Nothing here applies yet.",
+  "rec.reason.children": "You handle children's data, which carries its own standards on top of the privacy law wherever you are.",
+  "rec.reason.nochildren": "No children's data, so these do not apply. Worth revisiting if you ever drop the age limit.",
+  "rec.reason.health": "You sell into the NHS, and a trust runs both of these before it buys.",
+  "rec.reason.nohealth": "Not selling into the NHS, so these do not apply.",
+  "packs.error.empty": "Choose at least one region.",
+  "packs.error.owner": "Only the account owner can change this.",
+  "plan.regimes.title": "Which regimes apply to you",
+  "plan.regimes.body": "Answer four questions about the business and we will say which frameworks apply, which are worth having, and which you can leave alone.",
+  "plan.regimes.cta": "Choose your regimes",
+  "plan.regimes.current": "Currently held",
+  "tier.studio.f6": "Evidence vault extended to twenty-four months",
+  "pack.uk.name": "United Kingdom",
+  "pack.uk.blurb": "UK GDPR, Cyber Essentials, and the Software Security Code of Practice that government buyers now ask suppliers to sign up to.",
+  "pack.eu.name": "European Union",
+  "pack.eu.blurb": "The EU GDPR as the regulation itself rather than the UK's version of it, and NIS 2 for the entities the directive brings into scope.",
+  "pack.uae.name": "United Arab Emirates",
+  "pack.uae.blurb": "The federal data protection law, the DIFC and ADGM regimes that free zone companies answer to instead, Dubai's information security regulation, and the federal assurance standards underneath them.",
+  "pack.saudi.name": "Saudi Arabia",
+  "pack.saudi.blurb": "The Saudi data protection law with the National Cybersecurity Authority's Essential Cybersecurity Controls and the cloud controls that extend them.",
+  "pack.gulf.name": "The wider Gulf",
+  "pack.gulf.blurb": "Qatar's data protection law and national information assurance policy, with the Bahraini and Omani data protection laws.",
+  "pack.na.name": "North America",
+  "pack.na.blurb": "California's privacy act, Canada's federal law, and Quebec's Law 25, which asks for more than the federal one and catches companies that assumed otherwise.",
+  "pack.asia.name": "Asia Pacific",
+  "pack.asia.blurb": "Singapore's data protection act and India's digital personal data protection act.",
+  "pack.security.name": "Security standards",
+  "pack.security.blurb": "The certifications a buyer asks for by name. ISO 27001 and SOC 2, extended by ISO 27701 for privacy management, 27017 and 27018 for the cloud, 22301 for continuity, and the NIST framework where an American buyer uses its language.",
+  "pack.ai.name": "AI governance",
+  "pack.ai.blurb": "ISO 42001, the EU AI Act and the NIST AI risk management framework. One AI system inventory answers the first control of all three.",
+  "pack.children.name": "Children's data",
+  "pack.children.blurb": "The UK Children's Code and the American pair, COPPA and FERPA. Required of anything a child can sign up to, which is more services than expect it.",
+  "pack.health.name": "NHS supply",
+  "pack.health.blurb": "The Digital Technology Assessment Criteria a trust runs before buying, and the Data Security and Protection Toolkit it expects you to have submitted.",
+  "packs.title": "Which regimes apply to you",
+  "packs.lede": "You do not pick frameworks, you pick regimes. A pack is every framework that follows from where you are registered, where your customers are, and what you sell into.",
+  "packs.note": "Adding a pack does not change what Snoopios looks at. All thirty-six frameworks read the same one hundred and eighty-five checks, so the evidence is the same evidence. What a pack adds is the ability to answer for that regime: its coverage view, the control wording an assessor recognises, the attestations it asks for that no other does, and the questionnaire answers in its language.",
+  "packs.region.title": "Where you operate",
+  "packs.assurance.title": "What buyers ask for",
+  "packs.specialist.title": "What you handle",
+  "packs.locked": "On a higher tier",
+  "packs.save": "Save selection",
+  "packs.saved": "Selection saved.",
+  "packs.error": "That selection does not fit your plan. Deselect one first.",
+  "packs.included": "Included",
+  "attest.ai_inventory.statement": "{org} keeps an inventory of the AI systems it builds or uses, recording for each one its purpose, the data it sees, the provider behind it and who owns the outcome.",
+  "attest.ai_inventory.reference": "Where the inventory is kept and when it was last reviewed",
+  "attest.ai_inventory.hint": "Every AI obligation in every regime hangs from this list. A system nobody wrote down is a system nobody assessed, and the first question an assessor asks is how you know the list is complete.",
+  "attest.ai_risk_tier.statement": "{org} has classified each of its AI systems under the EU AI Act as prohibited, high-risk, limited-risk or minimal-risk, and has recorded the reasoning for each classification.",
+  "attest.ai_risk_tier.reference": "Where the classification and its reasoning are recorded",
+  "attest.ai_risk_tier.hint": "Almost everything else in the Act follows from the tier. Most business software lands in limited or minimal risk, but the reasoning is what you will be asked for, not the answer.",
+  "attest.ai_human.statement": "A named person at {org} can review, override or stop each AI system's output before it affects anyone, and that person has the means and the authority to do it.",
+  "attest.ai_human.reference": "Who holds that responsibility for each system",
+  "attest.age_assurance.statement": "{org} establishes the age of its users with a level of certainty proportionate to the risks its service presents to children, or applies the standards of the Children's Code to all users.",
+  "attest.age_assurance.reference": "The method used, and the risk assessment that justifies it",
+  "attest.age_assurance.hint": "The Code allows either route. Applying children's protections to everyone is a legitimate answer and is often the cheaper one for a small service.",
+  "attest.child_dpia.statement": "{org} has assessed how its service affects children, treating their best interests as a primary consideration, and has recorded the conclusions by age range.",
+  "attest.child_dpia.reference": "Where the assessment is recorded and when it was last revised",
+  "attest.child_dpia.hint": "The regulator expects the assessment to distinguish a five-year-old from a fifteen-year-old rather than treating everyone under eighteen as one group.",
+  "attest.ferpa_school.statement": "Where {org} handles education records, it does so as a school official under the direct control of the educational institution, uses the records only for the authorised purpose, and does not redisclose them without authorisation.",
+  "attest.ferpa_school.reference": "The agreement that establishes the school official relationship",
+  "attest.ferpa_school.hint": "This is the exception most education software relies on. Without a written agreement placing you under the school's control, the exception does not apply and the parental consent route does.",
+  "home.stats.method": "The first four are counted from the product itself, not written by hand: providers and checks from the check registry, frameworks from the control catalogue, and the percentage is the mean across every framework of the controls a connected stack evidences before you answer a single question. A check is one rule. Platforms that advertise thousands of tests are usually counting a rule again for every kind of resource it touches, which is a fair way to count and a different one. See them",
+  "home.stats.method.link": "framework by framework",
+  "attest.bc_test.statement": "{org} has exercised its business continuity and disaster recovery plans within the last twelve months, and the result, including anything that did not work, is written down.",
+  "attest.bc_test.reference": "The date of the last exercise and where the result is recorded",
+  "attest.bc_test.hint": "A restore that has never been attempted is a plan, not a capability. Auditors ask for the date and the findings, not the document.",
+  "attest.desc_scope.statement": "{org} has carried out the applicability review the Information Security Regulation requires, recording which of the thirteen domains and which controls apply to it and why.",
+  "attest.desc_scope.reference": "Where the applicability review is recorded and when it was last revised",
+  "attest.desc_scope.hint": "The regulation expects a right-fit implementation sized to the risk, so the review is the document that justifies everything you did not do.",
+  "fw.iso27017.name": "ISO/IEC 27017",
+  "fw.iso27017.tagline": "The cloud extension to ISO 27001. Where the provider's job ends and yours begins.",
+  "fw.iso27017.summary": "ISO/IEC 27017 extends ISO/IEC 27002 with guidance for cloud services, addressed to both providers and customers. It adds seven cloud-specific controls and cloud-specific guidance on many existing ones. Its subject is the seam: who is responsible for what, how tenants are kept apart in a virtual environment, how virtual machines are hardened, how administrator operations are performed and recorded, what monitoring data the customer can actually get, and what happens to the customer's assets when the contract ends. For a company running on someone else's infrastructure it is the standard that forces the shared responsibility model out of a diagram and into a document.",
+  "fw.iso27017.who": "Anyone certified to ISO 27001 who runs on public cloud, and anyone whose customer asks how the responsibility is divided. It is certified as an extension of 27001 rather than on its own.",
+  "fw.iso27017.needs": "A documented shared responsibility split \xB7 Removal and return of your assets at the end of the contract \xB7 Segregation between tenants in a virtual environment \xB7 Virtual machine hardening to a known baseline \xB7 Documented administrator operations \xB7 Monitoring, with the logs you need available to you \xB7 Alignment of virtual and physical network security \xB7 Agreed cryptographic controls, including who holds the keys \xB7 Separated cloud administration access \xB7 Agreed incident responsibilities and notification",
+  "fw.iso27017.snoopios": "Ten controls, all inherited from the ISO 27001 evidence already running, because 27017 is guidance layered on 27002 rather than a separate control set.",
+  "fw.iso27017.youdo": "Write the responsibility split down and get your provider's half in the contract. Check you can actually export the logs you would need in an investigation, because most customers discover the gap during one.",
+  "fw.iso27017.source": "https://www.iso.org/standard/43757.html",
+  "fw.iso27018.name": "ISO/IEC 27018",
+  "fw.iso27018.tagline": "For a processor holding other people's personal data in a public cloud.",
+  "fw.iso27018.summary": "ISO/IEC 27018 is the code of practice for protecting personally identifiable information in a public cloud when you act as a processor. It sits on ISO 27001 and 27002 and adds obligations that map closely onto what a controller must contractually require of you: process only on documented instructions, never use the data for your own purposes including marketing, disclose your sub-processors and the countries the data may reach, tell the controller about a breach, encrypt personal data over public networks and on portable media, keep records of who accessed it, and put confidentiality obligations on everyone who can. It is the certificate a European or Gulf buyer asks for when they want assurance about their customers' data rather than your security generally.",
+  "fw.iso27018.who": "Any software business that holds personal data on behalf of its customers, which is most of them. It is the processor-side counterpart to ISO 27701's controller clauses.",
+  "fw.iso27018.needs": "Processing only on the controller's documented instructions \xB7 No use for your own purposes, including marketing \xB7 Collection limitation and secure disposal of temporary files \xB7 A schedule for return, transfer and disposal \xB7 Disclosure of sub-processors and of the countries involved \xB7 Breach notification to the controller, and records of disclosures \xB7 Encryption over public networks and on portable media \xB7 Unique identifiers and access records \xB7 Subcontracting disclosed before it begins \xB7 Confidentiality obligations on anyone with access",
+  "fw.iso27018.snoopios": "Ten controls, all inherited from the ISO 27001 and UK GDPR evidence, since the obligations are the ones a data processing agreement already imposes.",
+  "fw.iso27018.youdo": "Make sure the sub-processor register is current and public, because this standard turns it from good practice into a control. Confirm nothing in the product uses customer personal data for your own analytics or model training.",
+  "fw.iso27018.source": "https://www.iso.org/standard/76559.html",
+  "fw.iso22301.name": "ISO 22301",
+  "fw.iso22301.tagline": "Business continuity as a management system, and the exercise is the point.",
+  "fw.iso22301.summary": "ISO 22301 specifies a business continuity management system: the same clause structure as ISO 27001, applied to keeping the business running. Clause 8 is where the substance lives. A business impact analysis identifies the activities that must not stop and how long they can be interrupted, a risk assessment says what would stop them, strategies and solutions set recovery objectives, plans say what people actually do, and an exercise programme tests whether any of it works. That last part is what separates certification from a document: an untested plan is a hypothesis, and an auditor asks for the date of the last exercise and what it found rather than for the plan itself.",
+  "fw.iso22301.who": "Software companies whose customers depend on availability, which increasingly means anyone selling to enterprise or the public sector. It is often asked for alongside ISO 27001 rather than instead of it, and the two share a management system.",
+  "fw.iso22301.needs": "A defined scope and the interested parties \xB7 A policy and assigned responsibilities \xB7 Continuity objectives \xB7 Competence, awareness and documented information \xB7 A business impact analysis and risk assessment \xB7 Strategies and solutions with recovery objectives \xB7 Plans and an incident response structure \xB7 An exercise programme, with results recorded \xB7 Internal audit and management review \xB7 Correction of nonconformities",
+  "fw.iso22301.snoopios": "Ten controls at clause level. Eight inherit from the ISO 27001 evidence and the continuity plan the pack already generates. Two are attestations with a date: the exercise, and the management review.",
+  "fw.iso22301.youdo": "Run the exercise and write down what failed, because the finding is worth more to an auditor than a clean report. Set recovery time and recovery point objectives that your architecture can actually meet, and check them against what your hosting provider commits to.",
+  "fw.iso22301.source": "https://www.iso.org/standard/75106.html",
+  "fw.uaeia.name": "UAE Information Assurance Standards",
+  "fw.uaeia.tagline": "The federal baseline, and the one with named cryptographic minimums.",
+  "fw.uaeia.summary": "The UAE Information Assurance Standards are the federal baseline for protecting information systems, originally issued by the National Electronic Security Authority and now maintained under the country's cyber security authority. They divide into management controls, covering strategy, risk, awareness, human resources, compliance and performance, and technical controls, covering assets, access, cryptography, networks, operations, third parties, development, incidents and continuity. They are more prescriptive than most equivalents in one respect: they name cryptographic minimums, expecting AES-256 for data at rest and TLS 1.2 or better in transit, where the Qatari and Saudi authorities accept weaker with documented justification. Entities in the critical sectors are expected to comply, and the requirements reach their suppliers by contract.",
+  "fw.uaeia.who": "Suppliers to UAE federal entities and to critical sector operators. It sits underneath the emirate-level regimes: a Dubai government buyer will ask about DESC's regulation, an Abu Dhabi one about its own, and both sit on this federal baseline.",
+  "fw.uaeia.needs": "Strategy and planning, approved and owned \xB7 Risk assessment, treatment and acceptance \xB7 Awareness and training \xB7 Human resources security across the employment lifecycle \xB7 Legal and regulatory compliance \xB7 Performance evaluation and improvement \xB7 Asset management and classification \xB7 Access control including privileged and remote \xB7 Cryptography: AES-256 at rest, TLS 1.2 or better in transit \xB7 Communications and network security \xB7 Operations security, change and capacity \xB7 Third-party security \xB7 Secure acquisition, development and maintenance \xB7 Incident management with reporting to the authority \xB7 Business continuity",
+  "fw.uaeia.snoopios": "Fifteen controls. Fourteen inherit from the ISO 27001 evidence, and the cryptographic minimums are read directly by the TLS and header checks already running against your domain. Performance evaluation is an attestation with a date.",
+  "fw.uaeia.youdo": "Check your cipher configuration against the named minimums rather than assuming a modern default passes: this is one of the few standards that states the numbers. Find out which emirate-level regime your buyer also applies.",
+  "fw.uaeia.source": "https://tdra.gov.ae/",
+  "attest.clinical_safety.statement": "{org} has appointed a clinical safety officer who is a suitably qualified and experienced clinician, and maintains a hazard log and a clinical safety case report under DCB0129.",
+  "attest.clinical_safety.reference": "The officer's name and registration, and where the hazard log lives",
+  "attest.clinical_safety.hint": "Required for any health IT system placed into service in the NHS, whatever its size. The officer must be a registered clinician; the role cannot be filled by an engineer.",
+  "attest.dspt_submission.statement": "{org} has submitted this year's NHS Data Security and Protection Toolkit at Standards Met, and where its supplier category requires one, has completed the independent Cyber Assessment Framework audit.",
+  "attest.dspt_submission.reference": "The ODS code and the date of the submission",
+  "attest.dspt_submission.hint": "The submission closes on 30 June each year. Standards Met is a contractual requirement under NHS Standard Contract clause 21.2, so without it the trust using your software is in breach.",
+  "attest.accessibility.statement": "{org} has tested the product against WCAG 2.2 level AA and publishes an accessibility statement saying what conforms, what does not, and when the gaps will close.",
+  "attest.accessibility.reference": "Where the accessibility statement is published, and the date it was last tested",
+  "attest.accessibility.hint": "A statement claiming full conformance without a test behind it is the failure an NHS assessor finds most often.",
+  "attest.cloud_location.statement": "{org} has agreed with its cloud provider where each class of data is hosted and processed, and where Saudi rules require it, that data stays inside the Kingdom.",
+  "attest.cloud_location.reference": "The regions in use, and the contract clause that fixes them",
+  "attest.cloud_location.hint": "The Cloud Cybersecurity Controls treat location as a control, not a preference. Get it into the contract rather than the console.",
+  "fw.dtac.name": "NHS DTAC",
+  "fw.dtac.tagline": "The assessment every NHS buyer runs before it can buy your software.",
+  "fw.dtac.summary": "The Digital Technology Assessment Criteria is the standard set of questions an NHS organisation asks a supplier before procuring digital technology. It covers five areas: clinical safety, data protection, technical security, interoperability, and usability and accessibility. It is not a certification and there is no DTAC badge; it is a form the buyer sends and the supplier completes, and a weak answer stops the sale. Two sections catch software companies out. Clinical safety requires a nominated clinical safety officer who is a registered clinician, plus a hazard log and safety case under DCB0129, which is a discipline most product teams have never met. And the data protection section asks for the Data Security and Protection Toolkit at Standards Met, so DTAC and DSPT are answered together or not at all.",
+  "fw.dtac.who": "Any company selling software into the NHS, from a trust pilot upwards. It arrives as a spreadsheet early in procurement, and the answers are reused across every trust you sell to, so it is worth answering once and well.",
+  "fw.dtac.needs": "A clinical safety officer, a hazard log and a safety case under DCB0129 \xB7 A lawful basis, privacy notice, record of processing and DPIA \xB7 The DSPT at Standards Met \xB7 Encryption in transit and at rest, access control and patching \xB7 An annual penetration test with findings closed \xB7 Business continuity and disaster recovery with stated recovery objectives \xB7 Recognised interoperability standards and a documented API \xB7 WCAG 2.2 AA and a published accessibility statement",
+  "fw.dtac.snoopios": "Eight controls. Four inherit the checks and documents already running for UK GDPR and ISO 27001. Four are attestations with a reference, because a clinical safety officer, a DSPT submission, a penetration test and an accessibility test are all things only you can hold.",
+  "fw.dtac.youdo": "Find a clinical safety officer early; it is the longest lead time on this list and cannot be delegated to an engineer. Submit the DSPT, since DTAC asks for it directly. Get the accessibility statement tested rather than asserted.",
+  "fw.dtac.source": "https://digital.nhs.uk/services/digital-technology-assessment-criteria-dtac",
+  "fw.dspt.name": "NHS Data Security and Protection Toolkit",
+  "fw.dspt.tagline": "Annual, contractual, and now audited. Without it your NHS customer is in breach.",
+  "fw.dspt.summary": "The Data Security and Protection Toolkit is an annual self-assessment against the National Data Guardian's ten data security standards, and from 2025/26 it is aligned to the National Cyber Security Centre's Cyber Assessment Framework, which makes it outcome-based rather than a checklist. Submission closes on 30 June each year. Its force comes from contract, not regulation: Standards Met is a requirement of NHS Standard Contract clause 21.2, so an NHS organisation continuing to use a supplier without it is itself in breach. Larger IT suppliers, meaning fifty or more staff or ten million pounds of turnover, are treated as operators of essential services and must additionally complete an independent audit across eleven assertions. Together with Cyber Essentials and DTAC it forms the complete set an NHS supplier is asked for.",
+  "fw.dspt.who": "Any organisation that accesses NHS patient data or provides IT to an NHS body. If you hold a trust contract you almost certainly need it, and the trust will chase you for it because their own compliance depends on yours.",
+  "fw.dspt.needs": "Staff understand their responsibilities for personal confidential data \xB7 Confidentiality in contracts, with consequences \xB7 Annual data security training, recorded \xB7 Access granted on need, reviewed and removed \xB7 Incidents and near misses reviewed and acted on \xB7 Incidents reported and managed \xB7 A tested continuity plan for a data or cyber incident \xB7 No unsupported operating systems, software or browsers \xB7 A tested IT protection strategy \xB7 IT suppliers held to account \xB7 This year's submission at Standards Met, with the independent CAF audit where required",
+  "fw.dspt.snoopios": "Eleven controls. Ten inherit the checks and documents already running, since the ten standards map onto ISO 27001 and UK GDPR almost line for line, and the unsupported-systems standard is answered by the same checks as Cyber Essentials patching. The submission itself is an attestation with your ODS code and date.",
+  "fw.dspt.youdo": "Diarise 30 June, because a lapsed submission is a contractual breach for your customer rather than a tidy-up for you. Work out whether you are a category two supplier and therefore need the independent audit, since that has a long lead time. Keep the training records with dates: the CAF alignment made the toolkit ask for evidence rather than assertions.",
+  "fw.dspt.source": "https://www.dsptoolkit.nhs.uk/",
+  "fw.ccc.name": "Saudi NCA Cloud Cybersecurity Controls",
+  "fw.ccc.tagline": "CCC-2:2024. Written as an extension of the ECC, and it binds the tenant as well as the provider.",
+  "fw.ccc.summary": "The Cloud Cybersecurity Controls are the National Cybersecurity Authority's minimum requirements for cloud computing in Saudi Arabia, issued as an extension to the Essential Cybersecurity Controls and updated on 31 July 2025. What makes them unusual is that they bind two parties: cloud service providers and cloud service tenants. A company running its product on someone else's cloud is a tenant and carries its own set of controls, which is precisely the position of most software businesses. The controls follow the ECC's structure, adding cloud-specific requirements for shared responsibility, tenant segregation, cryptography, backup and the return of data in a usable format at the end of service. Data location is treated as a control rather than a preference, and for some classes of data and some sectors it must remain inside the Kingdom.",
+  "fw.ccc.who": "Any organisation using cloud services in Saudi Arabia, and anyone selling cloud-delivered software to a Saudi government entity or critical infrastructure operator. If your customer is bound by the ECC, their contract will push these controls onto you.",
+  "fw.ccc.needs": "A cloud cybersecurity strategy and policy aligned to the ECC \xB7 Roles split explicitly between provider and tenant \xB7 Cloud risk assessment before adoption and periodically after \xB7 Compliance with the applicable law \xB7 Identity and privileged access management \xB7 Protection of cloud systems and processing facilities \xB7 Network security including tenant segregation \xB7 Cryptography in transit and at rest \xB7 Backup, recovery and return of data in a usable format \xB7 Vulnerability management and penetration testing \xB7 Event logs and monitoring \xB7 Incident management with the provider's notification route agreed \xB7 Continuity for cloud services \xB7 Third-party requirements in the contract, including data removal at the end of service \xB7 Hosting location agreed, in-Kingdom where required",
+  "fw.ccc.snoopios": "Fifteen controls. Fourteen inherit from the ISO 27001 evidence already running, which works because the CCC extends the ECC and the ECC was written from the same material. The hosting location is an attestation, since it is a contract term rather than a configuration.",
+  "fw.ccc.youdo": "Write the shared responsibility split down: the controls assume you know which half is yours and most tenants do not. Get the data location and the end-of-service return into the contract. Check whether your sector requires in-Kingdom hosting before you choose a region.",
+  "fw.ccc.source": "https://nca.gov.sa/en/regulatory-documents/controls-list/ccc/",
+  "fw.nia.name": "Qatar National Information Assurance Policy",
+  "fw.nia.tagline": "Qatar's security standard, and the other half of the pair with its privacy law.",
+  "fw.nia.summary": "The National Information Assurance Policy is Qatar's baseline standard for protecting information, issued under the National Cyber Security Agency and applying to government agencies and to the organisations that serve them and operate critical sectors. It is built around data labelling and classification, from which the handling rules for everything else follow, then works through asset management, risk management, change management, personnel security, access control, cryptography, network security, systems acquisition and development, incident management, business continuity, third-party security and compliance audit. Its shape will be familiar to anyone who has read ISO 27001, which is deliberate. It pairs with the Personal Data Privacy Protection Law: the privacy law governs personal data, the assurance policy governs how the systems holding it are run.",
+  "fw.nia.who": "Suppliers to Qatari government entities and to operators in the critical sectors, plus anyone whose Qatari customer flows the requirements down. Neither Vanta nor Drata carries it, and the enterprise buyers who ask for it tend to be substantial.",
+  "fw.nia.needs": "Data labelling and classification with handling rules \xB7 Asset inventory and owners \xB7 Risk assessment and treatment \xB7 Change management \xB7 Personnel security: screening, terms and awareness \xB7 Access control with privilege management \xB7 Cryptography for stored and transmitted information \xB7 Network security and boundary protection \xB7 Secure acquisition, development and maintenance \xB7 Incident management with reporting to the authority \xB7 Business continuity \xB7 Third-party security requirements, monitored \xB7 Periodic compliance review and audit",
+  "fw.nia.snoopios": "Thirteen controls. Twelve inherit from the ISO 27001 evidence already running, because the policy follows the same structure. The periodic compliance review is an attestation with a date.",
+  "fw.nia.youdo": "Start with the classification scheme, because in this policy everything else hangs off it and it is the part nobody else can write for you. Keep the review dated: the compliance domain asks when, not whether.",
+  "fw.nia.source": "https://www.ncsa.gov.qa/",
+  "attest.sg_dpo.statement": "{org} has appointed a data protection officer as the PDPA requires and has made their business contact information publicly available.",
+  "attest.sg_dpo.reference": "The DPO's business contact and where it is published",
+  "attest.sg_dpo.hint": "The role can be held alongside another job and can be outsourced, but every organisation must have one and the contact must be findable.",
+  "attest.in_significant.statement": "{org} has determined whether it is a Significant Data Fiduciary and, if it is, has appointed an India-based data protection officer, commissioned an independent data auditor and carried out a data protection impact assessment.",
+  "attest.in_significant.reference": "The determination, and the DPO and auditor if one applies",
+  "attest.in_significant.hint": "The Central Government designates significant fiduciaries on volume and sensitivity of data and risk to sovereignty and public order. Most software companies are not one, but the determination should be written down.",
+  "attest.qc_officer.statement": "{org} has designated a person in charge of the protection of personal information and published their title and contact details. By default this is the person with the highest authority in the organisation unless the role has been delegated in writing.",
+  "attest.qc_officer.reference": "The title and contact published, and the written delegation if any",
+  "attest.qc_officer.hint": "Quebec is unusual: if you appoint nobody, the law appoints your chief executive.",
+  "attest.ccpa_optout.statement": "{org} either does not sell or share personal information as California defines it, or provides a Do Not Sell or Share My Personal Information link and honours the Global Privacy Control browser signal.",
+  "attest.ccpa_optout.reference": "Where the link is, or a note that nothing is sold or shared",
+  "attest.ccpa_optout.hint": "Sharing includes cross-context behavioural advertising, so most analytics and advertising pixels count even where no money changes hands.",
+  "fw.sgpdpa.name": "Singapore PDPA",
+  "fw.sgpdpa.tagline": "Consent-based, with a named officer everyone can find and a three-day breach clock.",
+  "fw.sgpdpa.summary": "Singapore's Personal Data Protection Act has applied since 2012 and was substantially amended in 2020. It is built on consent with a set of obligations around it: notification of purposes, purpose limitation, access and correction, accuracy, protection, retention limitation and transfer limitation. Two features stand out for a foreign company. Every organisation must appoint a data protection officer and publish their business contact, which is enforced and easy for the regulator to check. And since February 2021 breach notification is mandatory: the Personal Data Protection Commission within three calendar days of assessing a breach as notifiable, and affected individuals at the same time. The 2020 amendments also added exceptions for legitimate interests and business improvement, so it is no longer consent alone, and raised the financial penalty ceiling.",
+  "fw.sgpdpa.who": "Any organisation collecting personal data in Singapore, including from outside it. Singapore is the usual first Asian market for a UK software business, and the DPO requirement catches people out because there is no size threshold.",
+  "fw.sgpdpa.needs": "Notification of purposes at or before collection \xB7 Consent per purpose, with a withdrawal route \xB7 Purpose limitation \xB7 Access and correction requests answered \xB7 Accuracy \xB7 Reasonable security arrangements \xB7 Retention limitation \xB7 Transfer limitation with a comparable standard abroad \xB7 Breach notification to the PDPC within three days and to individuals \xB7 Written policies made available on request \xB7 A data protection officer with published contact details",
+  "fw.sgpdpa.snoopios": "Eleven controls. Ten inherit the checks and documents that already evidence UK GDPR, because the obligations overlap almost completely. The data protection officer is an attestation with their published contact.",
+  "fw.sgpdpa.youdo": "Appoint the officer and publish the contact, because that is the most visible failure. Tighten the breach runbook: three calendar days is shorter than seventy-two hours once a weekend is involved. Check the Do Not Call provisions separately if you send marketing messages to Singapore numbers.",
+  "fw.sgpdpa.source": "https://www.pdpc.gov.sg/overview-of-pdpa/the-legislation/personal-data-protection-act",
+  "fw.indpdp.name": "India DPDP Act",
+  "fw.indpdp.tagline": "Act 22 of 2023 with the 2025 Rules. Consent-first, and strict about children.",
+  "fw.indpdp.summary": "India's Digital Personal Data Protection Act was passed in 2023 and given effect by the DPDP Rules in 2025. It applies to digital personal data processed in India, and to processing outside India connected with offering goods or services to people in India. Consent must be free, specific, informed, unconditional and unambiguous, with a notice in English or any language in the Eighth Schedule, and it introduces the Consent Manager as a registered intermediary. Data principals get access, correction, erasure, grievance redressal and, unusually, nomination: the right to name someone to exercise their rights if they die or become incapacitated. Two duties bite hardest on software companies. Anyone under eighteen is a child, requiring verifiable parental consent, with tracking and targeted advertising to children prohibited outright. And an entity the government designates a Significant Data Fiduciary must appoint a data protection officer based in India, commission an independent audit and carry out impact assessments.",
+  "fw.indpdp.who": "Any company with Indian users or customers. The under-eighteen rule makes it particularly sharp for education, gaming and consumer products, where the rest of the world draws the line at thirteen or sixteen.",
+  "fw.indpdp.needs": "A notice in English or a scheduled language \xB7 Free, specific, informed, unconditional and unambiguous consent, or a legitimate use \xB7 Purpose limitation and data minimisation \xB7 Access, correction, erasure, nomination and grievance redressal \xB7 A published grievance contact \xB7 Reasonable security safeguards \xB7 Breach notification to the Data Protection Board and every affected person \xB7 Erasure when consent is withdrawn or the purpose is served \xB7 Processor contracts \xB7 Verifiable parental consent for under-eighteens, with no tracking or targeted advertising to them \xB7 Significant Data Fiduciary duties where designated",
+  "fw.indpdp.snoopios": "Eleven controls. Nine inherit from the UK GDPR evidence. Two are attestations with a reference: guardian consent for under-eighteens, and whether you have been designated a Significant Data Fiduciary along with the duties that follow.",
+  "fw.indpdp.youdo": "Decide how you verify parental consent, because India means under eighteen and that is a product decision rather than a policy one. Write down your Significant Data Fiduciary determination even when the answer is no. Note that breach notification has no harm threshold: every personal data breach is notifiable.",
+  "fw.indpdp.source": "https://www.meity.gov.in/data-protection-framework",
+  "fw.pipeda.name": "Canada PIPEDA",
+  "fw.pipeda.tagline": "Ten principles rather than articles, and a breach register you must keep for two years.",
+  "fw.pipeda.summary": "The Personal Information Protection and Electronic Documents Act governs personal information in the course of commercial activity across Canada, except where a province has substantially similar legislation of its own, which Quebec, Alberta and British Columbia do. Rather than numbered articles it sets ten fair information principles in Schedule 1: accountability, identifying purposes, consent, limiting collection, limiting use and disclosure and retention, accuracy, safeguards, openness, individual access, and challenging compliance. Since 2018 a breach of security safeguards must be reported to the Office of the Privacy Commissioner and to affected individuals where it creates a real risk of significant harm, and separately every breach must be recorded and the record kept for twenty-four months whether or not it was reportable. That record-keeping duty is the one most often missed.",
+  "fw.pipeda.who": "Any organisation handling personal information commercially in Canada, including from abroad where there is a real and substantial connection. Reform has been discussed for years but PIPEDA remains the federal law in force.",
+  "fw.pipeda.needs": "A designated accountable individual \xB7 Purposes identified at or before collection \xB7 Knowledge and consent \xB7 Collection limited to what is necessary \xB7 Limits on use, disclosure and retention \xB7 Accuracy \xB7 Safeguards proportionate to sensitivity \xB7 Openness about policies and practices \xB7 Individual access and the ability to challenge accuracy \xB7 A complaints procedure to the accountable individual \xB7 Breach reporting to the Privacy Commissioner and individuals on real risk of significant harm, and a register of every breach kept for 24 months",
+  "fw.pipeda.snoopios": "Eleven controls, one for each principle plus breach. Every one inherits from the UK GDPR evidence, since the principles are the same obligations under older names.",
+  "fw.pipeda.youdo": "Keep the breach register even for incidents you decide are not reportable, because the register is a separate duty from the report and is what an investigation asks for first. Check whether Quebec, Alberta or British Columbia law applies to you instead of, or as well as, the federal act.",
+  "fw.pipeda.source": "https://www.priv.gc.ca/en/privacy-topics/privacy-laws-in-canada/the-personal-information-protection-and-electronic-documents-act-pipeda/",
+  "fw.law25.name": "Quebec Law 25",
+  "fw.law25.tagline": "The strictest regime in North America, and it appoints your chief executive if you do not.",
+  "fw.law25.summary": "Quebec's Law 25, originally Bill 64, came into force in stages between 2022 and September 2024 and is the most demanding privacy law in North America. It requires a designated person in charge of the protection of personal information whose title and contact are published, and if you designate nobody the role falls by default to the person with the highest authority in the organisation. It requires published governance policies, privacy by default at the highest level of confidentiality with no action by the user, a privacy impact assessment for any acquisition or overhaul of an information system and before any transfer outside Quebec, and since September 2024 a right to portability in a structured, commonly used technological format. Confidentiality incidents must be reported to the Commission d'acc\xE8s \xE0 l'information and to affected people where there is a risk of serious injury, and a register of every incident must be kept. Penalties reach twenty-five million Canadian dollars or four per cent of worldwide turnover.",
+  "fw.law25.who": "Anyone doing business in Quebec, which for a software company means any Quebec customer. It applies regardless of where you are established, and the transfer assessment means hosting outside Quebec is itself a documented decision.",
+  "fw.law25.needs": "A published person in charge of personal information \xB7 Published governance policies in clear language \xB7 Information at collection, including where technology identifies or profiles \xB7 Manifest, free and enlightened consent for specific purposes \xB7 Privacy by default at the highest confidentiality \xB7 Impact assessments for new systems and for transfers outside Quebec \xB7 Access, rectification, de-indexing and portability \xB7 Transparency and the right to submit observations on automated decisions \xB7 Confidentiality incident notification and a register of every incident \xB7 Assessment before transferring outside Quebec \xB7 Destruction or anonymisation when the purpose is achieved",
+  "fw.law25.snoopios": "Eleven controls. Ten inherit from the UK GDPR evidence, since Law 25 was written with the GDPR open on the desk. The person in charge is an attestation, because the default rule makes it consequential: name someone, or the law has already named your chief executive.",
+  "fw.law25.youdo": "Designate the person in charge and publish the title, first. Write the transfer assessment for wherever you host, since that is a Quebec-specific document with no GDPR equivalent. Check that any automated decision affecting a person can be explained and that they can reach a human.",
+  "fw.law25.source": "https://www.cai.gouv.qc.ca/",
+  "fw.ccpa.name": "California CCPA and CPRA",
+  "fw.ccpa.tagline": "Opt-out rather than opt-in, and sharing counts even when no money changes hands.",
+  "fw.ccpa.summary": "The California Consumer Privacy Act, as amended by the Privacy Rights Act, applies to for-profit businesses that do business in California and meet one of three thresholds: gross annual revenue above twenty-five million dollars, buying or selling the personal information of a hundred thousand or more consumers or households, or deriving half or more of revenue from selling or sharing personal information. It is opt-out rather than opt-in: you may collect, but a consumer can tell you to stop selling or sharing. Sharing is defined to include cross-context behavioural advertising, which catches most analytics and advertising pixels even where nothing is paid. Rights cover knowing, deleting, correcting, opting out and limiting the use of sensitive personal information, with no discrimination for exercising them. Businesses must honour the Global Privacy Control signal, contract properly with service providers, and hold personal information no longer than the disclosed purpose requires.",
+  "fw.ccpa.who": "Businesses meeting one of the three thresholds. Below them the act does not apply, but American enterprise buyers routinely ask about it anyway, and other states have copied the structure closely enough that answering California answers most of them.",
+  "fw.ccpa.needs": "Notice at collection with categories, purposes, sale or sharing and retention \xB7 A privacy policy refreshed at least annually \xB7 The right to know, with a twelve-month lookback \xB7 The right to delete, passed on to service providers \xB7 The right to correct \xB7 An opt-out of sale and sharing, with a link and the Global Privacy Control honoured \xB7 The right to limit use of sensitive personal information \xB7 No discrimination \xB7 Service provider and contractor contracts with the required terms \xB7 Reasonable security \xB7 Retention limited to the disclosed purpose",
+  "fw.ccpa.snoopios": "Eleven controls. Ten inherit from the UK GDPR evidence, because the underlying obligations are close cousins even where the vocabulary differs. The opt-out is an attestation, since only you know whether you sell or share as California defines it.",
+  "fw.ccpa.youdo": "Work out honestly whether you share for cross-context behavioural advertising, because most companies that say no are running a pixel that says yes. Honour the Global Privacy Control, which is a technical change rather than a policy one. Check the thresholds before assuming the act applies at all.",
+  "fw.ccpa.source": "https://cppa.ca.gov/regulations/",
+  "attest.eu_rep.statement": "{org} has appointed a representative in the Union under Article 27, or is established in the Union, or falls within the exemption for occasional processing that is not large-scale and involves no special-category data.",
+  "attest.eu_rep.reference": "The representative's name and member state, or the reason none is required",
+  "attest.eu_rep.hint": "A UK company offering goods or services to people in the EU, or monitoring their behaviour, usually needs one. It must be named in the privacy notice.",
+  "attest.nis2_entity.statement": "{org} has determined whether it is an essential or an important entity under NIS 2, in which member state it is registered, and has registered with that state's competent authority where required.",
+  "attest.nis2_entity.reference": "Essential or important, the member state, and the registration reference",
+  "attest.nis2_entity.hint": "Managed service providers, cloud providers and data centre services are named in Annex I. Registration deadlines are set by each member state, not by the directive.",
+  "attest.nis2_management.statement": "The management body of {org} has approved the cybersecurity risk-management measures, oversees their implementation, and has taken training sufficient to identify risks and assess management practices, as Article 20 requires.",
+  "attest.nis2_management.reference": "Date of the approval and of the most recent training",
+  "fw.eugdpr.name": "EU GDPR",
+  "fw.eugdpr.tagline": "Regulation 2016/679. The same law as the UK's, minus the British additions, plus a representative.",
+  "fw.eugdpr.summary": "The EU General Data Protection Regulation applies to any organisation established in the Union, and to any organisation outside it that offers goods or services to people in the Union or monitors their behaviour. Since Brexit the UK and EU regimes have diverged slightly but the articles are the same and so is the evidence: a lawful basis per purpose, a privacy notice, records of processing, processor contracts, security proportionate to risk, breach notification within seventy-two hours, impact assessments for high-risk processing, a data protection officer where required, and transfers on a lawful mechanism. Two things differ for a British company. There is no ICO registration fee and no Data (Use and Access) Act complaints duty, and instead Article 27 requires a representative inside the Union unless you are established there. Cookies are governed by the ePrivacy Directive as each member state implemented it, rather than by PECR.",
+  "fw.eugdpr.who": "Any company selling into the EU, which for most UK software businesses means from the first Irish, German or Dutch customer. If you already evidence UK GDPR you are almost entirely there.",
+  "fw.eugdpr.needs": "A lawful basis per purpose \xB7 A privacy notice naming the controller and, where required, the EU representative \xB7 Records of processing \xB7 Processor contracts and a sub-processor register \xB7 Security appropriate to the risk \xB7 Breach notification to the supervisory authority within 72 hours \xB7 A DPIA for high-risk processing \xB7 A data protection officer where required \xB7 Transfers on a lawful mechanism \xB7 Cookie consent under the local ePrivacy implementation \xB7 A representative in the Union under Article 27",
+  "fw.eugdpr.snoopios": "Fifteen controls. Fourteen inherit the checks and documents that already evidence UK GDPR, because the articles are the same law. The Article 27 representative is an attestation with a reference, since only you know whether you are established in the Union or exempt.",
+  "fw.eugdpr.youdo": "Decide whether you need an Article 27 representative and name them in the privacy notice. Identify your lead supervisory authority if you are established in more than one member state. Check how the country you sell into implemented the ePrivacy rules, because consent requirements are not uniform.",
+  "fw.eugdpr.source": "https://eur-lex.europa.eu/eli/reg/2016/679/oj",
+  "fw.nis2.name": "NIS 2 Directive",
+  "fw.nis2.tagline": "Directive 2022/2555. Security duties with personal liability for management, transposed country by country.",
+  "fw.nis2.summary": "NIS 2 replaced the original network and information security directive and widened it considerably. It divides organisations into essential and important entities across eighteen sectors, and Annex I names managed service providers, managed security service providers, cloud computing services, data centre services and content delivery networks, which is how a software company finds itself in scope. Article 21 sets ten minimum measures, from risk analysis and incident handling to supply chain security, cryptography and multi-factor authentication. Article 20 makes the management body approve and oversee those measures and requires them to be trained, with member states able to hold them personally liable. Article 23 requires an early warning within twenty-four hours of a significant incident and a full notification within seventy-two. Because it is a directive rather than a regulation, the detail, the registration process and the penalties come from each member state's transposition, and those differ.",
+  "fw.nis2.who": "Managed service providers, cloud and hosting providers and data centre operators above the size thresholds, plus anyone in the eighteen listed sectors. Also, in practice, their suppliers: the supply chain measure pushes the requirements down a tier, so a smaller software vendor meets NIS 2 through its customer's contract long before it meets it directly.",
+  "fw.nis2.needs": "Risk analysis and information system security policies \xB7 Incident handling \xB7 Business continuity, backup and crisis management \xB7 Supply chain security \xB7 Security in acquisition, development and maintenance, with vulnerability handling and disclosure \xB7 Assessment of the measures' effectiveness \xB7 Cyber hygiene and security training \xB7 Cryptography and encryption policies \xB7 Human resources security, access control and asset management \xB7 Multi-factor authentication and secured communications \xB7 Management approval, oversight and training \xB7 Early warning within 24 hours and notification within 72 \xB7 Registration with the competent authority of your member state",
+  "fw.nis2.snoopios": "Thirteen controls. Ten of the eleven technical ones inherit the checks and documents that already evidence ISO 27001, because Article 21 was written from the same material. Three are attestations: whether you are essential or important and where you are registered, that your management body approved and was trained on the measures, and the periodic assessment of effectiveness.",
+  "fw.nis2.youdo": "Work out which member state you register in and whether you are essential or important, because the directive does not tell you and the transpositions differ. Get the management approval and training recorded with dates, since Article 20 is the clause with personal liability attached. Build the twenty-four hour early warning into the breach runbook: it is much tighter than GDPR's seventy-two.",
+  "fw.nis2.source": "https://eur-lex.europa.eu/eli/dir/2022/2555/oj",
+  "fw.iso27701.name": "ISO/IEC 27701",
+  "fw.iso27701.tagline": "The privacy extension to ISO 27001. One certificate that covers security and personal data together.",
+  "fw.iso27701.summary": "ISO/IEC 27701 extends an ISO 27001 information security management system into a privacy information management system. You cannot hold it alone: it is certified alongside or after 27001, and it adds privacy-specific requirements to the management system in clause 5, privacy-specific guidance on the Annex A controls in clause 6, and then two separate sets of obligations, clause 7 for when you act as a controller and clause 8 for when you act as a processor. Most software companies are both, depending on the data. Its value is translation: it maps its controls to GDPR articles, so an auditor and a customer can see one certificate rather than a certificate plus a separate privacy argument. It is the standard a European or Gulf enterprise buyer asks for when they want assurance about personal data specifically rather than security generally.",
+  "fw.iso27701.who": "Anyone already going for ISO 27001 who processes personal data on behalf of customers, which is most software businesses. It is the cheapest way to turn a security certificate into a privacy one, because the management system is already there.",
+  "fw.iso27701.needs": "An ISO 27001 management system to extend \xB7 The controller and processor roles identified, with the applicable law \xB7 Privacy risk assessment and impact assessment \xB7 Accountability for privacy, and a point of contact \xB7 Awareness and training covering personal data \xB7 Classification and handling of personal data \xB7 Access control over systems holding it \xB7 Logging and monitoring \xB7 Secure transfer \xB7 Supplier arrangements where a supplier processes it \xB7 Privacy incident management and notification \xB7 Controller duties: lawful basis, data subject rights, privacy by design, transfers \xB7 Processor duties: acting on instructions, sub-processors, assisting the controller",
+  "fw.iso27701.snoopios": "Sixteen controls at clause level. Every one inherits from the ISO 27001 and GDPR evidence you already have, because that is precisely what the standard is: the same management system with the privacy requirements named. Nothing new to connect.",
+  "fw.iso27701.youdo": "Get ISO 27001 first, or at the same time; 27701 cannot stand alone. Decide control and processor scope for each kind of data you hold, because clauses 7 and 8 apply differently. The certification body must be accredited for 27701 specifically, not only for 27001.",
+  "fw.iso27701.source": "https://www.iso.org/standard/71670.html",
+  "fw.nistcsf.name": "NIST Cybersecurity Framework 2.0",
+  "fw.nistcsf.tagline": "The American vocabulary for security posture. Not certifiable, frequently demanded by name.",
+  "fw.nistcsf.summary": "The NIST Cybersecurity Framework is a voluntary structure published by the United States National Institute of Standards and Technology. Version 2.0, released in February 2024, added Govern as a sixth function alongside Identify, Protect, Detect, Respond and Recover, and widened the audience from critical infrastructure to organisations of any size. Under the six functions sit categories such as asset management, identity and access control, continuous monitoring and incident recovery. There is no certification and no auditor: you assess yourself against the categories and describe your current and target profiles. Its value is as a shared language. US enterprise procurement and cyber insurers ask for a CSF profile by name, and it maps cleanly onto ISO 27001 and SOC 2, so the same evidence answers all three.",
+  "fw.nistcsf.who": "Anyone selling to a US enterprise or public body, and increasingly anyone renewing cyber insurance. Also useful internally as the plain-English frame for a security programme, because its six functions are easier to explain to a board than an Annex A control list.",
+  "fw.nistcsf.needs": "Govern: strategy, expectations and policy, including supply chain risk \xB7 Identify: asset inventory and risk assessment \xB7 Protect: identity and access control, data security, platform security, infrastructure resilience \xB7 Detect: continuous monitoring and adverse event analysis \xB7 Respond: incident management and reporting \xB7 Recover: recovery plan execution and communication \xB7 A current and a target profile, and the gap between them",
+  "fw.nistcsf.snoopios": "Fourteen controls, shown at category level rather than across all the subcategories, because that is the level at which a buyer's questionnaire asks. Every one inherits from the ISO 27001 evidence already running, since the two map closely.",
+  "fw.nistcsf.youdo": "Write the current and target profiles, which are the part of the framework nobody can generate for you: they say what your risk appetite is and where you intend to be. Nothing here is certified, so treat it as a way to structure and explain the programme rather than a badge to earn.",
+  "fw.nistcsf.source": "https://www.nist.gov/cyberframework",
+  "coverage.locked.title": "Not on this plan",
+  "coverage.locked.body": "These regimes are not the ones you selected. They read the same checks and the same documents you already have, so switching to one costs you no setup. The pack decides which questions get answered, not what Snoopios looks at.",
+  "coverage.locked.cta": "See what each plan includes",
+  "settings.password.title": "Password",
+  "settings.password.body": "Changing it signs out nothing else, because a session is per browser. If you think someone else has one, change the password and then delete the account's other sessions by signing out everywhere from each device.",
+  "settings.password.current": "Current password",
+  "settings.password.new": "New password",
+  "settings.password.confirm": "Confirm new password",
+  "settings.password.submit": "Change password",
+  "settings.password.saved": "Password changed.",
+  "settings.password.error": "The password could not be changed. Try again.",
+  "settings.password.error.current": "That current password is not right.",
+  "settings.password.forgot": "Forgotten it? Sign out and use the reset link on the sign-in page.",
+  "settings.rights.title": "Your data and your rights",
+  "settings.rights.body": "Snoopios holds your name, your email address, the organisation and projects you created, the evidence your checks collected, and the documents you uploaded. What each connected service is read for is listed in the privacy notice.",
+  "settings.rights.list": "Get a copy of everything, using the download above \xB7 Correct your name here, or ask us to correct anything else \xB7 Delete the account and everything in it, below \xB7 Object to a use, or ask us to restrict one, by email \xB7 Ask a question about any of it and get an answer within one month",
+  "settings.rights.notice": "Read the privacy notice",
+  "settings.rights.contact": "Ask about your data",
+  "settings.complaints.title": "If you are unhappy with how we handle it",
+  "settings.complaints.body": "Write to us first at the address above and we will answer within 30 days, telling you what we did and why. If our answer does not satisfy you, you can complain to the Information Commissioner's Office, the UK regulator, at ico.org.uk, and complaining to us first does not affect that right.",
+  "settings.complaints.ico": "Complain to the ICO",
+  "tier.free.f5": "Documents are drafted but cannot be exported",
+  "tier.solo.f6": "Ingest keys for `npx snoopios run --push` from your own machine or CI",
+  "tier.studio.f5": "Provider reports page for the controls your hosts hold, not you",
+  "tier.scale.f6": "Priority support",
+  "home.nav.install": "Install app",
+  "home.screens.pick": "Choose a screen",
+  "home.screens.screen": "Screen",
+  "home.screens.prev": "Previous screen",
+  "home.screens.next": "Next screen",
+  "home.screens.pause": "Pause the show",
+  "home.screens.play": "Play the show",
+  "home.stats.baseline": "of controls evidenced before you answer a question",
+  "home.nav.label": "Site",
+  "home.nav.menu": "Open menu",
+  "home.nav.close": "Close menu",
+  "home.nav.cli": "CLI",
+  "home.stats.providers": "providers, from hosting to payroll",
+  "home.stats.checks": "checks, one rule each, never a model",
+  "home.stats.frameworks": "frameworks, UK, EU, US and Gulf",
+  "home.stats.readonly": "reachable to full coverage, from one place",
+  "home.checks.body": "Every provider a small software team actually runs on, grouped by what it does in your business rather than by where it sits in a diagram. Product connectors run hourly from our side with a read-only credential. CLI providers run on your own machine with npx snoopios and never send a token anywhere.",
+  "home.checks.cli": "Runs on the CLI",
+  "home.checks.count": "checks",
+  "home.role.hosting": "Hosting and edge",
+  "home.role.database": "Databases and storage",
+  "home.role.code": "Code and CI",
+  "home.role.identity": "Identity and workspace",
+  "home.role.monitoring": "Monitoring and on-call",
+  "home.role.payments": "Payments",
+  "home.role.domain": "Domain and email",
+  "home.frameworks.body": "Thirty-six frameworks evidenced control by control from the same checks and documents, from UK GDPR to the seven Gulf data protection laws, the security standards, the AI regimes and the children's codes. Grouped into regimes, so you buy the one that applies to you rather than picking standards off a list.",
+  "vault.title": "Documents",
+  "vault.intro": "Everything you hold that no check can read: signed policies, certificates, penetration test reports, contracts, training records, insurance. Upload each once and link it to every control it evidences, across every framework. A dated document reminds you thirty days before it lapses and stops counting the day after.",
+  "vault.count.documents": "documents",
+  "vault.count.expiring": "expiring within thirty days",
+  "vault.count.expired": "expired",
+  "vault.upload.title": "Add a document",
+  "vault.upload.body": "Give it a title, a kind and its dates, then tick the controls it evidences. Each link gets the same deterministic review as the locker: dated, owned, approved, names your organisation, mentions the control's topics. No model decides.",
+  "vault.upload.submit": "Upload and link",
+  "vault.field.file": "File",
+  "vault.field.title": "Title",
+  "vault.field.title.placeholder": "Penetration test report 2026",
+  "vault.field.kind": "Kind",
+  "vault.field.issued": "Issued on",
+  "vault.field.expires": "Expires on",
+  "vault.field.expires.hint": "Leave blank for a document that does not lapse. Certificates, insurance and test reports usually do.",
+  "vault.kind.policy": "Policy or procedure",
+  "vault.kind.certificate": "Certificate",
+  "vault.kind.report": "Report or assessment",
+  "vault.kind.contract": "Contract or agreement",
+  "vault.kind.register": "Register or record",
+  "vault.kind.training": "Training record",
+  "vault.kind.insurance": "Insurance",
+  "vault.kind.other": "Other",
+  "vault.state.undated": "No expiry",
+  "vault.state.current": "Valid until",
+  "vault.state.expiring": "Expires in",
+  "vault.state.days": "days",
+  "vault.state.expired": "Expired",
+  "vault.links.title": "Controls this document evidences",
+  "vault.links.hint": "Open a framework and tick its controls. One document can back the same duty in several frameworks.",
+  "vault.links.already": "linked",
+  "vault.links.none": "Not linked to any control yet, so it evidences nothing.",
+  "vault.link.title": "Link more controls to",
+  "vault.link.submit": "Link the ticked controls",
+  "vault.link.cancel": "Cancel",
+  "vault.link.more": "Link controls",
+  "vault.unlink": "Unlink",
+  "vault.list.title": "Your documents",
+  "vault.empty": "No documents yet. The first is usually a signed information security policy or a penetration test report.",
+  "vault.uploaded": "uploaded",
+  "vault.issued": "issued",
+  "vault.footer": "Files are stored encrypted in the same private bucket as check evidence, under your organisation, and leave with your account. The review reads the file once at upload and once per later link; the text is never stored.",
+  "vault.notice.added": "Document added.",
+  "vault.notice.linked": "controls linked",
+  "vault.notice.passed": "reviewed as pass",
+  "vault.notice.unlinked": "Link removed.",
+  "vault.notice.removed": "Document removed, with its links.",
+  "vault.notice.dates": "The expiry date is before the issue date.",
+  "vault.notice.nolinks": "Tick at least one control to link.",
+  "vault.open": "Documents",
+  "coverage.group.other": "Other frameworks",
+  "coverage.to100.title": "What gets this to 100%",
+  "coverage.to100.none": "Everything is evidenced.",
+  "coverage.to100.attest": "Confirm the statement",
+  "coverage.to100.attach": "Attach a document",
+  "coverage.to100.reports": "Attach your hosts' reports",
+  "coverage.to100.more": "more",
+  "coverage.documents.hint": "Upload once, link to every control it evidences:",
+  "notify.documents.subject": "Documents expiring soon:",
+  "notify.documents.body": "These documents in the vault lapse within thirty days, or already have, for",
+  "notify.documents.in": "in",
+  "notify.documents.days": "days",
+  "notify.documents.expired": "expired",
+  "notify.documents.footer": "An expired document stops evidencing its controls. Upload the renewed one at",
+  "attest.pentest.statement": "{org} has its internet-facing services penetration tested by an independent party at least once a year, and every finding is tracked to closure.",
+  "attest.pentest.reference": "Date of the last test and who ran it",
+  "attest.pentest.hint": "A scan is not a test. Name the firm or the individual and the month.",
+  "attest.support.statement": "{org} publishes, for every supported version of its software, what support and maintenance the customer gets and for how long, including how security updates reach them.",
+  "attest.support.reference": "Where the support statement is published",
+  "attest.eol.statement": "{org} gives customers at least a year's notice before a version of its software stops receiving security updates.",
+  "attest.eol.reference": "Where the support lifecycle is published, or the words 'no version has been retired yet'",
+  "attest.eol.hint": "A continuously deployed SaaS with one live version still needs the statement: it says what happens if the service is withdrawn.",
+  "fw.ecc.name": "Saudi NCA Essential Cybersecurity Controls",
+  "fw.ecc.tagline": "ECC-2:2024. The baseline your Saudi government and critical-infrastructure customers must impose on you.",
+  "fw.ecc.summary": "The Essential Cybersecurity Controls are the National Cybersecurity Authority's minimum requirements for cybersecurity in Saudi Arabia. ECC-2:2024 replaces ECC-1:2018 and has four domains (governance, defence, resilience, and third-party and cloud), 28 subdomains, 108 main controls and 92 subcontrols; the old industrial control systems domain moved to the separate OTCC. It binds government agencies and their affiliated companies inside and outside the Kingdom, and private entities that own, operate or host critical national infrastructure. The NCA strongly encourages every other entity in the Kingdom to adopt it. Compliance is evaluated by self-assessment, periodic reports from the NCA's assessment and compliance tool, and field audits. Subdomain 4-1 requires those entities to write cybersecurity requirements into every third-party contract, including incident communication, secure data removal at the end of service, and an obligation on the supplier to follow the entity's policies, and subdomain 4-2 does the same for cloud and hosting, which is how the ECC reaches a SaaS vendor.",
+  "fw.ecc.who": "Directly: Saudi government entities, their subsidiaries and critical infrastructure operators. In practice: any software company selling to them, because the ECC obliges the buyer to flow its requirements down to you and to review them periodically. Sector regulators build on it: SAMA for finance, the NCA's CCC for critical systems, and the CST for telecoms.",
+  "fw.ecc.needs": "A cybersecurity strategy, policies, defined roles and a periodic review \xB7 Risk management and security in projects \xB7 HR security, awareness and training \xB7 Asset management, identity and access, system hardening \xB7 Email, network, mobile device, data and cryptographic protection \xB7 Backup, vulnerability management and annual penetration testing \xB7 Event logging and monitoring, incident and threat management \xB7 Physical security \xB7 Web application security \xB7 Business continuity with cybersecurity resilience \xB7 Third-party contract requirements and cloud and hosting requirements, with the data returned or removed at the end of service",
+  "fw.ecc.snoopios": "The 28 subdomains as controls. Twelve carry automated checks inherited from the ISO 27001 controls they were written from: access, hardening, email and network, cryptography, backups, vulnerability management, logging, incidents, continuity and supplier controls all read your connected stack hourly. Thirteen are covered by the pack's documents. Physical security is a provider-held control answered by your hosts' reports. Periodic review and penetration testing are attestations with a reference. The full 108 controls are not enumerated: a vendor answers a buyer's ECC questionnaire at subdomain level, and the questionnaire answer bank gives you the wording.",
+  "fw.ecc.youdo": "Book the annual penetration test. Keep the strategy and review cadence real, because the NCA's tool asks for dates. Expect Saudi buyers to require managed security operations located in the Kingdom and data returned in a usable format when a contract ends: put both in your contract template before they ask.",
+  "fw.ecc.source": "https://cdn.nca.gov.sa/api/files/public/upload/86e09090-44e4-481f-bc28-355673607654_ECC--2024-EN.pdf",
+  "fw.sscop.name": "UK Software Security Code of Practice",
+  "fw.sscop.tagline": "DSIT and NCSC, May 2025. Fourteen principles for anyone who sells software.",
+  "fw.sscop.summary": "The Software Security Code of Practice is a voluntary code published by the Department for Science, Innovation and Technology on 7 May 2025, co-designed with the National Cyber Security Centre, and updated in January 2026. It sets fourteen principles in four themes for organisations that develop or sell software to businesses: secure design and development, build environment security, secure deployment and maintenance, and communication with customers. A self-assessment form accompanies it using principles-based assurance, and the government is developing a certification scheme on top of it. It is the successor to the thinking behind the Cyber Security and Resilience Bill's supply-chain duties, and the document UK buyers will increasingly attach to a software procurement.",
+  "fw.sscop.who": "Every software vendor selling into the UK, from a two-person SaaS to an enterprise supplier. It is voluntary today; buyers, insurers and the coming certification scheme are what make it matter. If you sell to the public sector or to a regulated company, expect the self-assessment in the next security questionnaire.",
+  "fw.sscop.needs": "Follow an established secure development framework \xB7 Know what third-party components you ship and assess their risk \xB7 Test software and updates before release \xB7 Secure by design and by default \xB7 Protect the build environment against unauthorised access \xB7 Control and log build changes \xB7 Distribute software securely \xB7 Publish a vulnerability disclosure process \xB7 Detect, prioritise and manage vulnerabilities \xB7 Report vulnerabilities to relevant parties \xB7 Ship timely security updates and notifications \xB7 Tell customers what support and maintenance they get \xB7 Give a year's notice of end of support \xB7 Tell customers about notable incidents",
+  "fw.sscop.snoopios": "Fourteen controls. Ten carry automated checks inherited from the ISO 27001 and Cyber Essentials controls that cover the same ground: branch protection and reviews, dependency updates and vulnerability alerts, secret scanning, build access, TLS, security.txt and on-call coverage. Two are covered by the secure development document. The two customer-communication principles about support levels and end-of-support notice are attestations with a reference to where you publish them.",
+  "fw.sscop.youdo": "Publish a support statement and a lifecycle policy, even for a single continuously deployed version. Keep the disclosure process answered. Fill in the government's self-assessment form; Snoopios gives you the evidence for each principle, not the form.",
+  "fw.sscop.source": "https://www.gov.uk/government/publications/software-security-code-of-practice/software-security-code-of-practice",
+  "fw.isr.name": "Dubai Information Security Regulation (DESC ISR)",
+  "fw.isr.tagline": "Dubai government's security standard. Reaches suppliers through the entities it binds.",
+  "fw.isr.summary": "The Information Security Regulation is the Dubai Electronic Security Center's standard for all Dubai Government entities, formalised under Resolution No. 13 of 2012 and maintained by DESC under Dubai Law No. 11 of 2014. It covers thirteen domains grouped into governance, operation and assurance, sets minimum requirements for information security controls, and is technology neutral. It applies to every Dubai Government entity and to the consultants, contractors and visitors engaged with it, and to government information in any medium. Entities run an applicability review, size the controls to the risk assessment, and keep the cost of controls below the value of the information protected. DESC also publishes an IoT Security Standard, an ICS standard, a biomedical devices standard, a connected vehicle standard and web security policies, and runs a Cloud Service Provider Security Standard for providers hosting government data. The regulation itself is issued to entities on request rather than posted publicly, so this guide is written from DESC's own description.",
+  "fw.isr.who": "Dubai Government and semi-government entities directly. Suppliers, cloud providers and contractors indirectly: a Dubai government customer will send you its ISR-derived requirements, and a cloud provider hosting government data needs DESC's CSP certification. A UK or GCC SaaS selling to Dubai government should expect an ISO 27001-shaped questionnaire with Dubai specifics on data location and incident reporting.",
+  "fw.isr.needs": "Governance: information security management, information asset management, risk management \xB7 Operation: incident and problem management, access management, operations and communications security, system acquisition and development, cryptography, business continuity \xB7 Assurance: human resources security, physical and environmental security, third-party and supplier management, compliance and audit \xB7 An applicability review against the thirteen domains \xB7 Alignment with the DESC CSP Security Standard for anyone hosting government data",
+  "fw.isr.snoopios": "Not evidenced as its own framework: the regulation is distributed on request and versioned by DESC, and its thirteen domains follow ISO 27001, which Snoopios already evidences control by control. Use the ISO 27001 coverage and the questionnaire answer bank for a Dubai government supplier assessment, and the UAE PDPL framework for the personal data side.",
+  "fw.isr.youdo": "Ask the customer for the ISR-derived supplier requirements rather than guessing at the regulation. Decide early whether government data will be hosted in the UAE. If you are a hosting provider, DESC's CSP Security Standard certification is the badge the buyer will ask for.",
+  "fw.isr.source": "https://www.desc.gov.ae/regulations/standards-policies/",
+  "attest.regulations_watch.statement": "{org} checks the UAE Data Office for the Executive Regulations, the penalty schedule and the adequacy list at least every quarter, and will update its breach deadline and transfer basis when they are issued.",
+  "attest.regulations_watch.reference": "Date last checked",
+  "attest.autonomous.statement": "{org} keeps a record of every autonomous or semi-autonomous system, including generative AI, that it uses to process personal data, with the purpose, the human oversight and the data involved, as DIFC Regulation 10 asks, or uses none.",
+  "attest.autonomous.reference": "Where the record lives, or the words 'none used'",
+  "attest.autonomous.hint": "The AI inventory on the roadmap will generate this record from your connected providers.",
+  "attest.qfc_regime.statement": "{org} is not established in the Qatar Financial Centre, or it follows the QFC Data Protection Regulations 2021 and has notified the QFC Data Protection Office.",
+  "attest.qfc_regime.reference": "QFC licence number, or the words 'not in the QFC'",
+  "attest.ksa_register.statement": "{org} is registered on the Saudi National Register of Controllers because the law requires it, or has recorded why registration is not required for its processing.",
+  "attest.ksa_register.reference": "Registration certificate number, or the reason registration is not required",
+  "attest.ksa_register.hint": "Registration is mandatory for public entities, businesses whose main activity is processing personal data, and anyone processing sensitive data. Certificates run up to five years.",
+  "attest.difc_notify.statement": "{org} has filed this year's notification of processing with the DIFC Commissioner of Data Protection and paid the fee.",
+  "attest.difc_notify.reference": "DIFC registration number",
+  "attest.adgm_register.statement": "{org} is registered as a controller with the ADGM Registration Authority and has renewed the registration for the current year.",
+  "attest.adgm_register.reference": "ADGM registration number",
+  "attest.bahrain_notify.statement": "{org} has notified the Bahrain Personal Data Protection Authority of its automated processing, holds prior authorisation for any sensitive, biometric, genetic or monitoring processing, and has appointed a representative in Bahrain if it is established elsewhere.",
+  "attest.bahrain_notify.reference": "Notification or authorisation reference",
+  "attest.bahrain_notify.hint": "Notification may be waived where an accredited Data Protection Guardian is appointed; record the Guardian's registration instead.",
+  "attest.oman_permit.statement": "{org} holds a permit from the Ministry of Transport, Communications and Information Technology for every category of sensitive personal data it processes in Oman, or processes none.",
+  "attest.oman_permit.reference": "Permit reference, or the words 'none processed'",
+  "attest.oman_permit.hint": "The Ministry decides within 45 days; silence is a refusal.",
+  "attest.qatar_permit.statement": "{org} holds a permit from the National Cyber Governance and Assurance Affairs for any personal data of special nature it processes in Qatar, or processes none.",
+  "attest.qatar_permit.reference": "Permit reference, or the words 'none processed'",
+  "attest.qatar_permit.hint": "Data of special nature includes children's data, health, ethnic origin, religion, marital status and criminal record.",
+  "attest.guardian_consent.statement": "{org} obtains a parent's or legal guardian's consent before processing a child's personal data, and uses that data only in the child's best interest.",
+  "attest.guardian_consent.reference": "Where the consent flow lives (a screen, a form, a school agreement)",
+  "attest.guardian_consent.hint": "If no children use the product, say so here and the control is answered.",
+  "fw.uae.name": "UAE Personal Data Protection Law",
+  "fw.uae.tagline": "Federal Decree-Law 45 of 2021. In force since 2022, still waiting for its regulations.",
+  "fw.uae.summary": "The UAE's federal data protection law took effect on 2 January 2022 and created the UAE Data Office as regulator. It follows the GDPR's shape: notices, a lawful basis per purpose with consent as the default, records of processing, processor contracts, security, breach notification, impact assessments, a data protection officer for high-risk processing, and rights answered within a month. Two things make it unusual. Its Executive Regulations, which set the breach deadline, the penalties and the adequacy list, had still not been issued as of September 2026, so the law's six-month compliance clock has never formally started. And it does not apply inside the DIFC and ADGM free zones, which have their own laws, nor to health and banking data covered by sector rules.",
+  "fw.uae.who": "Any company established in the UAE mainland that processes personal data, and any company outside the UAE processing data about people in the UAE. If your entity sits in the DIFC or ADGM, read those guides instead; if you are a UK company selling into Dubai or Abu Dhabi, this law reaches you.",
+  "fw.uae.needs": "A notice before collection covering purposes, recipients, retention, rights and transfers \xB7 Consent per purpose unless a listed exception applies; there is no general legitimate-interests basis \xB7 A record of processing activities \xB7 Written contracts with processors \xB7 Security proportionate to the risk \xB7 Breach notification to the Data Office immediately on becoming aware, and to affected people \xB7 A DPIA for high-risk processing and new technologies \xB7 A DPO where processing is high-risk or large-scale sensitive \xB7 Rights answered within a month, extendable \xB7 Transfers only to adequate countries, under contract, or with explicit consent \xB7 Explicit consent and a DPIA for sensitive data",
+  "fw.uae.snoopios": "Thirteen controls. Twelve are evidenced by the same hourly checks that evidence UK GDPR security and access, and by the privacy notice, record of processing, sub-processor register, retention schedule, breach runbook, requests procedure and DPIA draft generated from your connected stack. One is an attestation with a date: that you are watching the Data Office for the Executive Regulations, penalties and adequacy list, so the framework says they are pending rather than pretending they exist.",
+  "fw.uae.youdo": "Choose a lawful basis per purpose knowing that consent is the default and legitimate interests is not available. Decide whether your processing triggers the DPO duty. Keep a UAE-specific eye on the Data Office: when the regulations land, the deadlines in your breach runbook may need changing.",
+  "fw.uae.source": "https://u.ae/en/about-the-uae/digital-uae/data/data-protection-laws",
+  "fw.difc.name": "DIFC Data Protection Law",
+  "fw.difc.tagline": "Law No. 5 of 2020, amended 2022 and 2025. The Gulf's closest cousin to the GDPR.",
+  "fw.difc.summary": "The Dubai International Financial Centre has its own data protection law, regulator (the Commissioner of Data Protection) and courts. It has six lawful bases including legitimate interests, GDPR-style rights, a record of processing, breach notification as soon as practicable, DPIAs, a UAE-resident DPO for high-risk processing with an annual assessment filed, and transfers under an adequacy list or safeguards, with a documented assessment of remedies in the recipient country since the 2025 amendment. Every controller and processor files an annual notification of processing with the Commissioner. Since 15 July 2025 individuals can sue directly in the DIFC Courts, and Regulation 10 covers the ethical use of autonomous and generative AI systems.",
+  "fw.difc.who": "Any company established in the DIFC, and any company processing personal data within the DIFC as part of a stable arrangement, wherever it is based. Many Dubai tech companies and their UK parents are here without realising the free zone has its own law.",
+  "fw.difc.needs": "Annual notification of processing to the Commissioner, with the fee \xB7 A lawful basis per purpose from the six \xB7 A privacy notice naming the Commissioner as the complaints route \xB7 Record of processing, available for inspection \xB7 Processor contracts \xB7 Security measures \xB7 Breach notification to the Commissioner as soon as practicable \xB7 DPIAs for high-risk processing \xB7 A UAE-resident DPO where required, with an annual assessment \xB7 Transfers under the adequacy list or safeguards plus a remedies assessment \xB7 Rights within a month \xB7 Regulation 10 documentation for autonomous and AI systems",
+  "fw.difc.snoopios": "Thirteen controls. Eleven are evidenced by the same checks and documents as UK GDPR, because the law was written on the same pattern. Two are attestations with a reference: the annual notification with your DIFC registration number, and the Regulation 10 record of autonomous and AI systems, which the AI inventory on the roadmap will generate.",
+  "fw.difc.youdo": "File the notification every year and diarise it. Appoint the DPO if your processing is high-risk. Document the remedies assessment for each transfer destination, including back to a UK parent.",
+  "fw.difc.source": "https://www.difc.com/business/laws-and-regulations/data-protection",
+  "fw.adgm.name": "ADGM Data Protection Regulations 2021",
+  "fw.adgm.tagline": "Abu Dhabi Global Market's law. GDPR-shaped, with paid annual registration.",
+  "fw.adgm.summary": "Abu Dhabi Global Market's Data Protection Regulations 2021 apply to every ADGM-established controller and processor, and to others processing within the ADGM. They mirror the GDPR: six lawful bases, rights, records of processing, processor contracts, security, breach notification within 72 hours where feasible, DPIAs with prior consultation of the Commissioner where residual risk stays high, a UAE-resident DPO for large-scale monitoring or special-category processing, and transfers under the Commissioner's adequacy list, ADGM standard contractual clauses or binding corporate rules. Every entity registers as a controller with the Registration Authority and renews yearly, with a USD 300 fee from 2025. Fines reach USD 28 million and individuals can claim compensation.",
+  "fw.adgm.who": "Any company licensed in the ADGM, from a two-person fintech to a fund. UK founders setting up in Abu Dhabi usually land here.",
+  "fw.adgm.needs": "Annual registration with the Registration Authority \xB7 A lawful basis per purpose \xB7 A privacy notice \xB7 Record of processing \xB7 Processor contracts \xB7 Security measures \xB7 Breach notification within 72 hours \xB7 DPIAs and Commissioner consultation for high residual risk \xB7 A UAE-resident DPO where required \xB7 Transfers under the adequacy list or ADGM clauses \xB7 Rights within the statutory period",
+  "fw.adgm.snoopios": "Twelve controls. Eleven are evidenced by the same checks and documents as UK GDPR. Registration is an attestation with your ADGM registration number.",
+  "fw.adgm.youdo": "Register and renew every year. Decide whether you need the DPO. Use the ADGM's own clauses for transfers rather than EU ones.",
+  "fw.adgm.source": "https://www.adgm.com/operating-in-adgm/office-of-data-protection",
+  "fw.ksa.name": "Saudi Personal Data Protection Law",
+  "fw.ksa.tagline": "Royal Decree M/19, enforced since September 2024. The region's most demanding regime.",
+  "fw.ksa.summary": "Saudi Arabia's PDPL, regulated by SDAIA, has been enforced since 14 September 2024 with Implementing Regulations and Transfer Regulations behind it. It reaches any processing in the Kingdom and any processing of Saudi residents' data from outside. Consent is the default basis, with a documented legitimate-interests basis added in 2023 for non-sensitive data. Sensitive data includes location and credit data, needs explicit consent and can never be used for marketing. A privacy policy with prescribed content is mandatory. Breaches go to SDAIA within 72 hours through the National Data Governance Platform. Rights are answered within 30 days. Certain controllers must register on the National Register of Controllers and register their DPO. Transfers need an adequacy decision, standard clauses, binding common rules or certification, plus a documented transfer risk assessment; sector localisation for banking, telecoms, health and government overrides it. Fines reach SAR 5 million, doubled for repeat, and decisions are published.",
+  "fw.ksa.who": "Any company selling to people or businesses in Saudi Arabia, and any Saudi-established company. Startups launching in Riyadh under a foreign licence are in scope from day one, and the Kingdom's cloud rules may also decide where the database has to live.",
+  "fw.ksa.needs": "A privacy policy with the prescribed content, before collection \xB7 Consent per purpose, or a documented legitimate interest for non-sensitive data \xB7 Explicit consent for sensitive data, never for marketing \xB7 Guardian consent for children \xB7 A record of processing kept five years \xB7 Processor contracts \xB7 Security to NCA and SDAIA standards \xB7 Breach notification to SDAIA within 72 hours \xB7 A DPIA for new products and sensitive data \xB7 A DPO where the 2024 rules require, registered on the platform \xB7 Registration on the National Register of Controllers where required \xB7 Rights answered within 30 days \xB7 Transfers with a lawful mechanism and a transfer risk assessment \xB7 Data destroyed when its purpose ends",
+  "fw.ksa.snoopios": "Fifteen controls. Thirteen are evidenced by the same checks and documents as UK GDPR, with the sensitive-data and destruction controls carried by the DPIA draft, the privacy notice and the retention schedule the pack generates. Two are attestations with a reference: registration on the National Register, and guardian consent for children.",
+  "fw.ksa.youdo": "Decide whether you must register on the National Register and do it before you launch. Check whether your sector or customers require in-Kingdom hosting, because that decides your database region. Write the transfer risk assessment for data flowing back to the UK or EU. Make sure your privacy policy has every item the regulations list.",
+  "fw.ksa.source": "https://sdaia.gov.sa/en/SDAIA/about/Pages/RegulationsAndPolicies.aspx",
+  "fw.qatar.name": "Qatar Personal Data Privacy Protection Law",
+  "fw.qatar.tagline": "Law No. 13 of 2016. The Gulf's first, with a permit system for sensitive data.",
+  "fw.qatar.summary": "Qatar's law has applied since February 2017 and is regulated by the National Cyber Governance and Assurance Affairs within the National Cyber Security Agency, which issued fourteen guidelines in 2020 and 2021 in place of regulations. Consent is the default basis with exceptions including a legitimate-purposes basis. Data of special nature, which expressly includes children's data alongside health, ethnic origin, religion, marital status and criminal record, needs a prior permit from the regulator and explicit consent. The guidelines expect breach notification to the regulator and affected people within 72 hours where serious harm is possible, an impact assessment for special-nature data, and an internal complaints channel. Fines reach QAR 1 million, or QAR 5 million for special-nature data, transfers and children. The Qatar Financial Centre has its own GDPR-style regulations with a Data Protection Office, 72-hour breach notice, 30-day rights and fines to USD 1.5 million.",
+  "fw.qatar.who": "Any company processing personal data electronically in Qatar. Education and family products are squarely in scope because children's data is data of special nature and needs a permit. Companies in the Qatar Financial Centre follow the QFC regulations instead.",
+  "fw.qatar.needs": "A notice before processing and an internal complaints channel \xB7 Consent per purpose or a listed exception \xB7 A permit from the regulator before processing any data of special nature, including children's \xB7 Express guardian approval for children \xB7 Security precautions per the guidelines \xB7 Processor contracts \xB7 Breach notification within 72 hours where serious harm is possible \xB7 An impact assessment for special-nature and high-risk processing \xB7 A privacy contact \xB7 Transfers that cause no serious harm, with the regulator involved for special-nature data \xB7 A retention schedule",
+  "fw.qatar.snoopios": "Fourteen controls. Eleven are evidenced by the same checks and documents as UK GDPR. Three are attestations with a reference: the special-nature permit, guardian consent, and whether the separate QFC regime applies to your entity.",
+  "fw.qatar.youdo": "If you process children's data or any other special-nature data in Qatar, apply for the permit before launch. Set up the complaints channel. Decide whether the QFC regime applies to your entity.",
+  "fw.qatar.source": "https://www.ncsa.gov.qa/",
+  "fw.bahrain.name": "Bahrain Personal Data Protection Law",
+  "fw.bahrain.tagline": "Law No. 30 of 2018 with the 2022 resolutions. Notify the Authority before you process.",
+  "fw.bahrain.summary": "Bahrain's law has applied since August 2019 with the Personal Data Protection Authority as regulator and ten ministerial resolutions of 2022 filling in the detail. It is GDPR-like in its bases, rights and records, and unusual in two ways: automated processing must be notified to the Authority before it starts, and sensitive, biometric or genetic data, monitoring, and transfers to non-listed countries need prior authorisation. Foreign controllers using means in Bahrain must appoint a local representative. Breaches go to the Authority within 72 hours. Transfers are free to a list of about 83 adequate jurisdictions including the EU, UK, US and GCC. A Data Protection Guardian is mandatory where the Authority prescribes, which now includes financial institutions. Individuals can face criminal liability, and companies fines of BHD 20,000 and more.",
+  "fw.bahrain.who": "Any company established in Bahrain, and any foreign company processing personal data with means in Bahrain. Manama's fintech scene and any SaaS with Bahraini customers whose processing runs there.",
+  "fw.bahrain.needs": "Notification to the Authority before automated processing starts \xB7 Prior authorisation for sensitive, biometric or genetic data, monitoring and non-listed transfers \xB7 A representative in Bahrain for foreign controllers \xB7 A lawful basis per purpose \xB7 A notice before processing \xB7 A register of processing operations \xB7 Processor contracts \xB7 Security measures per Resolution 43 \xB7 Breach notification within 72 hours \xB7 A Guardian where prescribed \xB7 Rights answered within the resolution's period \xB7 Transfers to listed jurisdictions or with approval \xB7 Retention limits",
+  "fw.bahrain.snoopios": "Fourteen controls. Thirteen are evidenced by the same checks and documents as UK GDPR. The notification, authorisation and representative duty are one attestation with a reference.",
+  "fw.bahrain.youdo": "Notify the Authority before you switch anything on, and apply for authorisation if you touch sensitive data or monitoring. Appoint a representative if you are established abroad. Check the adequacy list before each transfer destination.",
+  "fw.bahrain.source": "https://www.pdp.gov.bh/",
+  "fw.oman.name": "Oman Personal Data Protection Law",
+  "fw.oman.tagline": "Royal Decree 6/2022, fully enforceable since February 2026. Consent first, permits for sensitive data.",
+  "fw.oman.summary": "Oman's law took effect in February 2023 and its Executive Regulation became fully enforceable on 5 February 2026 after an extended grace period. The regulator is the Ministry of Transport, Communications and Information Technology. Explicit, informed consent is the basis for processing, with only narrow statutory exclusions. Sensitive data (genetic, biometric, health, race, sexual life, beliefs, criminal record) may not be processed without a Ministry permit, decided within 45 days with silence meaning refusal. Children under 18 need guardian approval unless the processing is in their best interest. Controllers designate a data protection officer with published contact details, keep records, report breaches to the Ministry and affected people within 72 hours, and answer rights within 45 days. Transfers need equivalent protection and explicit consent, with Cyber Defence Centre approval for sensitive data. Fines run to OMR 500,000 for unlawful transfers.",
+  "fw.oman.who": "Any company processing personal data in Oman. Education, health-adjacent and family products need the permit conversation before launch.",
+  "fw.oman.needs": "Explicit, informed consent per purpose \xB7 A notice with the DPO's contact details \xB7 A Ministry permit before any sensitive data \xB7 Guardian approval for children under 18 \xB7 A designated DPO \xB7 A record of processing \xB7 Processor contracts \xB7 Security measures per the Regulation \xB7 Breach notification within 72 hours to the Ministry and affected people \xB7 An impact assessment before high-risk processing \xB7 Rights answered within 45 days \xB7 Transfers only with equivalent protection and consent \xB7 Data deleted when its purpose ends",
+  "fw.oman.snoopios": "Fourteen controls. Twelve are evidenced by the same checks and documents as UK GDPR. The sensitive-data permit and guardian consent are attestations with a reference.",
+  "fw.oman.youdo": "Apply for the permit before processing any sensitive data, and allow 45 days. Name the DPO and publish the contact. Build the consent flow as the primary basis rather than relying on contract or interests.",
+  "fw.oman.source": "https://www.mtcit.gov.om/",
+  "fw.kuwait.name": "Kuwait data privacy (CITRA Decision 26 of 2024)",
+  "fw.kuwait.tagline": "No general data protection law yet. The CITRA regulation binds licensed telecom and internet providers.",
+  "fw.kuwait.summary": "Kuwait has no comprehensive personal data protection statute as of September 2026 and no data protection authority. The Communication and Information Technology Regulatory Authority issued a Data Privacy Protection Regulation in 2021 covering any provider of communications or IT services in Kuwait, and replaced it in February 2024 with Decision 26 of 2024, which narrows the scope to CITRA-licensed telecom and internet service providers. That regulation requires explicit consent with Arabic and English disclosures, breach notification to CITRA and affected users within 24 hours, deletion after a contract ends, and disclosure of transfers outside Kuwait. The 2021 Data Classification Policy that imposed localisation was repealed in 2024. For everyone else the Electronic Transactions Law of 2014 and the Cybercrime Law of 2015 set the baseline: penalties for unlawful disclosure, up to three years' imprisonment under the former.",
+  "fw.kuwait.who": "Licensed telecom and internet providers for the CITRA regulation. Other companies with Kuwaiti customers have no data protection statute to comply with yet, but the Electronic Transactions Law, customer contracts and the expectations of Kuwaiti enterprise buyers, which usually mean ISO 27001 and a GDPR-grade privacy programme, still apply.",
+  "fw.kuwait.needs": "For licensed providers: explicit consent with bilingual disclosures, 24-hour breach notification, deletion at contract end, transfer disclosure \xB7 For everyone: the Electronic Transactions Law's confidentiality duties, contract terms on data, and whatever the buyer's own policy demands \xB7 A watching brief for a comprehensive law, which has been discussed but not published",
+  "fw.kuwait.snoopios": "Not evidenced as a framework because there is no general law to evidence. Your UK GDPR coverage is the programme Kuwaiti buyers actually ask to see, and the residency guide covers the transfer disclosure.",
+  "fw.kuwait.youdo": "Run the GDPR-grade programme you already have, state where data lives in your Kuwaiti contracts, and revisit this guide if a law is published.",
+  "fw.kuwait.source": "https://citra.gov.kw/",
+  "home.nav.integrations": "Integrations",
+  "home.nav.stack": "Your stack",
+  "home.nav.research": "Research",
+  "home.nav.blog": "Notes",
+  "home.nav.frameworks": "Frameworks",
+  "home.frameworks.title": "Know what each framework actually asks for",
+  "home.frameworks.cta": "Read the guides",
+  "home.screens.body": "Real screens from a real project, not mock-ups. Every check is code, every result is pass, fail or unknown, and every document cites the checks behind it.",
+  "home.screens.s1": "One project, every platform, every check, with the date it was last observed.",
+  "home.screens.s2": "A check page: what was read, the evidence file and its hash, the fix, and the history.",
+  "home.screens.s3": "A generated document: a live claim badge on every line a check can back, and a plain note where one cannot.",
+  "home.screens.s4": "The public trust page: the same results, without the evidence, for customers to see.",
+  "fw.index.title": "Frameworks, explained",
+  "fw.index.seoTitle": "Compliance frameworks, explained \xB7 Snoopios",
+  "fw.index.body": "What each standard or law asks of a small software team, what Snoopios evidences automatically, and what stays yours to do. Guides, not legal advice.",
+  "fw.index.checked": "Snoopios evidences these",
+  "fw.index.guides": "Guides to what is coming",
+  // ── /integrations and /integrations/<provider> ───────────────────────────
+  // Fifty-five pages generated from lib/provider-pages.ts. The chrome is here;
+  // everything specific to a provider — its checks, the frameworks they
+  // answer, whether the token stays on the customer's machine — is read from
+  // the registry at render, so no sentence here can describe the software
+  // wrongly. {provider} is the provider's display name.
+  // The markdown rendering of the public pages (lib/markdown.ts). One line,
+  // because everything else in those documents is the same deck the HTML uses.
+  "md.canonical": "Canonical HTML version:",
+  "md.framework": "Framework",
+  "md.controls": "Controls evidenced",
+  // ── /stack, the PUBLIC picker ────────────────────────────────────────────
+  // Not the in-app one above (stack.* / "Which platforms does this project run
+  // on?"), which is onboarding and shows connection cards. This one runs before
+  // anyone signs up and shows the checks themselves.
+  "stackpage.title": "What would Snoopios check on your stack?",
+  "stackpage.body": "Pick what you actually run. You will see every check that would run against it, in the wording the product uses, and how much of each framework those checks reach. No sign-up, and nothing here is a score.",
+  "stackpage.meta": "Choose the providers you run and see exactly which checks Snoopios would run against them, and which framework controls those checks evidence.",
+  "stackpage.pick": "Your stack",
+  "stackpage.pick.body": "Choose as many as apply. Your selection lives in the address bar, so the link is shareable.",
+  "stackpage.empty": "Nothing picked yet. Choose a provider above and the checks appear here.",
+  "stackpage.clear": "Clear selection",
+  "stackpage.checks": "Checks that would run",
+  "stackpage.checks.body": "One rule each, with a pass, a fail and a fix, run read-only against your live configuration.",
+  "stackpage.frameworks": "How far that gets you",
+  "stackpage.frameworks.body": "Controls evidenced by these checks, out of each framework\u2019s total. Where two providers answer the same control it is counted once. No framework is finished by checks alone: the rest is documents and attestations, and that is the part that starts once you connect.",
+  "stackpage.providers": "providers",
+  "stackpage.checkcount": "checks",
+  "stackpage.frameworkcount": "frameworks touched",
+  "stackpage.cta": "Run these on your stack",
+  "stackpage.text": "Take this away",
+  "stackpage.text.body": "The same answer as plain text, for a colleague or an agent to read.",
+  "stackpage.nojs": "Works without JavaScript; the selection is held in the URL.",
+  // ── /research ────────────────────────────────────────────────────────────
+  // Measurement we publish. The numbers live in lib/research/*.ts, frozen as
+  // measured; the prose is here so it is reviewed like every other sentence.
+  // ── /blog ────────────────────────────────────────────────────────────────
+  // Chrome only. The posts themselves are in lib/blog/, exempt from the deck
+  // for the same reason the generated documents are.
+  "blog.index.title": "Notes",
+  "blog.index.seoTitle": "Compliance notes, one check at a time \xB7 Snoopios",
+  "blog.index.body": "What we find while building the checks, and what the measurements say. Written when there is something to report rather than to a schedule.",
+  "blog.index.meta": "Notes from Snoopios on email authentication, compliance evidence and what measuring real infrastructure turns up.",
+  "blog.published": "Published",
+  "blog.source": "Draws on",
+  "blog.back": "All notes",
+  "blog.cta": "Check your own domain",
+  "research.index.title": "Research",
+  "research.index.body": "Measurements of public infrastructure, published in full. No organisation is named, because the finding is the distribution and the individual result belongs to the individual.",
+  "research.index.meta": "Original measurement from Snoopios: what public records show about the security posture of defined populations of organisations.",
+  "research.scanned": "Scanned",
+  "research.population": "Population",
+  "research.method": "How this was measured",
+  "research.limits": "What this does not show",
+  "research.ethics": "Why no one is named",
+  "research.reproduce": "Check your own",
+  "research.md.measure": "Measurement",
+  "research.md.result": "Result",
+  "research.cta": "Check your own domain",
+  "research.gcloud.title": "Two in five UK government cloud suppliers cannot stop their email being spoofed",
+  "research.gcloud.standfirst": "Every organisation on G-Cloud 15 publishes an email address for public-sector buyers to contact them on. We looked up what the public DNS says about those addresses. 42.1% of them have no enforcing DMARC policy, and most of that number is not absence but abandonment.",
+  "research.gcloud.headline": "941 of 2,237 suppliers publish no enforcing DMARC policy on the address they give government buyers. A message claiming to come from them can be delivered to a buyer\u2019s inbox, and nothing in the mail system will stop it.",
+  "research.gcloud.finding": "The interesting half is not the suppliers with nothing. It is the 679 who published a DMARC record and left it set to p=none, which does not mean \u201Cnot configured\u201D. It is an instruction: deliver messages that fail authentication anyway. 1,976 suppliers have a DMARC record of some kind; only 1,296 of them enforce it. The work was started and then not finished, which is a harder problem than never having begun, because the record makes it look done.",
+  "research.gcloud.spf": "The same shape appears in the gap between the two records. 2,111 suppliers publish SPF with a fail policy, a record most registrars have offered by default for a decade. 865 of those suppliers publish SPF and still do not enforce DMARC \u2014 and SPF alone stops very little, because it authenticates the envelope rather than the address a person reads.",
+  "research.gcloud.tail": "The remaining measurements are thin across the board, and that is less surprising: CAA, MTA-STS and TLS-RPT are newer, none is required by Cyber Essentials, and none is visible to a buyer. 21 suppliers pass all six. 51 pass none.",
+  "research.gcloud.m.dmarc": "DMARC policy is quarantine or reject",
+  "research.gcloud.m.dmarc.note": "Tells receiving mail servers what to do with a message that fails authentication. Anything other than quarantine or reject means deliver it.",
+  "research.gcloud.m.spf": "SPF record with a fail policy",
+  "research.gcloud.m.spf.note": "Names the servers allowed to send for the domain. Authenticates the envelope, not the address the reader sees.",
+  "research.gcloud.m.rua": "DMARC reports go somewhere",
+  "research.gcloud.m.rua.note": "An address to receive aggregate reports. Without one nobody finds out they are being impersonated.",
+  "research.gcloud.m.tlsrpt": "TLS reporting configured",
+  "research.gcloud.m.tlsrpt.note": "Reports on mail delivered to the domain over an unencrypted connection.",
+  "research.gcloud.m.caa": "CAA record limits certificate issuance",
+  "research.gcloud.m.caa.note": "Names which certificate authorities may issue for the domain. Limits who can impersonate the website.",
+  "research.gcloud.m.mtasts": "MTA-STS in enforce mode",
+  "research.gcloud.m.mtasts.note": "Requires TLS on mail delivered to the domain. Testing mode is not counted: it reports and then delivers anyway.",
+  "research.gcloud.d.monitor": "Publish a record set to p=none, which instructs receivers to deliver failing mail",
+  "research.gcloud.d.absent": "Publish no DMARC record at all",
+  "research.gcloud.d.malformed": "Publish a record a receiver discards as malformed",
+  "research.gcloud.method": "The population is every organisation listed on G-Cloud 15, the current iteration of the UK government\u2019s cloud purchasing framework, enumerated from the public Digital Marketplace listing on 15 September 2026: 2,270 suppliers. Each supplier publishes a contact address for buyers; all 2,270 yielded one, which is why this is a census rather than a sample. Deduplicating gives 2,242 domains, of which 5 are at a mail provider the supplier does not control and are excluded, leaving 2,237. Every record was read from Cloudflare\u2019s public resolver rather than from the suppliers, so the organisations measured carried no load from being measured. Every result that was not a pass was looked up a second time and counted on the second answer: 7,929 rechecks, 2 of which changed, a rate of 0.03%. Twenty-four passes and failures drawn at random were confirmed against a raw DNS lookup, and all twenty-four agreed.",
+  "research.gcloud.limits": "This measures what the public DNS says, which is not the same as whether an organisation is secure. A supplier can enforce DMARC and still be breached, and can lack it and never be impersonated. It says nothing about the systems behind the domain, and nothing about any supplier\u2019s handling of the data it holds. Twenty-three domains could not be resolved for MTA-STS and are excluded from that row rather than counted as failures. The contact address is the one given for public-sector buyers and may not be the domain a supplier sends most of its mail from. Every figure is a snapshot of one day; DNS changes.",
+  "research.gcloud.ethics": "No supplier is named here, and the per-organisation results are not published, kept in this repository, or shared. Every check ran against records any member of the public can look up, and the individual answer belongs to the individual, who can get it for themselves in one command. A distribution tells a buyer and a policymaker something true about a market. A list of names would only tell an attacker where to start.",
+  "research.gcloud.reproduce": "Every check behind these numbers is one the product runs, and you can run the same ones against your own domain without an account, a sign-up or a credential.",
+  "int.index.title": "Integrations",
+  "int.index.seoTitle": "Integrations: every tool Snoopios checks",
+  "int.index.body": "Everything Snoopios can read, grouped by the part of a stack it is. Connect what you already run. Every check is read-only, every answer keeps the provider's own response behind it, and nothing here is a model's opinion.",
+  "int.index.providers": "providers",
+  "int.index.checks": "checks",
+  "int.index.meta": "Every provider Snoopios connects to, from hosting and databases to identity, devices and secrets. Read-only checks, with the evidence behind each answer.",
+  "int.page.back": "All integrations",
+  "int.page.strap": "What Snoopios reads from {provider}, what it proves, and how to connect it.",
+  "int.page.meta": "The read-only checks Snoopios runs on {provider}, and the frameworks they help answer. Evidence behind every result.",
+  "int.page.titlesuffix": "compliance checks and framework coverage",
+  "int.page.chip.checks": "checks",
+  "int.page.chip.frameworks": "frameworks",
+  "int.page.checks": "What Snoopios checks",
+  "int.page.checks.body": "One rule each, with a pass, a fail and a fix. The wording below is the wording the product uses, because both are read from the same deck.",
+  "int.page.frameworks": "Frameworks these checks answer",
+  "int.page.frameworks.body": "The figure beside each name is how many of that framework's controls these checks evidence, out of the total it has. Most providers answer a few controls in many frameworks rather than most of one, and the ratio is there so you can tell which is which. Nothing here is a certification, and no framework is answered by one provider alone.",
+  "int.page.connect": "How to connect",
+  "int.page.readonly": "Read-only, always",
+  "int.page.readonly.body": "Snoopios asks for the narrowest credential {provider} offers, and its own requests are limited to reads in code. Where a provider gives no way to read a token's permissions back, the connection says so rather than claiming otherwise.",
+  "int.page.local": "Runs on your machine",
+  "int.page.local.body": "{provider} issues only all-or-nothing credentials, so Snoopios never holds one. These checks run through the CLI on your own machine, and it is the result that is pushed, never the token.",
+  "int.page.evidence": "Evidence, not a tick",
+  "int.page.evidence.body": "Every answer keeps the raw response it was read from, so a finding can be shown to a customer or an auditor rather than asserted.",
+  "int.page.cta": "Check this on your stack",
+  "fw.index.checked.note": "Every control listed, ticked automatically, by a document, by an attestation, or left to you.",
+  "fw.index.guides.note": "Explained so you can plan; Snoopios does not evidence these yet.",
+  "fw.page.back": "All frameworks",
+  "fw.page.summary": "What it is",
+  "fw.page.who": "Who needs it",
+  "fw.page.needs": "What it requires",
+  "fw.page.snoopios": "What Snoopios does",
+  "fw.page.youdo": "What stays with you",
+  "fw.page.source": "Official source",
+  "fw.page.controls": "Every control, and how it is evidenced",
+  "fw.page.control": "Control",
+  "fw.page.how": "How it is evidenced",
+  "fw.page.by.automated": "Checked automatically",
+  "fw.page.by.document": "Pack document",
+  "fw.page.by.attested": "Attestation",
+  "fw.page.by.provider": "Hosting provider's report",
+  "fw.page.by.manual": "You answer",
+  "fw.page.by.none": "Not yet",
+  "fw.page.disclaimer": "These guides explain what a framework asks for as of the date on this page. They are not legal advice and do not replace an auditor, a certification body or a solicitor.",
+  "fw.page.updated": "Reviewed 8 September 2026",
+  "fw.page.cta": "Start checking your stack",
+  "fw.group.security": "Security standards",
+  "fw.group.privacy": "Privacy law",
+  "fw.group.gulf": "Gulf data protection laws",
+  "fw.group.ai": "AI governance",
+  "fw.group.children": "Children's data",
+  "fw.group.residency": "Where data lives",
+  "fw.gdpr.name": "UK GDPR and the Data Protection Act 2018",
+  "fw.gdpr.tagline": "The law that applies from your first user in the UK.",
+  "fw.gdpr.summary": "UK GDPR is the UK's version of the EU General Data Protection Regulation, kept after Brexit and read alongside the Data Protection Act 2018. It governs any processing of personal data about people in the UK: what you may collect, on what legal basis, how long you keep it, who you share it with, how you protect it, and what people can ask you to do with it. The Data (Use and Access) Act 2025 amended parts of it, including the complaints procedure every controller now needs. The regulator is the ICO, and fines run to \xA317.5 million or 4% of worldwide turnover.",
+  "fw.gdpr.who": "Every organisation that processes personal data about people in the UK, whatever its size, from the day it has one user, one customer or one employee. Most software companies must also register with the ICO and pay the data protection fee.",
+  "fw.gdpr.needs": "A lawful basis for each processing purpose, written down \xB7 A privacy notice that says what you collect, why, for how long and who else sees it \xB7 A record of processing activities (Article 30) \xB7 Contracts with every processor and a list of them \xB7 Appropriate security: encryption, access control, backups, tested restores \xB7 Breach detection and a way to tell the ICO within 72 hours \xB7 A way to answer subject access, erasure and complaint requests within a month \xB7 A transfer mechanism for data leaving the UK \xB7 ICO registration where required",
+  "fw.gdpr.snoopios": "Sixteen controls. Four are checked automatically every hour from your connected stack (encryption in transit, access control, backups, retention). Eleven are evidenced by the documents the pack generates from what is connected: the privacy notice, the Article 30 record, the sub-processor register, the retention schedule, the breach runbook and the requests procedure. One is an attestation: your ICO registration number, recorded with your name and the date.",
+  "fw.gdpr.youdo": "Confirm the ICO registration. Fill in the parts of each document only you know: the purposes, the legal bases you rely on, who your DPO or contact is. Answer requests within a month when they come. Keep the transfer mechanism current if your hosting moves.",
+  "fw.gdpr.source": "https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/",
+  "fw.ce.name": "Cyber Essentials",
+  "fw.ce.tagline": "The UK government's baseline. Often required to sell to the public sector.",
+  "fw.ce.summary": "Cyber Essentials is a UK government scheme run by the NCSC through IASME. It is a self-assessment against five technical controls, verified by a certification body, and renewed yearly. Cyber Essentials Plus adds an independent technical test. It does not cover policies, people or privacy: it is about whether the common attacks are blocked. Public-sector contracts that involve personal data or IT services usually require it, and some insurers ask for it.",
+  "fw.ce.who": "Any organisation, but in practice anyone bidding for UK public-sector or NHS work, agencies whose clients ask for it, and small companies that want the cheapest credible security badge. The self-assessment costs a few hundred pounds.",
+  "fw.ce.needs": "Firewalls: every device and cloud service behind a boundary firewall with no open admin ports \xB7 Secure configuration: default passwords changed, unnecessary services off, auto-run disabled \xB7 User access control: named accounts, least privilege, MFA on every cloud service that offers it \xB7 Malware protection: anti-malware or application allow-listing on every device \xB7 Security update management: supported software only, critical patches within 14 days \xB7 A signed declaration covering every device that touches company data, including staff laptops and phones",
+  "fw.ce.snoopios": "Four of the five controls have automated checks from your connected stack: firewalls and open ports, secure configuration of hosting and DNS, MFA and access on every identity and code provider, and unsupported versions. Malware protection on devices is an attestation, because no cloud API can see a laptop.",
+  "fw.ce.youdo": "Keep the device list honest: laptops, phones and the software on them are in scope. Attest to malware protection. Complete the IASME questionnaire yourself; Snoopios gives you the evidence and the wording for each answer, not the certificate.",
+  "fw.ce.source": "https://www.ncsc.gov.uk/cyberessentials/overview",
+  "fw.soc2.name": "SOC 2",
+  "fw.soc2.tagline": "The report American and enterprise buyers ask for.",
+  "fw.soc2.summary": "SOC 2 is an attestation report written by a licensed CPA firm against the AICPA Trust Services Criteria: security always, plus availability, confidentiality, processing integrity and privacy if you choose them. Type I describes your controls at a point in time; Type II tests that they operated over a period, usually six or twelve months. It is not a certificate and there is no pass mark: the auditor reports exceptions and the reader decides. It costs from around \xA310,000 for a small company, before software.",
+  "fw.soc2.who": "Software companies selling to US enterprises, or to anyone whose procurement team asks for it. A young company rarely needs a full SOC 2 in its first two years; it needs to answer the questionnaire and show evidence. When a deal genuinely blocks on the report, the evidence Snoopios has been collecting is what the auditor asks for first.",
+  "fw.soc2.needs": "Common criteria CC1 to CC9: governance, communication, risk assessment, monitoring, control activities, logical access, system operations, change management, risk mitigation \xB7 Availability: monitoring, incident response, backups and recovery \xB7 Written policies that match what actually happens \xB7 Evidence that controls operated throughout the period: access reviews, change approvals, incident records, vendor reviews \xB7 A description of the system and its boundaries \xB7 An auditor",
+  "fw.soc2.snoopios": "Thirty-eight controls mapped across the security, availability and confidentiality categories. Fifteen are checked automatically against your own accounts: access and multi-factor authentication, change management through reviewed branches, monitoring, backups, encryption in transit, and the vendor inventory. Twenty are evidenced by generated documents with a live claim on every sentence a check can back. Two are statements you confirm, and one is held by your hosting provider and evidenced by their report. The result is an evidence trail with dates and hashes, which is what an auditor samples. Snoopios also drafts the system description an auditor asks for before anything else, Section III of the report, from the same facts.",
+  "fw.soc2.youdo": "Choose an auditor and a period. Run the quarterly access review and record it. Keep incident and change records real. Decide which criteria beyond security you include. Snoopios is the evidence collector and the drafts, not the audit.",
+  "fw.soc2.source": "https://www.aicpa-cima.com/topic/audit-assurance/audit-and-assurance-greater-than-soc-2",
+  "fw.iso.name": "ISO/IEC 27001:2022",
+  "fw.iso.tagline": "The international information security certificate.",
+  "fw.iso.summary": "ISO/IEC 27001 is the international standard for an information security management system (ISMS). Certification means an accredited body has audited that you run a management system: scope, risk assessment, a statement of applicability across the 93 controls in Annex A, internal audits, management review and continual improvement. The 2022 edition regrouped the controls into organisational, people, physical and technological themes. It is more about running the system than about any single technical setting, and it is renewed on a three-year cycle with yearly surveillance audits.",
+  "fw.iso.who": "Companies selling into the UK public sector, Europe, the Middle East or regulated industries, where the certificate is a tender requirement. It is heavier than SOC 2 for a tiny team and rarely the right first step; it is the right step when a contract names it.",
+  "fw.iso.needs": "A defined scope and an information security policy \xB7 A risk assessment and a risk treatment plan \xB7 A statement of applicability covering all 93 Annex A controls \xB7 Asset inventory, access control, cryptography, backups, logging, vulnerability management \xB7 Supplier relationships, incident management, business continuity \xB7 Awareness and training records \xB7 Internal audit and management review \xB7 An accredited certification body",
+  "fw.iso.snoopios": "Ninety-three controls mapped. Twenty-four are checked automatically from your stack. Forty-eight are evidenced by the generated policy set and registers. Nine are attestations. Twelve are held by the hosting provider and evidenced by their report, so the percentage never pretends we checked a door we have never seen.",
+  "fw.iso.youdo": "Run the management system: the risk assessment, the internal audit, the management review, the training. Choose the certification body. Snoopios gives you the technical evidence and the document set that the auditor reads first.",
+  "fw.iso.source": "https://www.iso.org/standard/27001",
+  "fw.iso42001.name": "ISO/IEC 42001:2023",
+  "fw.iso42001.tagline": "The management-system standard for AI. The AI equivalent of 27001.",
+  "fw.iso42001.summary": "ISO/IEC 42001 is the first certifiable international standard for an AI management system (AIMS). It follows the same shape as ISO 27001: context and scope, leadership, an AI policy, risk assessment, an AI system impact assessment, objectives, operational controls from Annex A, monitoring, internal audit and improvement. It applies whether you build models, fine-tune them or simply deploy a third-party model inside your product. Large buyers have started asking for it from AI-heavy suppliers in place of a bespoke AI questionnaire.",
+  "fw.iso42001.who": "Companies whose product makes or shapes decisions with AI: generating content for users, scoring, recommending, classifying people. If your product calls a model provider's API, you are in scope as a deployer. A small team can be certified; the work is proportionate to the number and risk of AI systems.",
+  "fw.iso42001.needs": "An AI policy and a named person accountable for AI \xB7 An inventory of AI systems with their purpose, data and model provider \xB7 An AI risk assessment and an AI system impact assessment for each system (affected people, harms, bias, safety) \xB7 Data governance: provenance, quality, rights to use the data, retention \xB7 Transparency: users told when they interact with AI and what it is for \xB7 Human oversight and a way to override or turn off \xB7 Incident handling for AI failures \xB7 Supplier controls for model providers: their terms, retention, training on your data \xB7 Internal audit and management review",
+  "fw.iso42001.snoopios": "Twelve controls at clause and annex level. Ten inherit from the ISO 27001 and UK GDPR evidence already running, because an AI management system is the same management system with a different subject. Two are attestations: the AI system inventory, and the person accountable for each system's output.",
+  "fw.iso42001.youdo": "Write the AI inventory now, even on one page: every place a model is used, which provider, what data it sees, whether the provider trains on it. Everything else in the standard builds on that list.",
+  "fw.iso42001.source": "https://www.iso.org/standard/42001",
+  "fw.euaiact.name": "EU AI Act",
+  "fw.euaiact.tagline": "The first AI law. Education is named as a high-risk area.",
+  "fw.euaiact.summary": "Regulation (EU) 2024/1689 sorts AI systems by risk. Prohibited practices (social scoring, manipulative systems, some biometric uses) have applied since 2 February 2025. Obligations for general-purpose AI model providers applied from 2 August 2025. Most high-risk obligations apply from 2 August 2026, with the remainder for AI embedded in already-regulated products from 2 August 2027. Annex III lists high-risk uses and includes education and vocational training: systems that decide access or admission, evaluate learning outcomes, steer a person's learning, or monitor prohibited behaviour during tests. Transparency duties apply to chatbots and generated content whatever the risk tier. It applies to providers placing systems on the EU market and to deployers in the EU, wherever the company sits.",
+  "fw.euaiact.who": "Anyone selling AI-enabled software into the EU, including UK companies. Education products that grade, score, recommend a level or proctor are the clearest small-company case of high-risk use. A chatbot or content generator that is not high-risk still owes transparency: tell users it is AI and mark generated content where required.",
+  "fw.euaiact.needs": "Classify each AI system: prohibited, high-risk, limited-risk (transparency), minimal \xB7 High-risk providers: a risk management system, data governance, technical documentation, logging, instructions for deployers, human oversight, accuracy and robustness, a quality management system, conformity assessment and CE marking, registration in the EU database \xB7 High-risk deployers: use per instructions, human oversight by trained people, log keeping, informing affected people, and in some cases a fundamental rights impact assessment \xB7 Transparency for chatbots, deepfakes and generated text \xB7 AI literacy for staff (Article 4, since February 2025) \xB7 Serious incident reporting",
+  "fw.euaiact.snoopios": "Eleven controls covering the high-risk obligations and the transparency duties. Nine inherit from the ISO 27001 and UK GDPR evidence, since logging, accuracy, cybersecurity and data governance are the same controls the Act renames. Two are attestations: the risk classification with its reasoning, and human oversight.",
+  "fw.euaiact.youdo": "Decide the risk tier of each AI feature with the Annex III list open. If any is high-risk, decide whether you are the provider or the deployer, because the obligations differ, and start the technical documentation early. Train the team on AI basics and record it.",
+  "fw.euaiact.source": "https://eur-lex.europa.eu/eli/reg/2024/1689/oj",
+  "fw.nistai.name": "NIST AI Risk Management Framework",
+  "fw.nistai.tagline": "The voluntary US framework buyers cite. Four functions: govern, map, measure, manage.",
+  "fw.nistai.summary": "NIST AI RMF 1.0 (January 2023) is a voluntary framework from the US National Institute of Standards and Technology for managing the risks of AI systems, with a 2024 profile for generative AI. It is organised into four functions: Govern (policies, roles, culture), Map (context, intended use, affected people), Measure (test, evaluate, track metrics for trustworthiness characteristics such as safety, fairness, explainability and privacy), and Manage (prioritise and act on risks, monitor, respond). It is not certifiable; it is a vocabulary US customers and procurement questionnaires use.",
+  "fw.nistai.who": "Companies selling AI features to US customers, and anyone who wants a structured way to think about AI risk without the weight of a management-system standard. It maps well onto ISO 42001, so work done for one serves the other.",
+  "fw.nistai.needs": "Govern: an accountable owner, an AI policy, staff who know their role \xB7 Map: for each system, its purpose, users, affected people, data and known limitations \xB7 Measure: tests for accuracy, bias, safety and privacy, repeated over time, with results recorded \xB7 Manage: a risk register with decisions, monitoring in production, an incident and rollback plan \xB7 Documentation good enough that a customer can read how a system was assessed",
+  "fw.nistai.snoopios": "Nine controls across Govern, Map, Measure and Manage. Eight inherit from the risk assessment, monitoring and incident evidence already running. The AI system inventory is an attestation, and it is the same one ISO 42001 and the EU AI Act ask for, so you write it once.",
+  "fw.nistai.youdo": "Use the four functions as headings for a two-page AI risk note per system. That document answers most US questionnaire sections on AI.",
+  "fw.nistai.source": "https://www.nist.gov/itl/ai-risk-management-framework",
+  "fw.childrens.name": "UK Children's Code (Age Appropriate Design Code) and UK GDPR Article 8",
+  "fw.childrens.tagline": "For any online service likely to be used by under-18s in the UK.",
+  "fw.childrens.summary": "The Children's Code is a statutory code of practice from the ICO under the Data Protection Act 2018. It applies to information society services likely to be accessed by children under 18 in the UK: apps, websites, games, connected toys, learning platforms sold to families or directly to pupils. It sets fifteen standards, among them high privacy by default, data minimisation, no profiling or nudging by default, geolocation off, parental controls made visible to the child, no detrimental use of data, and a data protection impact assessment for the service. Schools themselves are not information society services, but the education technology they buy usually is. Separately, UK GDPR Article 8 sets the age at which a child can consent to online services at 13; below that, a parent must.",
+  "fw.childrens.who": "Any education, family, gaming or creative product used by children in the UK, including business-to-school products where pupils are the users. If a school is the controller and you are its processor, the school's obligations flow to you by contract, and the Code still shapes how the product must behave.",
+  "fw.childrens.needs": "A data protection impact assessment specific to children \xB7 Privacy settings high by default, with off-by-default profiling, geolocation and behavioural advertising \xB7 Only the data needed for the feature the child is using \xB7 Age assurance proportionate to the risk, or treating every user as a child \xB7 Transparency written for the child's age \xB7 Parental controls that the child can see are in use \xB7 No nudges towards weaker privacy \xB7 A lawful basis and, for under-13s, parental consent where consent is the basis \xB7 Retention limits and a way for children or parents to exercise rights",
+  "fw.childrens.snoopios": "Fifteen controls, one for each standard. Thirteen inherit from the UK GDPR evidence, because the Code is the GDPR applied to children rather than a separate law. Two are attestations: how you establish age, and the assessment of how the service affects children by age range.",
+  "fw.childrens.youdo": "Write the DPIA before launch, not after. Decide the age model: everyone treated as a child, or age assurance. Turn off anything that profiles or locates by default. Check every third-party SDK for what it collects from a child's device.",
+  "fw.childrens.source": "https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/childrens-information/childrens-code-guidance-and-resources/",
+  "fw.coppa.name": "COPPA and FERPA (United States)",
+  "fw.coppa.tagline": "Federal rules for children under 13 and for student records.",
+  "fw.coppa.summary": "COPPA, the Children's Online Privacy Protection Act, is enforced by the FTC and applies to online services directed at children under 13, or that knowingly collect their data, wherever the company is based. It requires a clear children's privacy policy, verifiable parental consent before collection, limits on retention and disclosure, and reasonable security. The FTC's 2025 amendments to the COPPA Rule added separate consent for third-party disclosure and a written security programme, with compliance required by April 2026. Schools may consent on parents' behalf for purely educational use. FERPA is the Family Educational Rights and Privacy Act: it governs student education records held by schools that receive federal funds, and reaches vendors through the school-official exception, which requires the vendor to act under the school's direct control, use records only for the authorised purpose and not redisclose. Most US states add their own student privacy laws, such as California's SOPIPA and New York's Education Law 2-d, which often require a signed data privacy agreement per district.",
+  "fw.coppa.who": "Any education or family product with users in the United States. Selling to US schools means FERPA and state agreements; selling to US families means COPPA from the first user under 13.",
+  "fw.coppa.needs": "COPPA: a children's privacy policy, verifiable parental consent (or school consent for education-only use), separate consent for sharing with third parties, data minimisation, retention only as long as needed, a written security programme, and a way for parents to review and delete \xB7 FERPA: a written agreement with each school placing you under its direct control, use of records only for the contracted purpose, no redisclosure, deletion when the contract ends, and breach notification to the school \xB7 State laws: a signed data privacy agreement per district (New York, California and others), a published list of sub-processors, and in some states in-country or in-state hosting expectations for student data",
+  "fw.coppa.snoopios": "Ten controls covering both regimes. Eight inherit from the UK GDPR evidence, since notice, minimisation, access, retention, security and vendor control are the same obligations under different names. Two are attestations: verifiable parental consent, and the school official agreement that FERPA turns on.",
+  "fw.coppa.youdo": "Keep a signed agreement per school or district and know which state's law each falls under. Build the parental-consent flow before the first under-13 user. Log every disclosure to a third party.",
+  "fw.coppa.source": "https://www.ftc.gov/legal-library/browse/rules/childrens-online-privacy-protection-rule-coppa",
+  "fw.residency.name": "Data residency and international transfers",
+  "fw.residency.tagline": "Which countries want data kept at home, and what to have in place when it is not.",
+  "fw.residency.summary": "Two different questions get mixed up. Data residency is where data is stored and processed; a few laws require certain data to stay in the country. Transfer rules are about moving personal data across borders; most laws allow it with a mechanism in place. For a small team on hosted infrastructure the practical facts are: the UK and EU allow transfers with an adequacy decision or standard contractual clauses (the UK's IDTA or Addendum) plus a transfer risk assessment; the United States has no federal residency rule but state student-privacy laws and district contracts sometimes require US hosting; the UAE's federal law restricts transfers to approved countries or contract-based safeguards, and its financial free zones have their own regimes; Saudi Arabia's PDPL allows transfers under conditions after the 2023 amendments but expects sensitive data, including children's, to be handled with care and has sector rules that require in-Kingdom hosting; India's DPDP Act allows transfers except to countries on a government blocklist, with sector regulators stricter; China and Russia require localisation of much personal data; Canadian provinces such as British Columbia and Nova Scotia require public bodies, including schools, to keep personal data in Canada; Australia allows transfers where the recipient is bound to equivalent protection. Education regulators in several countries (for example the UAE's school regulators) add their own expectations for pupil data.",
+  "fw.residency.who": "Any team with users in more than one country, and every education product, because a school's pupils are almost always in one country and the school's regulator will ask where their data is. If your database is in London and your customers are in Dubai, Riyadh or Toronto, this is your question before it is theirs.",
+  "fw.residency.needs": "A map of where each system holds data: database region, file storage, backups, logs, email provider, model providers \xB7 A sub-processor list with the country of each \xB7 For every cross-border flow, the mechanism: adequacy, standard contractual clauses or the UK IDTA, binding corporate rules, or the local equivalent \xB7 A transfer risk assessment where the destination law is weaker \xB7 For markets that require residency, a region or a separate deployment in that country, or a contract that makes the host the controller's approved location \xB7 Contract wording that names the storage location and forbids moving it without notice \xB7 A way to answer a school or regulator in a day",
+  "fw.residency.snoopios": "Partly evidenced. The sub-processor register is generated from your connected providers with the region each one runs in, and the checks record the region of your database and hosting. A transfer register that pairs each flow with its mechanism, and a residency check that flags a resource outside the region you declared for a market, are on the roadmap.",
+  "fw.residency.youdo": "Declare your target markets and pick regions to match before you have customers there. Put the storage location in your customer contract. For pupil data, ask the school's regulator what it expects rather than guessing.",
+  "fw.residency.source": "https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/international-transfers/",
   "conn.datadog.site.placeholder": "datadoghq.com, datadoghq.eu, us3.datadoghq.com, us5.datadoghq.com, ap1.datadoghq.com, ap2.datadoghq.com or uk1.datadoghq.com",
   "conn.local.label": "Run on your machine with the CLI",
   "ingest.title": "Run locally and push",
@@ -4118,2787 +7336,7 @@ var COPY = {
   "run.source.link": "CI run"
 };
 
-// ../lib/checks/providers/github.ts
-async function ownerType(ctx) {
-  if (ctx.ownerType) return ctx.ownerType;
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const r = await ctx.api.get(`/users/${encodeURIComponent(ctx.org)}`);
-  if (r.status !== 200) throw new Error("scope:api.owner");
-  ctx.ownerType = r.json.type === "Organization" ? "org" : "user";
-  return ctx.ownerType;
-}
-async function listRepos(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const max = ctx.maxRepos ?? 30;
-  if (ctx.repos && ctx.repos.length) {
-    const out = [];
-    for (const name4 of ctx.repos.slice(0, max)) {
-      const r2 = await ctx.api.get(`/repos/${ctx.org}/${name4}`);
-      if (r2.status === 200) out.push(r2.json);
-    }
-    return out;
-  }
-  const kind = await ownerType(ctx);
-  const r = await ctx.api.get(kind === "org" ? `/orgs/${ctx.org}/repos?per_page=100&type=all&sort=pushed` : `/user/repos?affiliation=owner&per_page=100&sort=pushed`);
-  if (r.status !== 200) throw new Error("scope:api.repos");
-  const owner = ctx.org.toLowerCase();
-  return r.json.filter((x) => !x.archived && !x.fork).filter((x) => kind === "org" || (x.owner?.login ?? "").toLowerCase() === owner).slice(0, max);
-}
-var org2fa = {
-  code: "github.org.2fa",
-  provider: "github",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5", "iso:5.17"],
-  run: (ctx) => guarded("api.org", async () => {
-    if (!ctx.api) return unknown("api.not_connected");
-    const r = await ctx.api.get(`/orgs/${ctx.org}`);
-    if (r.status !== 200) return unknown("api.org");
-    const org = r.json;
-    if (org.two_factor_requirement_enabled == null) return unknown("api.org_2fa_hidden", { visible: false });
-    const observed = { required: org.two_factor_requirement_enabled };
-    return observed.required ? pass(observed, org) : fail(observed, org);
-  })
-};
-var branchProtection = {
-  code: "github.repo.default_branch_protected",
-  provider: "github",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC8.1", "iso:8.32", "iso:8.25"],
-  run: (ctx) => guarded("api.repos", async () => {
-    const repos2 = await listRepos(ctx);
-    const unprotected = [];
-    const evidence = {};
-    for (const repo2 of repos2) {
-      const rules = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/rules/branches/${encodeURIComponent(repo2.default_branch)}`);
-      const ruleTypes = rules.status === 200 ? rules.json.map((x) => x.type) : [];
-      let protectedBranch = ruleTypes.includes("pull_request") || ruleTypes.includes("non_fast_forward");
-      if (!protectedBranch) {
-        const classic = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/branches/${encodeURIComponent(repo2.default_branch)}/protection`);
-        protectedBranch = classic.status === 200;
-        evidence[repo2.name] = { rules: rules.json, classic: classic.status === 200 ? classic.json : null };
-      } else {
-        evidence[repo2.name] = { rules: rules.json };
-      }
-      if (!protectedBranch) unprotected.push(repo2.name);
-    }
-    const observed = { repos: repos2.length, unprotected };
-    return unprotected.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var dependabot = {
-  code: "github.repo.dependabot",
-  provider: "github",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC7.1", "ce:patching", "iso:8.8"],
-  run: (ctx) => guarded("api.repos", async () => {
-    const repos2 = await listRepos(ctx);
-    const disabled = [];
-    const openCritical = {};
-    const evidence = {};
-    for (const repo2 of repos2) {
-      const enabled = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/vulnerability-alerts`);
-      if (enabled.status !== 204) {
-        disabled.push(repo2.name);
-        evidence[repo2.name] = { enabled: false };
-        continue;
-      }
-      const alerts = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/dependabot/alerts?state=open&severity=critical,high&per_page=100`);
-      const n = alerts.status === 200 ? alerts.json.length : 0;
-      if (n > 0) openCritical[repo2.name] = n;
-      evidence[repo2.name] = { enabled: true, openCriticalOrHigh: n };
-    }
-    const observed = { repos: repos2.length, disabled, openCriticalOrHigh: openCritical };
-    const ok = disabled.length === 0 && Object.keys(openCritical).length === 0;
-    return ok ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var secretScanning = {
-  code: "github.repo.secret_scanning",
-  provider: "github",
-  version: 2,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:8.12", "iso:8.28"],
-  run: (ctx) => guarded("api.repos", async () => {
-    const repos2 = await listRepos(ctx);
-    const off = [];
-    const unverifiedPush = [];
-    const evidence = {};
-    for (const repo2 of repos2) {
-      const sa = repo2.security_and_analysis;
-      if (sa) {
-        evidence[repo2.name] = sa;
-        const scanning = sa.secret_scanning?.status === "enabled";
-        const push2 = sa.secret_scanning_push_protection?.status === "enabled";
-        if (!scanning || !push2) off.push(repo2.name);
-        continue;
-      }
-      const probe = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/secret-scanning/alerts?per_page=1`);
-      const message = String(probe.json?.message ?? "");
-      if (probe.status === 200) {
-        evidence[repo2.name] = { probe: "alerts", status: 200, scanning: true, pushProtection: "unverified" };
-        unverifiedPush.push(repo2.name);
-      } else if (probe.status === 404 && /disabled|not enabled|not available/i.test(message)) {
-        evidence[repo2.name] = { probe: "alerts", status: 404, message, scanning: false };
-        off.push(repo2.name);
-      } else {
-        return unknown("api.secret_scanning_probe", { repo: repo2.name, status: probe.status });
-      }
-    }
-    const purchasable = off.length === 0 ? null : await ownerType(ctx) === "org";
-    const observed = { repos: repos2.length, missingScanningOrPushProtection: off, pushProtectionUnverified: unverifiedPush, secretProtectionPurchasable: purchasable };
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var ENV_PATH2 = /(^|\/)\.env(\.[^/]+)?$/;
-var ENV_ALLOWED2 = /\.env\.(example|sample|template|dist)$/;
-var noEnvCommitted = {
-  code: "github.repo.no_env_committed",
-  provider: "github",
-  version: 1,
-  severity: "critical",
-  maps: ["soc2:CC6.1", "gdpr:art32", "iso:8.12", "iso:5.17"],
-  run: (ctx) => guarded("api.tree", async () => {
-    const repos2 = await listRepos(ctx);
-    const offenders = {};
-    const evidence = {};
-    for (const repo2 of repos2) {
-      const tree = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/git/trees/${encodeURIComponent(repo2.default_branch)}?recursive=1`);
-      if (tree.status !== 200) {
-        evidence[repo2.name] = { status: tree.status };
-        continue;
-      }
-      const t = tree.json;
-      const hits = t.tree.filter((e) => e.type === "blob" && ENV_PATH2.test(e.path) && !ENV_ALLOWED2.test(e.path)).map((e) => e.path);
-      if (hits.length) offenders[repo2.name] = hits;
-      evidence[repo2.name] = { truncated: Boolean(t.truncated), envFiles: hits, entries: t.tree.length };
-    }
-    const observed = { repos: repos2.length, offenders };
-    return Object.keys(offenders).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var repoHygiene = {
-  code: "github.repo.hygiene",
-  provider: "github",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:8.25", "iso:5.24", "soc2:CC7.3"],
-  run: (ctx) => guarded("api.contents", async () => {
-    const repos2 = await listRepos(ctx);
-    const missing = {};
-    const evidence = {};
-    for (const repo2 of repos2) {
-      const gaps = [];
-      const gi = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/contents/.gitignore`);
-      let ignoresEnv = false;
-      if (gi.status === 200) {
-        const body = Buffer.from(String(gi.json.content ?? ""), "base64").toString("utf8");
-        ignoresEnv = /^\s*\.env(\*|\.\*|\.local|$)/m.test(body) || /^\s*\*\.env/m.test(body) || /^\s*\.env\*?\.local/m.test(body);
-      }
-      if (!ignoresEnv) gaps.push(".gitignore covers .env");
-      const sec = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/contents/SECURITY.md`);
-      if (sec.status !== 200) gaps.push("SECURITY.md");
-      let codeowners = false;
-      for (const p of ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"]) {
-        const co = await ctx.api.get(`/repos/${ctx.org}/${repo2.name}/contents/${p}`);
-        if (co.status === 200) {
-          codeowners = true;
-          break;
-        }
-      }
-      if (!codeowners) gaps.push("CODEOWNERS");
-      if (gaps.length) missing[repo2.name] = gaps;
-      evidence[repo2.name] = { ignoresEnv, securityMd: sec.status === 200, codeowners };
-    }
-    const observed = { repos: repos2.length, missing };
-    return Object.keys(missing).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var outsideCollaborators = {
-  code: "github.org.outside_collaborators",
-  provider: "github",
-  version: 1,
-  severity: "low",
-  maps: ["soc2:CC6.2", "ce:user-access", "iso:5.18", "iso:8.4"],
-  run: (ctx) => guarded("api.org", async () => {
-    if (!ctx.api) return unknown("api.not_connected");
-    const r = await ctx.api.get(`/orgs/${ctx.org}/outside_collaborators?per_page=100`);
-    if (r.status !== 200) return unknown("api.outside_collaborators");
-    const list9 = r.json.map((x) => x.login);
-    const observed = { count: list9.length, logins: list9 };
-    return list9.length === 0 ? pass(observed, r.json) : fail(observed, r.json);
-  })
-};
-var GITHUB_CHECKS = [
-  org2fa,
-  branchProtection,
-  secretScanning,
-  dependabot,
-  noEnvCommitted,
-  repoHygiene,
-  outsideCollaborators
-];
-
-// ../lib/checks/providers/cloudflare.ts
-async function listZones(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const r = await ctx.api.get(`/zones?account.id=${encodeURIComponent(ctx.accountId)}&per_page=50&status=active`);
-  if (r.status !== 200) throw new Error("scope:api.zones");
-  let zones = r.json.result ?? [];
-  if (ctx.zones?.length) zones = zones.filter((z) => ctx.zones.includes(z.name));
-  return zones.slice(0, ctx.maxZones ?? 10);
-}
-async function setting(ctx, zoneId, id) {
-  const r = await ctx.api.get(`/zones/${zoneId}/settings/${id}`);
-  if (r.status !== 200) return null;
-  return r.json.result?.value ?? null;
-}
-var dnssec = {
-  code: "cloudflare.zone.dnssec",
-  provider: "cloudflare",
-  version: 1,
-  severity: "medium",
-  maps: ["ce:secure-config", "iso:8.20"],
-  run: (ctx) => guarded("api.zones", async () => {
-    const zones = await listZones(ctx);
-    const off = [];
-    const evidence = {};
-    for (const z of zones) {
-      const r = await ctx.api.get(`/zones/${z.id}/dnssec`);
-      const status = r.status === 200 ? r.json.result?.status : null;
-      evidence[z.name] = r.json;
-      if (status !== "active") off.push(z.name);
-    }
-    const observed = { zones: zones.length, dnssecNotActive: off };
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var tlsStrict = {
-  code: "cloudflare.tls.strict",
-  provider: "cloudflare",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
-  run: (ctx) => guarded("api.settings", async () => {
-    const zones = await listZones(ctx);
-    const weak = {};
-    const evidence = {};
-    for (const z of zones) {
-      const ssl = await setting(ctx, z.id, "ssl");
-      const minTls = await setting(ctx, z.id, "min_tls_version");
-      evidence[z.name] = { ssl, minTls };
-      const ok = ssl === "strict" && (minTls === "1.2" || minTls === "1.3");
-      if (!ok) weak[z.name] = { ssl, minTls };
-    }
-    const observed = { zones: zones.length, weak };
-    return Object.keys(weak).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var alwaysHttps = {
-  code: "cloudflare.https.always",
-  provider: "cloudflare",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
-  run: (ctx) => guarded("api.settings", async () => {
-    const zones = await listZones(ctx);
-    const off = [];
-    const evidence = {};
-    for (const z of zones) {
-      const always = await setting(ctx, z.id, "always_use_https");
-      const sh = await setting(ctx, z.id, "security_header");
-      const hsts = sh?.strict_transport_security;
-      evidence[z.name] = { always, hsts };
-      const ok = always === "on" && hsts?.enabled === true && (hsts.max_age ?? 0) >= 31536e3 && hsts.include_subdomains === true;
-      if (!ok) off.push(z.name);
-    }
-    const observed = { zones: zones.length, notEnforced: off };
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var r2NoPublic = {
-  code: "cloudflare.r2.no_public_bucket",
-  provider: "cloudflare",
-  version: 2,
-  severity: "high",
-  maps: ["soc2:CC6.1", "gdpr:art32", "iso:8.3", "iso:8.12"],
-  run: (ctx) => guarded("api.r2", async () => {
-    if (!ctx.api) return unknown("api.not_connected");
-    const zones = await listZones(ctx);
-    const zoneNames = zones.map((z) => z.name.toLowerCase());
-    const inZone = (host) => zoneNames.some((z) => host === z || host.endsWith("." + z));
-    const exposed = [];
-    const outside = [];
-    const evidence = {};
-    let total = 0;
-    for (const jur of ["default", "eu", "us"]) {
-      const r = await ctx.api.get(`/accounts/${ctx.accountId}/r2/buckets?per_page=100`, { "cf-r2-jurisdiction": jur });
-      if (r.status === 403) return unknown("api.r2_forbidden");
-      if (r.status !== 200) continue;
-      const buckets = r.json.result?.buckets ?? [];
-      for (const b of buckets) {
-        total++;
-        const m = await ctx.api.get(`/accounts/${ctx.accountId}/r2/buckets/${encodeURIComponent(b.name)}/domains/managed`, { "cf-r2-jurisdiction": jur });
-        const enabled = m.status === 200 ? m.json.result?.enabled : null;
-        const c = await ctx.api.get(`/accounts/${ctx.accountId}/r2/buckets/${encodeURIComponent(b.name)}/domains/custom`, { "cf-r2-jurisdiction": jur });
-        const customDomains = c.status === 200 ? (c.json.result?.domains ?? []).map((d) => d.domain.toLowerCase()) : [];
-        evidence[`${jur}/${b.name}`] = { managed: m.json, customDomains };
-        if (enabled !== true) continue;
-        if (customDomains.some(inZone)) exposed.push(b.name);
-        else outside.push(b.name);
-      }
-    }
-    const unique = [...new Set(exposed)];
-    const observed = { buckets: total, zones: zoneNames, publicViaR2Dev: unique, publicOutsideProject: [...new Set(outside)] };
-    return unique.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var wafManaged = {
-  code: "cloudflare.waf.managed",
-  provider: "cloudflare",
-  version: 2,
-  severity: "medium",
-  maps: ["ce:firewalls", "iso:8.20", "iso:8.21", "soc2:CC6.6"],
-  run: (ctx) => guarded("api.rulesets", async () => {
-    const zones = await listZones(ctx);
-    const missing = [];
-    const evidence = {};
-    const freeZones = [];
-    for (const z of zones) {
-      const r = await ctx.api.get(`/zones/${z.id}/rulesets/phases/http_request_firewall_managed/entrypoint`);
-      const rules = r.status === 200 ? r.json.result?.rules ?? [] : [];
-      let deployed = rules.some((x) => x.action === "execute" && x.enabled !== false);
-      if (!deployed && r.status === 404 && z.plan?.legacy_id === "free") {
-        deployed = true;
-        freeZones.push(z.name);
-      }
-      evidence[z.name] = r.status === 200 ? r.json : { status: r.status, plan: z.plan?.legacy_id ?? null };
-      if (!deployed) missing.push(z.name);
-    }
-    const observed = { zones: zones.length, noManagedRuleset: missing, freePlanManagedByCloudflare: freeZones };
-    return missing.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var botFightMode = {
-  code: "cloudflare.bot.fight_mode",
-  provider: "cloudflare",
-  version: 1,
-  severity: "low",
-  maps: ["ce:firewalls", "iso:8.20", "soc2:CC6.6"],
-  run: (ctx) => guarded("api.bot_management", async () => {
-    const zones = await listZones(ctx);
-    const off = [];
-    const evidence = {};
-    for (const z of zones) {
-      const r = await ctx.api.get(`/zones/${z.id}/bot_management`);
-      if (r.status === 403) return unknown("api.bot_management_forbidden");
-      const cfg = r.status === 200 ? r.json.result : null;
-      evidence[z.name] = cfg;
-      const on = cfg?.fight_mode === true || cfg?.sbfm_definitely_automated === "block" || cfg?.sbfm_definitely_automated === "managed_challenge";
-      if (!on) off.push(z.name);
-    }
-    const observed = { zones: zones.length, botProtectionOff: off };
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var turnstileWidgets = {
-  code: "cloudflare.turnstile.widgets",
-  provider: "cloudflare",
-  version: 1,
-  severity: "low",
-  maps: ["soc2:CC6.6", "iso:8.5"],
-  run: (ctx) => guarded("api.turnstile", async () => {
-    if (!ctx.api) return unknown("api.not_connected");
-    const zones = await listZones(ctx);
-    const r = await ctx.api.get(`/accounts/${ctx.accountId}/challenges/widgets?per_page=100`);
-    if (r.status === 403) return unknown("api.turnstile_forbidden");
-    if (r.status !== 200) return unknown("api.turnstile");
-    const widgets = r.json.result ?? [];
-    const covered2 = new Set(widgets.flatMap((w) => w.domains));
-    const uncovered = zones.map((z) => z.name).filter((n) => ![...covered2].some((d) => d === n || d.endsWith(`.${n}`)));
-    const observed = { widgets: widgets.length, zonesWithoutWidget: uncovered };
-    return widgets.length > 0 && uncovered.length === 0 ? pass(observed, widgets) : fail(observed, widgets);
-  })
-};
-async function pagesProjects(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const r = await ctx.api.get(`/accounts/${ctx.accountId}/pages/projects`);
-  if (r.status === 403) return null;
-  if (r.status !== 200) throw new Error("scope:api.pages");
-  return (r.json.result ?? []).filter((p) => p && p.name);
-}
-var COMPAT_MAX_DAYS = 365;
-var pagesCompatDate = {
-  code: "cloudflare.pages.compat_date",
-  provider: "cloudflare",
-  version: 1,
-  severity: "medium",
-  maps: ["ce:patching", "iso:8.8", "soc2:CC7.1"],
-  run: (ctx) => guarded("api.pages", async () => {
-    const projects5 = await pagesProjects(ctx);
-    if (projects5 === null) return unknown("pages.readonly");
-    if (projects5.length === 0) return unknown("api.no_pages_projects");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    const stale = {};
-    const evidence = {};
-    for (const p of projects5) {
-      const date = p.deployment_configs?.production?.compatibility_date ?? null;
-      const age = date ? Math.floor((now - new Date(date).getTime()) / 864e5) : null;
-      evidence[p.name] = { compatibilityDate: date, ageDays: age };
-      if (age === null || age > COMPAT_MAX_DAYS) stale[p.name] = date;
-    }
-    const observed = { projects: projects5.length, maxAgeDays: COMPAT_MAX_DAYS, stale };
-    return Object.keys(stale).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var pagesPreviewProtected = {
-  code: "cloudflare.pages.preview_protected",
-  provider: "cloudflare",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "soc2:CC8.1", "iso:8.31"],
-  run: (ctx) => guarded("api.pages", async () => {
-    const projects5 = await pagesProjects(ctx);
-    if (projects5 === null) return unknown("pages.readonly");
-    if (projects5.length === 0) return unknown("api.no_pages_projects");
-    const r = await ctx.api.get(`/accounts/${ctx.accountId}/access/apps?per_page=100`);
-    const notEnabled = r.status === 403 && /not_enabled/i.test(JSON.stringify(r.json ?? ""));
-    if (r.status === 403 && !notEnabled) return unknown("access.readonly");
-    if (r.status !== 200 && !notEnabled) throw new Error("scope:api.access");
-    const apps3 = notEnabled ? [] : r.json.result ?? [];
-    const domains = apps3.flatMap((a) => [a.domain ?? "", ...a.self_hosted_domains ?? []]).map((d) => d.toLowerCase());
-    const covered2 = (name4) => domains.some((d) => d === `${name4}.pages.dev` || d === `*.${name4}.pages.dev` || d.endsWith(`.${name4}.pages.dev`));
-    const open = projects5.filter((p) => !covered2(p.name)).map((p) => p.name);
-    const observed = { projects: projects5.length, accessApplications: apps3.length, unprotected: open };
-    const evidence = { projects: projects5.map((p) => p.name), accessDomains: domains };
-    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var CLOUDFLARE_CHECKS = [
-  tlsStrict,
-  alwaysHttps,
-  dnssec,
-  wafManaged,
-  botFightMode,
-  r2NoPublic,
-  turnstileWidgets,
-  pagesCompatDate,
-  pagesPreviewProtected
-];
-
-// ../lib/checks/providers/stripe.ts
-var webhooksHealthy = {
-  code: "stripe.webhooks.healthy",
-  provider: "stripe",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC7.2", "iso:8.16", "iso:8.26"],
-  run: (ctx) => guarded("api.webhook_endpoints", async () => {
-    if (!ctx.api) return unknown("api.not_connected");
-    const r = await ctx.api.get("/v1/webhook_endpoints?limit=100");
-    if (r.status === 403) return unknown("api.webhooks_forbidden");
-    if (r.status !== 200) return unknown("api.webhook_endpoints");
-    const list9 = (r.json.data ?? []).map((e) => ({
-      id: e.id,
-      url: e.url,
-      status: e.status,
-      api_version: e.api_version,
-      livemode: e.livemode,
-      events: e.enabled_events?.length ?? 0
-    }));
-    const problems = {};
-    for (const e of list9) {
-      const p = [];
-      if (e.status !== "enabled") p.push("disabled");
-      if (!e.api_version) p.push("api version not pinned");
-      if (!/^https:\/\//.test(e.url) || /localhost|127\.0\.0\.1|ngrok|trycloudflare\.com|\.vercel\.app|\.netlify\.app|\.local(\/|$)/.test(e.url)) p.push("url not production");
-      if (p.length) problems[e.id] = p;
-    }
-    const observed = { endpoints: list9.length, problems };
-    const ok = list9.length > 0 && Object.keys(problems).length === 0;
-    return ok ? pass(observed, list9) : fail(observed, list9);
-  })
-};
-var noFailedDeliveries = {
-  code: "stripe.webhooks.deliveries",
-  provider: "stripe",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC7.2", "iso:8.16"],
-  run: (ctx) => guarded("api.events", async () => {
-    if (!ctx.api) return unknown("api.not_connected");
-    const since = Math.floor(Date.now() / 1e3) - 30 * 86400;
-    const r = await ctx.api.get(`/v1/events?delivery_success=false&created[gte]=${since}&limit=100`);
-    if (r.status === 403) return unknown("api.events_forbidden");
-    if (r.status !== 200) return unknown("api.events");
-    const data = r.json.data ?? [];
-    const byType = {};
-    for (const e of data) byType[e.type] = (byType[e.type] ?? 0) + 1;
-    const observed = { undeliveredLast30Days: data.length, byType };
-    const evidence = data.map((e) => ({ id: e.id, type: e.type, created: e.created, pending_webhooks: e.pending_webhooks }));
-    return data.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var STRIPE_CHECKS = [webhooksHealthy, noFailedDeliveries];
-
-// ../lib/checks/providers/sentry.ts
-var WRITE_SCOPE = /:(write|admin|releases|ci)$/;
-async function organisation(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const r = await ctx.api.get(`/organizations/${encodeURIComponent(ctx.org)}/`);
-  if (r.status === 403 || r.status === 404) throw new Error("scope:org.access");
-  if (r.status !== 200) throw new Error("scope:api.org");
-  const org = r.json;
-  if ((org.access ?? []).some((s) => WRITE_SCOPE.test(s))) throw new Error("scope:token.write_scope");
-  return org;
-}
-function maskEmail(email) {
-  if (!email || !email.includes("@")) return "?";
-  const [local, domain] = email.split("@");
-  return `${local.slice(0, 1)}\u2026@${domain}`;
-}
-var orgSubset = (o) => ({
-  slug: o.slug,
-  require2FA: o.require2FA,
-  dataScrubber: o.dataScrubber,
-  dataScrubberDefaults: o.dataScrubberDefaults,
-  scrubIPAddresses: o.scrubIPAddresses,
-  sensitiveFields: o.sensitiveFields,
-  storeCrashReports: o.storeCrashReports,
-  allowSharedIssues: o.allowSharedIssues,
-  enhancedPrivacy: o.enhancedPrivacy,
-  openMembership: o.openMembership,
-  allowJoinRequests: o.allowJoinRequests
-});
-var require2fa = {
-  code: "sentry.org.require_2fa",
-  provider: "sentry",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.org", async () => {
-    const org = await organisation(ctx);
-    if (org.require2FA == null) return unknown("api.org_2fa_hidden");
-    const observed = { required: org.require2FA === true };
-    return observed.required ? pass(observed, orgSubset(org)) : fail(observed, orgSubset(org));
-  })
-};
-var members2fa = {
-  code: "sentry.members.2fa",
-  provider: "sentry",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.members", async () => {
-    await organisation(ctx);
-    const r = await ctx.api.get(`/organizations/${encodeURIComponent(ctx.org)}/members/?per_page=100`);
-    if (r.status !== 200) throw new Error("scope:api.members");
-    const members2 = (r.json ?? []).filter((m) => m && !m.pending && !m.expired && m.user);
-    const flags = members2.map((m) => m.user?.has2fa);
-    if (members2.length > 0 && flags.every((f) => f == null)) return unknown("api.members_2fa_hidden", { members: members2.length });
-    const without = members2.filter((m) => m.user?.has2fa !== true).map((m) => `${m.role ?? "member"} ${maskEmail(m.email)}`);
-    const observed = { members: members2.length, without2fa: without };
-    const evidence = members2.map((m) => ({ role: m.role, email: maskEmail(m.email), has2fa: m.user?.has2fa ?? null }));
-    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var orgScrubbing = {
-  code: "sentry.org.data_scrubbing",
-  provider: "sentry",
-  version: 1,
-  severity: "high",
-  maps: ["gdpr:art5", "gdpr:art25", "iso:8.11", "soc2:CC6.7"],
-  run: (ctx) => guarded("api.org", async () => {
-    const org = await organisation(ctx);
-    const observed = {
-      dataScrubber: org.dataScrubber === true,
-      defaults: org.dataScrubberDefaults === true,
-      scrubIpAddresses: org.scrubIPAddresses === true,
-      sensitiveFields: (org.sensitiveFields ?? []).length
-    };
-    const ok = observed.dataScrubber && observed.defaults && observed.scrubIpAddresses;
-    return ok ? pass(observed, orgSubset(org)) : fail(observed, orgSubset(org));
-  })
-};
-var projectScrubbing = {
-  code: "sentry.projects.data_scrubbing",
-  provider: "sentry",
-  version: 1,
-  severity: "medium",
-  maps: ["gdpr:art5", "gdpr:art25", "iso:8.11"],
-  run: (ctx) => guarded("api.projects", async () => {
-    await organisation(ctx);
-    const r = await ctx.api.get(`/organizations/${encodeURIComponent(ctx.org)}/projects/?per_page=100`);
-    if (r.status !== 200) throw new Error("scope:api.projects");
-    const list9 = (r.json ?? []).filter((p) => p && p.slug).slice(0, ctx.maxProjects ?? 30);
-    const weak = [];
-    const evidence = {};
-    for (const p of list9) {
-      const d = await ctx.api.get(`/projects/${encodeURIComponent(ctx.org)}/${encodeURIComponent(p.slug)}/`);
-      if (d.status !== 200) throw new Error("scope:api.project");
-      const proj = d.json;
-      const scrubbing = proj.dataScrubber !== false && proj.scrubIPAddresses !== false;
-      const crashDumps = typeof proj.storeCrashReports === "number" && proj.storeCrashReports !== 0;
-      evidence[p.slug] = { dataScrubber: proj.dataScrubber, scrubIPAddresses: proj.scrubIPAddresses, storeCrashReports: proj.storeCrashReports, scrapeJavaScript: proj.scrapeJavaScript };
-      if (!scrubbing || crashDumps) weak.push(p.slug);
-    }
-    const observed = { projects: list9.length, weak };
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var membershipClosed = {
-  code: "sentry.org.membership_closed",
-  provider: "sentry",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.2", "iso:5.16", "iso:5.18"],
-  run: (ctx) => guarded("api.org", async () => {
-    const org = await organisation(ctx);
-    const observed = { openMembership: org.openMembership === true, allowJoinRequests: org.allowJoinRequests === true };
-    const ok = !observed.openMembership && !observed.allowJoinRequests;
-    return ok ? pass(observed, orgSubset(org)) : fail(observed, orgSubset(org));
-  })
-};
-var noSharedIssues = {
-  code: "sentry.org.no_shared_issues",
-  provider: "sentry",
-  version: 1,
-  severity: "low",
-  maps: ["iso:8.12", "soc2:CC6.7"],
-  run: (ctx) => guarded("api.org", async () => {
-    const org = await organisation(ctx);
-    const observed = { allowSharedIssues: org.allowSharedIssues === true, enhancedPrivacy: org.enhancedPrivacy === true };
-    return observed.allowSharedIssues ? fail(observed, orgSubset(org)) : pass(observed, orgSubset(org));
-  })
-};
-var SENTRY_CHECKS = [require2fa, members2fa, orgScrubbing, projectScrubbing, membershipClosed, noSharedIssues];
-
-// ../lib/checks/providers/slack.ts
-async function members(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const out = [];
-  let cursor = "";
-  for (let page = 0; page < 10; page++) {
-    const r = await ctx.api.get("users.list", { limit: "200", ...cursor ? { cursor } : {} });
-    const body = r.json;
-    if (!body?.ok) throw new Error(body?.error === "missing_scope" ? "scope:users.read" : "scope:api.users");
-    for (const u of body.members ?? []) if (u && u.id !== "USLACKBOT" && !u.deleted && !u.is_bot && !u.is_app_user) out.push(u);
-    cursor = body.response_metadata?.next_cursor ?? "";
-    if (!cursor) break;
-  }
-  return out;
-}
-var handle = (u) => `${(u.name ?? "?").slice(0, 2)}\u2026`;
-var roleOf = (u) => u.is_primary_owner ? "primary owner" : u.is_owner ? "owner" : u.is_admin ? "admin" : u.is_ultra_restricted ? "single-channel guest" : u.is_restricted ? "guest" : "member";
-var evidenceOf = (list9) => list9.map((u) => ({ handle: handle(u), role: roleOf(u), has_2fa: u.has_2fa ?? null }));
-var members2fa2 = {
-  code: "slack.members.2fa",
-  provider: "slack",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await members(ctx);
-    if (list9.length > 0 && list9.every((u) => u.has_2fa == null)) return unknown("api.2fa_hidden", { members: list9.length });
-    const without = list9.filter((u) => u.has_2fa !== true).map((u) => `${roleOf(u)} ${handle(u)}`);
-    const observed = { members: list9.length, without2fa: without };
-    return without.length === 0 ? pass(observed, evidenceOf(list9)) : fail(observed, evidenceOf(list9));
-  })
-};
-var adminsLimited = {
-  code: "slack.admins.limited",
-  provider: "slack",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:8.2", "soc2:CC6.3", "iso:5.18"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await members(ctx);
-    const admins = list9.filter((u) => u.is_admin || u.is_owner || u.is_primary_owner);
-    const ceiling = Math.max(3, Math.ceil(list9.length * 0.25));
-    const observed = { members: list9.length, admins: admins.length, ceiling, holders: admins.map((u) => `${roleOf(u)} ${handle(u)}`) };
-    const ok = admins.length >= 1 && admins.length <= ceiling;
-    return ok ? pass(observed, evidenceOf(admins)) : fail(observed, evidenceOf(admins));
-  })
-};
-var guestsReviewed = {
-  code: "slack.guests.none",
-  provider: "slack",
-  version: 1,
-  severity: "low",
-  maps: ["iso:5.18", "soc2:CC6.2"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await members(ctx);
-    const guests = list9.filter((u) => u.is_restricted || u.is_ultra_restricted);
-    const observed = { guests: guests.length, logins: guests.map((u) => `${roleOf(u)} ${handle(u)}`) };
-    return guests.length === 0 ? pass(observed, evidenceOf(guests)) : fail(observed, evidenceOf(guests));
-  })
-};
-var joinRestricted = {
-  code: "slack.team.join_restricted",
-  provider: "slack",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:5.16", "soc2:CC6.2"],
-  run: (ctx) => guarded("api.team", async () => {
-    if (!ctx.api) throw new Error("scope:api.not_connected");
-    const r = await ctx.api.get("team.info");
-    const body = r.json;
-    if (!body?.ok) throw new Error(body?.error === "missing_scope" ? "scope:team.read" : "scope:api.team");
-    const domains = (body.team?.email_domain ?? "").split(",").map((s) => s.trim()).filter(Boolean);
-    const observed = { workspace: body.team?.domain ?? null, emailDomains: domains };
-    const evidence = { name: body.team?.name, domain: body.team?.domain, email_domain: body.team?.email_domain };
-    return domains.length > 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var SLACK_CHECKS = [members2fa2, adminsLimited, guestsReviewed, joinRestricted];
-
-// ../lib/checks/providers/google.ts
-async function users(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const out = [];
-  let pageToken = "";
-  for (let page = 0; page < 10; page++) {
-    const r = await ctx.api.get(`/users?customer=my_customer&maxResults=500&projection=basic${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`);
-    if (r.status === 403) throw new Error("scope:users.readonly");
-    if (r.status !== 200) throw new Error("scope:api.users");
-    const body = r.json;
-    for (const u of body.users ?? []) if (u && !u.suspended && !u.archived) out.push(u);
-    pageToken = body.nextPageToken ?? "";
-    if (!pageToken) break;
-  }
-  return out;
-}
-function maskEmail2(email) {
-  if (!email || !email.includes("@")) return "?";
-  const [local, domain] = email.split("@");
-  return `${local.slice(0, 1)}\u2026@${domain}`;
-}
-var roleOf2 = (u) => u.isAdmin ? "super admin" : u.isDelegatedAdmin ? "delegated admin" : "user";
-var evidenceOf2 = (list9) => list9.map((u) => ({ email: maskEmail2(u.primaryEmail), role: roleOf2(u), enrolled2sv: u.isEnrolledIn2Sv ?? null, enforced2sv: u.isEnforcedIn2Sv ?? null, lastLogin: u.lastLoginTime ?? null }));
-var twoStepEnforced = {
-  code: "google.users.2sv_enforced",
-  provider: "google",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await users(ctx);
-    if (list9.length === 0) return unknown("api.no_users");
-    const not = list9.filter((u) => u.isEnforcedIn2Sv !== true).map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`);
-    const observed = { users: list9.length, notEnforced: not };
-    return not.length === 0 ? pass(observed, evidenceOf2(list9)) : fail(observed, evidenceOf2(list9));
-  })
-};
-var twoStepEnrolled = {
-  code: "google.users.2sv_enrolled",
-  provider: "google",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await users(ctx);
-    if (list9.length === 0) return unknown("api.no_users");
-    const not = list9.filter((u) => u.isEnrolledIn2Sv !== true).map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`);
-    const observed = { users: list9.length, notEnrolled: not };
-    return not.length === 0 ? pass(observed, evidenceOf2(list9)) : fail(observed, evidenceOf2(list9));
-  })
-};
-var adminsLimited2 = {
-  code: "google.admins.limited",
-  provider: "google",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:8.2", "soc2:CC6.3", "iso:5.18"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await users(ctx);
-    if (list9.length === 0) return unknown("api.no_users");
-    const admins = list9.filter((u) => u.isAdmin);
-    const ceiling = Math.max(3, Math.ceil(list9.length * 0.25));
-    const observed = { users: list9.length, superAdmins: admins.length, ceiling, holders: admins.map((u) => maskEmail2(u.primaryEmail)) };
-    const ok = admins.length >= 1 && admins.length <= ceiling;
-    return ok ? pass(observed, evidenceOf2(admins)) : fail(observed, evidenceOf2(admins));
-  })
-};
-var DORMANT_DAYS2 = 90;
-var dormantUsers2 = {
-  code: "google.users.dormant",
-  provider: "google",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:5.18", "iso:6.5", "soc2:CC6.3"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await users(ctx);
-    if (list9.length === 0) return unknown("api.no_users");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    const days = (iso) => iso ? Math.floor((now - new Date(iso).getTime()) / 864e5) : null;
-    const dormant = list9.filter((u) => {
-      const last = u.lastLoginTime && !u.lastLoginTime.startsWith("1970") ? days(u.lastLoginTime) : null;
-      const age = days(u.creationTime);
-      return last === null ? age !== null && age > 30 : last > DORMANT_DAYS2;
-    });
-    const observed = { users: list9.length, dormantDays: DORMANT_DAYS2, dormant: dormant.map((u) => `${roleOf2(u)} ${maskEmail2(u.primaryEmail)}`) };
-    return dormant.length === 0 ? pass(observed, evidenceOf2(list9)) : fail(observed, evidenceOf2(dormant));
-  })
-};
-var GOOGLE_CHECKS = [twoStepEnforced, twoStepEnrolled, adminsLimited2, dormantUsers2];
-
-// ../lib/checks/providers/microsoft.ts
-var USER_FIELDS = "id,userPrincipalName,accountEnabled,userType,createdDateTime";
-async function users2(ctx, select = USER_FIELDS) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const out = [];
-  let next = `/users?$select=${select}&$top=999`;
-  for (let page = 0; page < 10 && next; page++) {
-    const r = await ctx.api.get(next);
-    if (r.status === 403) {
-      const text2 = JSON.stringify(r.json ?? "");
-      throw new Error(/NonPremium|Premium/i.test(text2) && select.includes("signInActivity") ? "scope:licence.premium" : "scope:users.readonly");
-    }
-    if (r.status !== 200) throw new Error("scope:api.users");
-    const body = r.json;
-    for (const u of body.value ?? []) if (u && u.accountEnabled !== false && (u.userType ?? "Member") === "Member") out.push(u);
-    next = body["@odata.nextLink"] ?? "";
-  }
-  return out;
-}
-function maskEmail3(email) {
-  if (!email || !email.includes("@")) return "?";
-  const [local, domain] = email.split("@");
-  return `${local.slice(0, 1)}\u2026@${domain}`;
-}
-var MFA_METHODS = /* @__PURE__ */ new Set([
-  "#microsoft.graph.microsoftAuthenticatorAuthenticationMethod",
-  "#microsoft.graph.passwordlessMicrosoftAuthenticatorAuthenticationMethod",
-  "#microsoft.graph.phoneAuthenticationMethod",
-  "#microsoft.graph.fido2AuthenticationMethod",
-  "#microsoft.graph.softwareOathAuthenticationMethod",
-  "#microsoft.graph.hardwareOathAuthenticationMethod",
-  "#microsoft.graph.windowsHelloForBusinessAuthenticationMethod",
-  "#microsoft.graph.platformCredentialAuthenticationMethod"
-]);
-var MAX_METHOD_LOOKUPS = 300;
-var mfaRegistered = {
-  code: "microsoft.users.mfa_registered",
-  provider: "microsoft",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.users", async () => {
-    const list9 = await users2(ctx);
-    if (list9.length === 0) return unknown("api.no_users");
-    if (list9.length > MAX_METHOD_LOOKUPS) return unknown("api.too_many_users");
-    const evidence = [];
-    const not = [];
-    for (const u of list9) {
-      const r = await ctx.api.get(`/users/${encodeURIComponent(u.id ?? "")}/authentication/methods`);
-      if (r.status === 403) throw new Error("scope:auth_methods.readonly");
-      if (r.status !== 200) throw new Error("scope:api.auth_methods");
-      const methods = (r.json.value ?? []).map((m) => String(m["@odata.type"] ?? ""));
-      evidence.push({ email: maskEmail3(u.userPrincipalName), methods: methods.map((m) => m.replace("#microsoft.graph.", "")) });
-      if (!methods.some((m) => MFA_METHODS.has(m))) not.push(maskEmail3(u.userPrincipalName));
-    }
-    const observed = { users: list9.length, notRegistered: not };
-    return not.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var mfaEnforced = {
-  code: "microsoft.tenant.mfa_enforced",
-  provider: "microsoft",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.policies", async () => {
-    if (!ctx.api) throw new Error("scope:api.not_connected");
-    const d = await ctx.api.get("/policies/identitySecurityDefaultsEnforcementPolicy");
-    if (d.status === 403) throw new Error("scope:policy.readonly");
-    if (d.status !== 200) throw new Error("scope:api.security_defaults");
-    const securityDefaults = d.json.isEnabled === true;
-    if (securityDefaults) return pass({ securityDefaults, conditionalAccess: null }, { securityDefaults: d.json });
-    const c = await ctx.api.get("/identity/conditionalAccess/policies");
-    const policies = c.status === 200 ? c.json.value ?? [] : [];
-    const requiresMfa = (p) => p.state === "enabled" && (p.conditions?.users?.includeUsers ?? []).includes("All") && (p.conditions?.applications?.includeApplications ?? []).includes("All") && ((p.grantControls?.builtInControls ?? []).includes("mfa") || p.grantControls?.authenticationStrength != null);
-    const matching = policies.filter(requiresMfa).map((p) => p.displayName ?? "unnamed");
-    const observed = { securityDefaults, conditionalAccessAvailable: c.status === 200, policies: policies.length, requiringMfaForAll: matching };
-    const evidence = { securityDefaults: d.json, policies: policies.map((p) => ({ name: p.displayName, state: p.state, users: p.conditions?.users, apps: p.conditions?.applications, grant: p.grantControls })) };
-    return matching.length > 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var GLOBAL_ADMIN_TEMPLATE = "62e90394-69f5-4237-9190-012177145e10";
-var adminsLimited3 = {
-  code: "microsoft.admins.limited",
-  provider: "microsoft",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:8.2", "soc2:CC6.3", "iso:5.18"],
-  run: (ctx) => guarded("api.roles", async () => {
-    const list9 = await users2(ctx);
-    if (list9.length === 0) return unknown("api.no_users");
-    const roles = await ctx.api.get(`/directoryRoles?$filter=roleTemplateId eq '${GLOBAL_ADMIN_TEMPLATE}'`);
-    if (roles.status === 403) throw new Error("scope:directory.readonly");
-    if (roles.status !== 200) throw new Error("scope:api.roles");
-    const role = (roles.json.value ?? [])[0];
-    let admins = [];
-    if (role?.id) {
-      const m = await ctx.api.get(`/directoryRoles/${encodeURIComponent(role.id)}/members?$select=${USER_FIELDS}`);
-      if (m.status === 403) throw new Error("scope:directory.readonly");
-      if (m.status !== 200) throw new Error("scope:api.role_members");
-      admins = (m.json.value ?? []).filter((x) => (x["@odata.type"] ?? "#microsoft.graph.user") === "#microsoft.graph.user" && x.accountEnabled !== false);
-    }
-    const ceiling = Math.max(3, Math.ceil(list9.length * 0.25));
-    const observed = { users: list9.length, globalAdmins: admins.length, ceiling, holders: admins.map((u) => maskEmail3(u.userPrincipalName)) };
-    const ok = admins.length >= 1 && admins.length <= ceiling;
-    const evidence = admins.map((u) => ({ email: maskEmail3(u.userPrincipalName), type: u.userType ?? null }));
-    return ok ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var DORMANT_DAYS3 = 90;
-var dormantUsers3 = {
-  code: "microsoft.users.dormant",
-  provider: "microsoft",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:5.18", "iso:6.5", "soc2:CC6.3"],
-  run: (ctx) => guarded("api.users", async () => {
-    let list9;
-    try {
-      list9 = await users2(ctx, `${USER_FIELDS},signInActivity`);
-    } catch (e) {
-      if (e instanceof Error && e.message === "scope:licence.premium") return unknown("licence.premium");
-      throw e;
-    }
-    if (list9.length === 0) return unknown("api.no_users");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    const days = (iso) => iso ? Math.floor((now - new Date(iso).getTime()) / 864e5) : null;
-    const dormant = list9.filter((u) => {
-      const last = days(u.signInActivity?.lastSuccessfulSignInDateTime ?? u.signInActivity?.lastSignInDateTime);
-      const age = days(u.createdDateTime);
-      return last === null ? age !== null && age > 30 : last > DORMANT_DAYS3;
-    });
-    const observed = { users: list9.length, dormantDays: DORMANT_DAYS3, dormant: dormant.map((u) => maskEmail3(u.userPrincipalName)) };
-    const evidence = (dormant.length ? dormant : list9).map((u) => ({ email: maskEmail3(u.userPrincipalName), lastSignIn: u.signInActivity?.lastSuccessfulSignInDateTime ?? u.signInActivity?.lastSignInDateTime ?? null, created: u.createdDateTime ?? null }));
-    return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var MICROSOFT_CHECKS = [mfaEnforced, mfaRegistered, adminsLimited3, dormantUsers3];
-
-// ../lib/checks/providers/uptimerobot.ts
-var PAUSED = 0;
-async function monitors2(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const out = [];
-  for (let offset = 0; offset < 500; offset += 50) {
-    const r = await ctx.api.post("getMonitors", { alert_contacts: "1", limit: "50", offset: String(offset) });
-    const body = r.json;
-    if (r.status !== 200 || body?.stat !== "ok") throw new Error("scope:api.monitors");
-    out.push(...body.monitors ?? []);
-    if ((body.pagination?.total ?? 0) <= offset + 50) break;
-  }
-  return out;
-}
-function hostOf(url) {
-  try {
-    return new URL(url ?? "").hostname.toLowerCase();
-  } catch {
-    return "";
-  }
-}
-function productionMonitors(list9, host) {
-  const h = host.toLowerCase().replace(/^www\./, "");
-  return list9.filter((m) => (m.type === 1 || m.type === 2) && [h, `www.${h}`].includes(hostOf(m.url)));
-}
-var summarise = (list9) => list9.map((m) => ({ name: m.friendly_name ?? null, host: hostOf(m.url), type: m.type ?? null, status: m.status ?? null, interval: m.interval ?? null, alertContacts: (m.alert_contacts ?? []).length }));
-var productionMonitored = {
-  code: "uptimerobot.monitor.production",
-  provider: "uptimerobot",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:A1.1", "soc2:CC7.2", "iso:8.16"],
-  run: (ctx) => guarded("api.monitors", async () => {
-    if (!ctx.host) return unknown("connection.host");
-    const list9 = await monitors2(ctx);
-    const prod = productionMonitors(list9, ctx.host).filter((m) => m.status !== PAUSED);
-    const observed = { monitors: list9.length, host: ctx.host, productionMonitors: prod.map((m) => m.friendly_name ?? hostOf(m.url)) };
-    return prod.length > 0 ? pass(observed, summarise(prod)) : fail(observed, summarise(list9));
-  })
-};
-var alertsConfigured = {
-  code: "uptimerobot.alerts.configured",
-  provider: "uptimerobot",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC7.2", "iso:8.16"],
-  run: (ctx) => guarded("api.monitors", async () => {
-    const list9 = await monitors2(ctx);
-    const active2 = list9.filter((m) => m.status !== PAUSED);
-    if (active2.length === 0) return unknown("api.no_monitors");
-    const silent = active2.filter((m) => (m.alert_contacts ?? []).length === 0).map((m) => m.friendly_name ?? hostOf(m.url));
-    const observed = { monitors: active2.length, withoutAlertContact: silent };
-    return silent.length === 0 ? pass(observed, summarise(active2)) : fail(observed, summarise(active2));
-  })
-};
-var MAX_INTERVAL_SECONDS = 300;
-var productionInterval = {
-  code: "uptimerobot.monitor.interval",
-  provider: "uptimerobot",
-  version: 1,
-  severity: "low",
-  maps: ["soc2:A1.1", "iso:8.16"],
-  run: (ctx) => guarded("api.monitors", async () => {
-    if (!ctx.host) return unknown("connection.host");
-    const list9 = await monitors2(ctx);
-    const prod = productionMonitors(list9, ctx.host).filter((m) => m.status !== PAUSED);
-    if (prod.length === 0) return unknown("api.no_production_monitor");
-    const slow = prod.filter((m) => (m.interval ?? Infinity) > MAX_INTERVAL_SECONDS).map((m) => `${m.friendly_name ?? hostOf(m.url)} (${m.interval}s)`);
-    const observed = { productionMonitors: prod.length, maxIntervalSeconds: MAX_INTERVAL_SECONDS, slower: slow };
-    return slow.length === 0 ? pass(observed, summarise(prod)) : fail(observed, summarise(prod));
-  })
-};
-var UPTIMEROBOT_CHECKS = [productionMonitored, alertsConfigured, productionInterval];
-
-// ../lib/checks/providers/gitlab.ts
-async function ownerType2(ctx) {
-  if (ctx.ownerType) return ctx.ownerType;
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const g = await ctx.api.get(`/groups/${encodeURIComponent(ctx.owner)}`);
-  if (g.status === 200) {
-    ctx.ownerType = "group";
-    return "group";
-  }
-  const u = await ctx.api.get(`/users?username=${encodeURIComponent(ctx.owner)}`);
-  if (u.status === 200 && Array.isArray(u.json) && u.json.length > 0) {
-    ctx.ownerType = "user";
-    return "user";
-  }
-  throw new Error("scope:api.owner");
-}
-async function projects2(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const max = ctx.maxProjects ?? 30;
-  if (ctx.projects?.length) {
-    const out = [];
-    for (const p of ctx.projects.slice(0, max)) {
-      const r2 = await ctx.api.get(`/projects/${encodeURIComponent(`${ctx.owner}/${p}`)}`);
-      if (r2.status === 200 && !r2.json.empty_repo) out.push(r2.json);
-    }
-    return out;
-  }
-  const kind = await ownerType2(ctx);
-  const r = await ctx.api.get(kind === "group" ? `/groups/${encodeURIComponent(ctx.owner)}/projects?include_subgroups=true&archived=false&per_page=100&order_by=last_activity_at` : `/users/${encodeURIComponent(ctx.owner)}/projects?archived=false&per_page=100&order_by=last_activity_at`);
-  if (r.status === 403) throw new Error("scope:projects.read");
-  if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.projects");
-  return r.json.filter((p) => !p.archived && !p.forked_from_project && !p.empty_repo).slice(0, max);
-}
-async function file(ctx, project, path) {
-  const ref = project.default_branch ?? "main";
-  const r = await ctx.api.get(`/projects/${project.id}/repository/files/${encodeURIComponent(path)}?ref=${encodeURIComponent(ref)}`);
-  if (r.status !== 200) return null;
-  const body = r.json;
-  if (!body || typeof body.content !== "string") return null;
-  return body.encoding === "base64" ? Buffer.from(body.content, "base64").toString("utf8") : body.content;
-}
-var group2fa = {
-  code: "gitlab.group.2fa",
-  provider: "gitlab",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5", "iso:5.17"],
-  run: (ctx) => guarded("api.group", async () => {
-    if (!ctx.api) throw new Error("scope:api.not_connected");
-    const r = await ctx.api.get(`/groups/${encodeURIComponent(ctx.owner)}`);
-    if (r.status === 403) throw new Error("scope:group.read");
-    if (r.status !== 200) throw new Error("scope:api.group");
-    const g = r.json;
-    const observed = { group: ctx.owner, requireTwoFactor: g.require_two_factor_authentication === true, gracePeriodHours: g.two_factor_grace_period ?? null };
-    return observed.requireTwoFactor ? pass(observed, g) : fail(observed, g);
-  })
-};
-var branchProtection2 = {
-  code: "gitlab.repo.default_branch_protected",
-  provider: "gitlab",
-  version: 2,
-  severity: "high",
-  maps: ["soc2:CC8.1", "iso:8.32", "iso:8.25"],
-  run: (ctx) => guarded("api.projects", async () => {
-    const list9 = await projects2(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
-    const unprotected = [];
-    const evidence = {};
-    for (const p of list9) {
-      const r = await ctx.api.get(`/projects/${p.id}/protected_branches`);
-      const rules = r.status === 200 && Array.isArray(r.json) ? r.json : [];
-      const branch = p.default_branch ?? "main";
-      const rule = rules.find((x) => x.name === branch || x.name === "*");
-      const ok = Boolean(rule) && rule.allow_force_push !== true && (rule.push_access_levels ?? []).every((l) => (l.access_level ?? 0) === 0 || (l.access_level ?? 0) >= 40);
-      evidence[p.path] = { branch, rule: rule ?? null };
-      if (!ok) unprotected.push(p.path);
-    }
-    const observed = { projects: list9.length, unprotected };
-    return unprotected.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var noEnvCommitted2 = {
-  code: "gitlab.repo.no_env_committed",
-  provider: "gitlab",
-  version: 2,
-  severity: "critical",
-  maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
-  run: (ctx) => guarded("api.projects", async () => {
-    const list9 = await projects2(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
-    const offenders = {};
-    const evidence = {};
-    for (const p of list9) {
-      const r = await ctx.api.get(`/projects/${p.id}/repository/tree?ref=${encodeURIComponent(p.default_branch ?? "main")}&per_page=100`);
-      const names = r.status === 200 && Array.isArray(r.json) ? r.json.filter((e) => e.type === "blob").map((e) => e.name ?? "") : [];
-      const envs = names.filter((n) => /^\.env(\..+)?$/.test(n) && !/\.(example|sample|template)$/.test(n));
-      evidence[p.path] = { files: names.length, envFiles: envs };
-      if (envs.length) offenders[p.path] = envs;
-    }
-    const observed = { projects: list9.length, offenders };
-    return Object.keys(offenders).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var hygiene2 = {
-  code: "gitlab.repo.hygiene",
-  provider: "gitlab",
-  version: 2,
-  severity: "medium",
-  maps: ["iso:5.37", "soc2:CC2.3", "iso:8.24"],
-  run: (ctx) => guarded("api.projects", async () => {
-    const list9 = await projects2(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
-    const missing = {};
-    const evidence = {};
-    for (const p of list9) {
-      const gaps = [];
-      const gi = await file(ctx, p, ".gitignore");
-      const ignoresEnv = gi !== null && (/^\s*\.env(\*|\.\*|\.local|$)/m.test(gi) || /^\s*\*\.env/m.test(gi));
-      if (!ignoresEnv) gaps.push(".gitignore covers .env");
-      const sec = await file(ctx, p, "SECURITY.md");
-      if (sec === null) gaps.push("SECURITY.md");
-      let codeowners = false;
-      for (const path of ["CODEOWNERS", ".gitlab/CODEOWNERS", "docs/CODEOWNERS"]) {
-        if (await file(ctx, p, path) !== null) {
-          codeowners = true;
-          break;
-        }
-      }
-      if (!codeowners) gaps.push("CODEOWNERS");
-      evidence[p.path] = { ignoresEnv, securityMd: sec !== null, codeowners };
-      if (gaps.length) missing[p.path] = gaps;
-    }
-    const observed = { projects: list9.length, missing };
-    return Object.keys(missing).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var secretDetection = {
-  code: "gitlab.repo.secret_detection",
-  provider: "gitlab",
-  version: 2,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:8.24"],
-  run: (ctx) => guarded("api.projects", async () => {
-    const list9 = await projects2(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
-    const without = [];
-    const evidence = {};
-    for (const p of list9) {
-      const ci = await file(ctx, p, ".gitlab-ci.yml");
-      const on = ci !== null && /Security\/Secret-Detection\.gitlab-ci\.yml|Jobs\/Secret-Detection\.gitlab-ci\.yml|components\/secret-detection/i.test(ci);
-      evidence[p.path] = { hasPipeline: ci !== null, secretDetection: on };
-      if (!on) without.push(p.path);
-    }
-    const observed = { projects: list9.length, withoutSecretDetection: without };
-    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var visibility = {
-  code: "gitlab.repo.visibility",
-  provider: "gitlab",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:5.10"],
-  run: (ctx) => guarded("api.projects", async () => {
-    const list9 = await projects2(ctx);
-    if (list9.length === 0) return unknown("api.no_projects");
-    const open = (ctx.openSource ?? []).map((s) => s.toLowerCase());
-    const exposed = list9.filter((p) => p.visibility === "public" && !open.includes(p.path.toLowerCase())).map((p) => p.path);
-    const observed = { projects: list9.length, publicUndeclared: exposed, declaredOpenSource: open };
-    const evidence = list9.map((p) => ({ path: p.path, visibility: p.visibility ?? null }));
-    return exposed.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var membersReviewed = {
-  code: "gitlab.group.members_reviewed",
-  provider: "gitlab",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:5.18", "soc2:CC6.3", "iso:8.2"],
-  run: (ctx) => guarded("api.group", async () => {
-    if (!ctx.api) throw new Error("scope:api.not_connected");
-    const r = await ctx.api.get(`/groups/${encodeURIComponent(ctx.owner)}/members/all?per_page=100`);
-    if (r.status === 403) throw new Error("scope:members.read");
-    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.members");
-    const members2 = r.json;
-    const active2 = members2.filter((m) => m.state !== "blocked");
-    if (active2.length === 0) return unknown("api.no_members");
-    const now = Date.now();
-    const expired = active2.filter((m) => m.expires_at && new Date(m.expires_at).getTime() < now).map((m) => m.username ?? "?");
-    const owners = active2.filter((m) => (m.access_level ?? 0) >= 50);
-    const ceiling = Math.max(3, Math.ceil(active2.length * 0.25));
-    const observed = { members: active2.length, owners: owners.length, ceiling, expiredStillPresent: expired };
-    const ok = expired.length === 0 && owners.length >= 1 && owners.length <= ceiling;
-    const evidence = active2.map((m) => ({ username: m.username ?? null, accessLevel: m.access_level ?? null, expiresAt: m.expires_at ?? null }));
-    return ok ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var GITLAB_CHECKS = [group2fa, branchProtection2, noEnvCommitted2, hygiene2, secretDetection, visibility, membersReviewed];
-
-// ../lib/checks/providers/fly.ts
-async function apps2(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const max = ctx.maxApps ?? 30;
-  if (ctx.apps?.length) return ctx.apps.slice(0, max).map((name4) => ({ name: name4 }));
-  const r = await ctx.api.get(`/apps?org_slug=${encodeURIComponent(ctx.org)}`);
-  if (r.status === 403) throw new Error("scope:apps.read");
-  if (r.status !== 200) throw new Error("scope:api.apps");
-  const list9 = r.json?.apps ?? [];
-  return list9.filter((a) => a && a.name).slice(0, max);
-}
-async function machines(ctx, app) {
-  const r = await ctx.api.get(`/apps/${encodeURIComponent(app)}/machines`);
-  if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.machines");
-  return r.json;
-}
-var SECRET_KEY3 = /(SECRET|TOKEN|PASSWORD|PRIVATE|API_KEY|_KEY$|^KEY_)/i;
-var PUBLIC_KEY2 = /^(NEXT_PUBLIC_|PUBLIC_|VITE_|EXPO_PUBLIC_|REACT_APP_)|_PUBLIC_KEY$|PUBLISHABLE/i;
-var forceHttps2 = {
-  code: "fly.services.force_https",
-  provider: "fly",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.7", "ce:secure-config", "iso:8.24"],
-  run: (ctx) => guarded("api.machines", async () => {
-    const list9 = await apps2(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
-    const open = {};
-    const evidence = {};
-    for (const a of list9) {
-      const ms = await machines(ctx, a.name);
-      const offenders = [];
-      for (const m of ms) {
-        for (const s of m.config?.services ?? []) {
-          for (const p of s.ports ?? []) {
-            const isHttp = (p.handlers ?? []).includes("http") && !(p.handlers ?? []).includes("tls");
-            if (isHttp && p.force_https !== true) offenders.push(`${m.name ?? m.id}:${p.port ?? "?"}`);
-          }
-        }
-      }
-      evidence[a.name] = { machines: ms.length, plainHttpPorts: offenders };
-      if (offenders.length) open[a.name] = offenders;
-    }
-    const observed = { apps: list9.length, plainHttp: open };
-    return Object.keys(open).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var volumesEncrypted = {
-  code: "fly.volumes.encrypted",
-  provider: "fly",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.7", "iso:8.24", "gdpr:art32"],
-  run: (ctx) => guarded("api.volumes", async () => {
-    const list9 = await apps2(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
-    const plain = {};
-    const evidence = {};
-    let total = 0;
-    for (const a of list9) {
-      const r = await ctx.api.get(`/apps/${encodeURIComponent(a.name)}/volumes`);
-      if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.volumes");
-      const vols = r.json;
-      total += vols.length;
-      const bad = vols.filter((v) => v.encrypted === false).map((v) => v.name ?? v.id ?? "?");
-      evidence[a.name] = vols.map((v) => ({ name: v.name ?? v.id, encrypted: v.encrypted ?? null, sizeGb: v.size_gb ?? null }));
-      if (bad.length) plain[a.name] = bad;
-    }
-    const observed = { apps: list9.length, volumes: total, unencrypted: plain };
-    return Object.keys(plain).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var noPlaintextSecrets = {
-  code: "fly.machines.no_plaintext_secrets",
-  provider: "fly",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:8.24", "ce:secure-config"],
-  run: (ctx) => guarded("api.machines", async () => {
-    const list9 = await apps2(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
-    const leaks = {};
-    const evidence = {};
-    for (const a of list9) {
-      const ms = await machines(ctx, a.name);
-      const keys = /* @__PURE__ */ new Set();
-      for (const m of ms) for (const k of Object.keys(m.config?.env ?? {})) if (SECRET_KEY3.test(k) && !PUBLIC_KEY2.test(k)) keys.add(k);
-      evidence[a.name] = { machines: ms.length, secretLikeEnvKeys: [...keys] };
-      if (keys.size) leaks[a.name] = [...keys];
-    }
-    const observed = { apps: list9.length, plaintext: leaks };
-    return Object.keys(leaks).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var members2fa3 = {
-  code: "fly.org.members_2fa",
-  provider: "fly",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "ce:user-access", "iso:8.5"],
-  run: (ctx) => guarded("api.graphql", async () => {
-    if (!ctx.api) throw new Error("scope:api.not_connected");
-    const r = await ctx.api.graphql(
-      "query SnoopiosMembers($slug: String!) { organization(slug: $slug) { members { edges { role node { email twoFactorProtection } } } } }",
-      { slug: ctx.org }
-    );
-    const body = r.json;
-    if (r.status !== 200 || !body?.data?.organization || body.errors?.length) return unknown("api.members");
-    const edges = body.data.organization.members?.edges ?? [];
-    if (edges.length === 0) return unknown("api.no_members");
-    const mask5 = (e) => e && e.includes("@") ? `${e[0]}\u2026@${e.split("@")[1]}` : "?";
-    const without = edges.filter((e) => e.node?.twoFactorProtection !== true).map((e) => `${e.role ?? "member"} ${mask5(e.node?.email)}`);
-    const observed = { members: edges.length, without2fa: without };
-    const evidence = edges.map((e) => ({ role: e.role ?? null, email: mask5(e.node?.email), twoFactor: e.node?.twoFactorProtection ?? null }));
-    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var certificates = {
-  code: "fly.app.certificates",
-  provider: "fly",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.7", "iso:8.24"],
-  run: (ctx) => guarded("api.graphql", async () => {
-    const list9 = await apps2(ctx);
-    if (list9.length === 0) return unknown("api.no_apps");
-    const pending = {};
-    const evidence = {};
-    let hostnames = 0;
-    for (const a of list9) {
-      const r = await ctx.api.graphql("query SnoopiosCerts($name: String!) { app(name: $name) { certificates { nodes { hostname clientStatus } } } }", { name: a.name });
-      const body = r.json;
-      if (r.status !== 200 || !body?.data?.app || body.errors?.length) return unknown("api.certificates");
-      const certs = body.data.app.certificates?.nodes ?? [];
-      hostnames += certs.length;
-      const bad = certs.filter((c) => (c.clientStatus ?? "").toLowerCase() !== "ready").map((c) => `${c.hostname ?? "?"} (${c.clientStatus ?? "unknown"})`);
-      evidence[a.name] = certs;
-      if (bad.length) pending[a.name] = bad;
-    }
-    const observed = { apps: list9.length, hostnames, notReady: pending };
-    return Object.keys(pending).length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var FLY_CHECKS = [forceHttps2, volumesEncrypted, noPlaintextSecrets, members2fa3, certificates];
-
-// ../lib/checks/providers/vercel.ts
-async function projects3(ctx) {
-  const r = await ctx.api.get("/v9/projects?limit=100");
-  if (r.status !== 200) throw new Error("scope:projects.list");
-  const list9 = (r.json?.projects ?? []).filter((p) => p && p.id);
-  return { list: list9, raw: r.json };
-}
-var SUPPORTED_NODE = /* @__PURE__ */ new Set(["22.x", "24.x"]);
-var previewProtection = {
-  code: "vercel.projects.preview_protection",
-  provider: "vercel",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "iso:8.3", "iso:8.31"],
-  run: (ctx) => guarded("projects.list", async () => {
-    const { list: list9, raw } = await projects3(ctx);
-    const unprotected = list9.filter((p) => !p.ssoProtection && !p.passwordProtection).map((p) => p.name);
-    const observed = { projects: list9.length, unprotected };
-    return list9.length > 0 && unprotected.length === 0 ? pass(observed, raw) : fail(observed, raw);
-  })
-};
-var forkProtection = {
-  code: "vercel.projects.fork_protection",
-  provider: "vercel",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC8.1", "iso:8.32", "iso:8.25"],
-  run: (ctx) => guarded("projects.list", async () => {
-    const { list: list9, raw } = await projects3(ctx);
-    const linked = list9.filter((p) => p.link?.type);
-    const unprotected = linked.filter((p) => p.gitForkProtection !== true).map((p) => p.name);
-    const observed = { gitLinked: linked.length, unprotected };
-    return unprotected.length === 0 ? pass(observed, raw) : fail(observed, raw);
-  })
-};
-var nodeSupported = {
-  code: "vercel.projects.node_supported",
-  provider: "vercel",
-  version: 1,
-  severity: "medium",
-  maps: ["ce:patching", "iso:8.8", "soc2:CC7.1"],
-  run: (ctx) => guarded("projects.list", async () => {
-    const { list: list9, raw } = await projects3(ctx);
-    const outdated = list9.filter((p) => p.nodeVersion && !SUPPORTED_NODE.has(p.nodeVersion)).map((p) => `${p.name} (${p.nodeVersion})`);
-    const observed = { projects: list9.length, supported: [...SUPPORTED_NODE], outdated };
-    return outdated.length === 0 ? pass(observed, raw) : fail(observed, raw);
-  })
-};
-var domainsVerified2 = {
-  code: "vercel.domains.verified",
-  provider: "vercel",
-  version: 1,
-  severity: "medium",
-  maps: ["iso:8.9", "soc2:CC6.7"],
-  run: (ctx) => guarded("projects.domains", async () => {
-    const { list: list9 } = await projects3(ctx);
-    const unverified = [];
-    let total = 0;
-    const evidence = {};
-    for (const p of list9.slice(0, 50)) {
-      const r = await ctx.api.get(`/v9/projects/${encodeURIComponent(p.id)}/domains`);
-      if (r.status !== 200) throw new Error("scope:projects.domains");
-      const domains = r.json?.domains ?? [];
-      evidence[p.name] = domains;
-      for (const d of domains) {
-        total++;
-        if (d.verified !== true) unverified.push(d.name);
-      }
-    }
-    const observed = { domains: total, unverified };
-    return unverified.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var noRecentErrors = {
-  code: "vercel.deployments.no_recent_errors",
-  provider: "vercel",
-  version: 1,
-  severity: "low",
-  maps: ["soc2:CC7.2", "iso:8.16"],
-  run: (ctx) => guarded("deployments.list", async () => {
-    const since = Date.now() - 30 * 864e5;
-    const r = await ctx.api.get(`/v6/deployments?limit=100&state=ERROR&target=production&since=${since}`);
-    if (r.status !== 200) throw new Error("scope:deployments.list");
-    const list9 = r.json?.deployments ?? [];
-    const observed = { failedProductionDeployments30d: list9.length, projects: [...new Set(list9.map((d) => d.name ?? "?"))].slice(0, 10) };
-    return list9.length === 0 ? pass(observed, r.json) : fail(observed, r.json);
-  })
-};
-var VERCEL_CHECKS = [previewProtection, forkProtection, nodeSupported, domainsVerified2, noRecentErrors];
-
-// ../lib/checks/providers/atlas.ts
-async function list3(ctx, resource, scope) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const r = await ctx.api.get(`/groups/${encodeURIComponent(ctx.projectId)}/${resource}?itemsPerPage=500`);
-  if (r.status === 403) throw new Error(`scope:${scope}.read`);
-  if (r.status !== 200) throw new Error(`scope:api.${scope}`);
-  return r.json?.results ?? [];
-}
-var SUPPORTED_MAJOR = /* @__PURE__ */ new Set(["8.0", "8.1", "8.2"]);
-var ADMIN_ROLES = /* @__PURE__ */ new Set(["atlasAdmin", "readWriteAnyDatabase", "dbAdminAnyDatabase", "userAdminAnyDatabase", "root", "clusterAdmin"]);
-var ipAccessList = {
-  code: "atlas.project.ip_access_list",
-  provider: "atlas",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
-  run: (ctx) => guarded("api.access_list", async () => {
-    const entries2 = await list3(ctx, "accessList", "access_list");
-    if (shapeMismatch(entries2, (e) => [e.cidrBlock, e.ipAddress])) return unknown("api.shape.cidrBlock");
-    const open = entries2.filter((e) => e.cidrBlock === "0.0.0.0/0" || e.cidrBlock === "::/0").map((e) => e.cidrBlock ?? "");
-    const observed = { entries: entries2.length, openToInternet: open };
-    const evidence = entries2.map((e) => ({ cidr: e.cidrBlock ?? e.ipAddress ?? null, comment: e.comment ?? null }));
-    if (entries2.length === 0) return fail({ ...observed, note: "no entries: nothing can connect, or private endpoints only" }, evidence);
-    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var backupsEnabled = {
-  code: "atlas.cluster.backups_enabled",
-  provider: "atlas",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:A1.2", "iso:8.13", "gdpr:art32"],
-  run: (ctx) => guarded("api.clusters", async () => {
-    const clusters = await list3(ctx, "clusters", "clusters");
-    if (clusters.length === 0) return unknown("api.no_clusters");
-    if (shapeMismatch(clusters, (c) => [c.backupEnabled])) return unknown("api.shape.backupEnabled");
-    const off = clusters.filter((c) => c.backupEnabled !== true).map((c) => c.name);
-    const observed = { clusters: clusters.length, withoutBackups: off };
-    const evidence = clusters.map((c) => ({ name: c.name, backupEnabled: c.backupEnabled ?? null, type: c.clusterType ?? null }));
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var versionSupported = {
-  code: "atlas.cluster.version_supported",
-  provider: "atlas",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
-  run: (ctx) => guarded("api.clusters", async () => {
-    const clusters = await list3(ctx, "clusters", "clusters");
-    if (clusters.length === 0) return unknown("api.no_clusters");
-    if (shapeMismatch(clusters, (c) => [c.mongoDBMajorVersion])) return unknown("api.shape.mongoDBMajorVersion");
-    const old = clusters.filter((c) => !SUPPORTED_MAJOR.has(c.mongoDBMajorVersion ?? "")).map((c) => `${c.name} (${c.mongoDBMajorVersion ?? "unknown"})`);
-    const observed = { clusters: clusters.length, unsupportedVersion: old, supported: [...SUPPORTED_MAJOR] };
-    const evidence = clusters.map((c) => ({ name: c.name, version: c.mongoDBMajorVersion ?? null }));
-    return old.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var terminationProtection = {
-  code: "atlas.cluster.termination_protection",
-  provider: "atlas",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:A1.2", "soc2:CC6.1", "iso:8.13"],
-  run: (ctx) => guarded("api.clusters", async () => {
-    const clusters = await list3(ctx, "clusters", "clusters");
-    if (clusters.length === 0) return unknown("api.no_clusters");
-    if (shapeMismatch(clusters, (c) => [c.terminationProtectionEnabled])) return unknown("api.shape.terminationProtectionEnabled");
-    const off = clusters.filter((c) => c.terminationProtectionEnabled !== true).map((c) => c.name);
-    const observed = { clusters: clusters.length, deletable: off };
-    const evidence = clusters.map((c) => ({ name: c.name, terminationProtection: c.terminationProtectionEnabled ?? null }));
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var leastPrivilegeUsers = {
-  code: "atlas.db_users.least_privilege",
-  provider: "atlas",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
-  run: (ctx) => guarded("api.database_users", async () => {
-    const users3 = await list3(ctx, "databaseUsers", "database_users");
-    if (users3.length === 0) return unknown("api.no_database_users");
-    if (shapeMismatch(users3, (u) => [u.roles])) return unknown("api.shape.roles");
-    const admins = users3.filter((u) => (u.roles ?? []).some((r) => ADMIN_ROLES.has(r.roleName ?? ""))).map((u) => u.username ?? "?");
-    const observed = { users: users3.length, withAdminRole: admins };
-    const evidence = users3.map((u) => ({ username: u.username ?? null, roles: (u.roles ?? []).map((r) => `${r.roleName}@${r.databaseName}`) }));
-    return admins.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var ATLAS_CHECKS = [ipAccessList, backupsEnabled, versionSupported, terminationProtection, leastPrivilegeUsers];
-
-// ../lib/checks/providers/digitalocean.ts
-async function get2(ctx, path, key, scope) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const r = await ctx.api.get(path);
-  if (r.status === 403) throw new Error(`scope:${scope}.read`);
-  if (r.status !== 200) throw new Error(`scope:api.${scope}`);
-  const items = r.json?.[key];
-  return Array.isArray(items) ? items : [];
-}
-var publicDroplets = (ds) => ds.filter((d) => d.status === "active" && (d.networks?.v4 ?? []).some((n) => n.type === "public"));
-var dropletFirewall = {
-  code: "do.droplet.firewall",
-  provider: "digitalocean",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
-  run: (ctx) => guarded("api.droplets", async () => {
-    const droplets = publicDroplets(await get2(ctx, "/droplets?per_page=200", "droplets", "droplets"));
-    if (droplets.length === 0) return unknown("api.no_public_droplets");
-    const firewalls = await get2(ctx, "/firewalls?per_page=200", "firewalls", "firewalls");
-    const covered2 = /* @__PURE__ */ new Set();
-    const taggedFirewalls = /* @__PURE__ */ new Set();
-    for (const f of firewalls) {
-      for (const id of f.droplet_ids ?? []) covered2.add(id);
-      for (const t of f.tags ?? []) taggedFirewalls.add(t);
-    }
-    const bare = droplets.filter((d) => !covered2.has(d.id) && !(d.tags ?? []).some((t) => taggedFirewalls.has(t))).map((d) => d.name);
-    const observed = { publicDroplets: droplets.length, firewalls: firewalls.length, withoutFirewall: bare };
-    const evidence = droplets.map((d) => ({ name: d.name, covered: covered2.has(d.id) || (d.tags ?? []).some((t) => taggedFirewalls.has(t)) }));
-    return bare.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var dropletBackups = {
-  code: "do.droplet.backups",
-  provider: "digitalocean",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:A1.2", "iso:8.13"],
-  run: (ctx) => guarded("api.droplets", async () => {
-    const droplets = (await get2(ctx, "/droplets?per_page=200", "droplets", "droplets")).filter((d) => d.status === "active");
-    if (droplets.length === 0) return unknown("api.no_droplets");
-    if (shapeMismatch(droplets, (d) => [d.features])) return unknown("api.shape.features");
-    const off = droplets.filter((d) => !(d.features ?? []).includes("backups")).map((d) => d.name);
-    const observed = { droplets: droplets.length, withoutBackups: off };
-    const evidence = droplets.map((d) => ({ name: d.name, features: d.features ?? [] }));
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var databaseTrustedSources = {
-  code: "do.database.trusted_sources",
-  provider: "digitalocean",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
-  run: (ctx) => guarded("api.databases", async () => {
-    const dbs = await get2(ctx, "/databases", "databases", "databases");
-    if (dbs.length === 0) return unknown("api.no_databases");
-    const open = [];
-    const evidence = {};
-    for (const db of dbs) {
-      const rules = await get2(ctx, `/databases/${encodeURIComponent(db.id)}/firewall`, "rules", "database_firewall");
-      evidence[db.name] = rules.map((r) => ({ type: r.type ?? null, value: r.type === "ip_addr" ? r.value ?? null : "\u2026" }));
-      if (rules.length === 0) open.push(db.name);
-    }
-    const observed = { databases: dbs.length, openToAnyAddress: open };
-    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var databaseVersionSupported = {
-  code: "do.database.version_supported",
-  provider: "digitalocean",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC7.1", "iso:8.8", "ce:patching"],
-  run: (ctx) => guarded("api.databases", async () => {
-    const dbs = await get2(ctx, "/databases", "databases", "databases");
-    if (dbs.length === 0) return unknown("api.no_databases");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    const eol = dbs.filter((db) => db.version_end_of_life && Date.parse(db.version_end_of_life) < now).map((db) => `${db.name} (${db.engine ?? "?"} ${db.version ?? "?"})`);
-    const observed = { databases: dbs.length, pastEndOfLife: eol };
-    const evidence = dbs.map((db) => ({ name: db.name, engine: db.engine ?? null, version: db.version ?? null, endOfLife: db.version_end_of_life ?? null }));
-    return eol.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var DIGITALOCEAN_CHECKS = [dropletFirewall, dropletBackups, databaseTrustedSources, databaseVersionSupported];
-
-// ../lib/checks/providers/auth0.ts
-async function get3(ctx, path, scope) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const r = await ctx.api.get(path);
-  if (r.status === 403) throw new Error(`scope:scope.${scope}`);
-  if (r.status !== 200) throw new Error(`scope:api.${scope}`);
-  return r.json;
-}
-var PER_PAGE = 100;
-var MAX_PAGES3 = 5;
-async function clients(ctx) {
-  const out = [];
-  for (let page = 0; page < MAX_PAGES3; page++) {
-    const batch = await get3(ctx, `/clients?page=${page}&per_page=${PER_PAGE}&is_global=false&fields=client_id,name,app_type,callbacks,allowed_logout_urls,web_origins,grant_types,refresh_token`, "clients");
-    if (!Array.isArray(batch)) throw new Error("scope:api.clients");
-    out.push(...batch);
-    if (batch.length < PER_PAGE) break;
-  }
-  return out;
-}
-var LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+)(:\d+)?$/i;
-function insecureUrl(u) {
-  try {
-    const url = new URL(u);
-    if (url.protocol === "http:") return true;
-    if (url.protocol === "https:") return LOCAL_HOST.test(url.host);
-    return false;
-  } catch {
-    return u.startsWith("http://");
-  }
-}
-var attackProtection = {
-  code: "auth0.attack_protection.enabled",
-  provider: "auth0",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "soc2:CC6.6", "iso:8.5", "ce:user-access"],
-  run: (ctx) => guarded("api.attack_protection", async () => {
-    const [brute, breached, throttle] = await Promise.all([
-      get3(ctx, "/attack-protection/brute-force-protection", "attack_protection"),
-      get3(ctx, "/attack-protection/breached-password-detection", "attack_protection"),
-      get3(ctx, "/attack-protection/suspicious-ip-throttling", "attack_protection")
-    ]);
-    const observed = { bruteForceProtection: brute.enabled === true, breachedPasswordDetection: breached.enabled === true, suspiciousIpThrottling: throttle.enabled === true };
-    if (brute.enabled === void 0 && breached.enabled === void 0 && throttle.enabled === void 0) return unknown("api.shape.enabled");
-    const off = Object.entries(observed).filter(([, v]) => !v).map(([k]) => k);
-    return off.length === 0 ? pass({ ...observed, off }, observed) : fail({ ...observed, off }, observed);
-  })
-};
-var mfaEnforced2 = {
-  code: "auth0.mfa.enforced",
-  provider: "auth0",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:5.17", "iso:8.5", "ce:user-access"],
-  run: (ctx) => guarded("api.mfa", async () => {
-    const policies = await get3(ctx, "/guardian/policies", "mfa_policies");
-    const factors = await get3(ctx, "/guardian/factors", "guardian_factors");
-    const enabledFactors = (Array.isArray(factors) ? factors : []).filter((f) => f.enabled === true).map((f) => f.name ?? "?");
-    const enforced = Array.isArray(policies) && policies.some((p) => p === "all-applications" || p === "confidence-score");
-    const observed = { policies: Array.isArray(policies) ? policies : [], enforced, enabledFactors };
-    return enforced && enabledFactors.length > 0 ? pass(observed, observed) : fail(observed, observed);
-  })
-};
-var callbacksHttps = {
-  code: "auth0.clients.callbacks_https",
-  provider: "auth0",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.7", "iso:8.24", "iso:8.26"],
-  run: (ctx) => guarded("api.clients", async () => {
-    const all = await clients(ctx);
-    if (all.length === 0) return unknown("api.no_clients");
-    if (shapeMismatch(all, (c) => [c.callbacks, c.allowed_logout_urls, c.web_origins, c.app_type])) return unknown("api.shape.callbacks");
-    const bad = all.map((c) => ({ name: c.name ?? c.client_id ?? "?", urls: [...c.callbacks ?? [], ...c.allowed_logout_urls ?? [], ...c.web_origins ?? []].filter(insecureUrl) })).filter((c) => c.urls.length > 0);
-    const observed = { clients: all.length, withInsecureUrls: bad.map((b) => b.name) };
-    const evidence = all.map((c) => ({ name: c.name ?? null, appType: c.app_type ?? null, urls: [...c.callbacks ?? [], ...c.allowed_logout_urls ?? [], ...c.web_origins ?? []].length, insecure: bad.find((b) => b.name === (c.name ?? c.client_id))?.urls ?? [] }));
-    return bad.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var refreshTokenRotation = {
-  code: "auth0.clients.refresh_token_rotation",
-  provider: "auth0",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:8.5"],
-  run: (ctx) => guarded("api.clients", async () => {
-    const refreshing = (await clients(ctx)).filter((c) => (c.grant_types ?? []).includes("refresh_token") && (c.app_type === "spa" || c.app_type === "native"));
-    if (refreshing.length === 0) return unknown("api.no_public_clients_with_refresh");
-    if (shapeMismatch(refreshing, (c) => [c.refresh_token])) return unknown("api.shape.refresh_token");
-    const weak = refreshing.filter((c) => c.refresh_token?.rotation_type !== "rotating" || c.refresh_token?.expiration_type !== "expiring").map((c) => c.name ?? c.client_id ?? "?");
-    const observed = { publicClientsWithRefresh: refreshing.length, withoutRotation: weak };
-    const evidence = refreshing.map((c) => ({ name: c.name ?? null, appType: c.app_type ?? null, rotation: c.refresh_token?.rotation_type ?? null, expiration: c.refresh_token?.expiration_type ?? null }));
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var MAX_SESSION_HOURS = 30 * 24;
-var MAX_IDLE_HOURS = 7 * 24;
-var sessionLifetime = {
-  code: "auth0.tenant.session_lifetime",
-  provider: "auth0",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:8.5"],
-  run: (ctx) => guarded("api.tenant_settings", async () => {
-    const t = await get3(ctx, "/tenants/settings?fields=session_lifetime,idle_session_lifetime", "tenant_settings");
-    if (t.session_lifetime === void 0 && t.idle_session_lifetime === void 0) return unknown("api.shape.session_lifetime");
-    const session = typeof t.session_lifetime === "number" ? t.session_lifetime : 168;
-    const idle = typeof t.idle_session_lifetime === "number" ? t.idle_session_lifetime : 72;
-    const observed = { sessionLifetimeHours: session, idleSessionLifetimeHours: idle, maxSessionHours: MAX_SESSION_HOURS, maxIdleHours: MAX_IDLE_HOURS };
-    return session <= MAX_SESSION_HOURS && idle <= MAX_IDLE_HOURS ? pass(observed, observed) : fail(observed, observed);
-  })
-};
-var STRONG = /* @__PURE__ */ new Set(["good", "excellent"]);
-var passwordPolicy = {
-  code: "auth0.connections.password_policy",
-  provider: "auth0",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access"],
-  run: (ctx) => guarded("api.connections", async () => {
-    const conns = await get3(ctx, "/connections?strategy=auth0&per_page=100&fields=id,name,strategy,options", "connections");
-    const db = (Array.isArray(conns) ? conns : []).filter((c) => c.strategy === "auth0");
-    if (db.length === 0) return unknown("api.no_database_connections");
-    if (db.every((c) => !c.options || !("passwordPolicy" in c.options))) return unknown("scope.connections_options", { connections: db.length });
-    const weak = db.filter((c) => !STRONG.has(c.options?.passwordPolicy ?? "")).map((c) => `${c.name ?? c.id ?? "?"} (${c.options?.passwordPolicy ?? "none"})`);
-    const observed = { databaseConnections: db.length, weakPolicy: weak };
-    const evidence = db.map((c) => ({ name: c.name ?? null, passwordPolicy: c.options?.passwordPolicy ?? null }));
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var AUTH0_CHECKS = [attackProtection, mfaEnforced2, callbacksHttps, refreshTokenRotation, sessionLifetime, passwordPolicy];
-
-// ../lib/checks/providers/bitbucket.ts
-var PAGELEN = 100;
-var MAX_PAGES4 = 10;
-var MAX_REPOS = 50;
-async function list4(ctx, path, scope) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const out = [];
-  for (let page = 1; page <= MAX_PAGES4; page++) {
-    const r = await ctx.api.get(`${path}${path.includes("?") ? "&" : "?"}pagelen=${PAGELEN}&page=${page}`);
-    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
-    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
-    const body = r.json;
-    out.push(...body?.values ?? []);
-    if (!body?.next) break;
-  }
-  return out;
-}
-async function repos(ctx) {
-  const all = await list4(ctx, `/repositories/${encodeURIComponent(ctx.workspace)}`, "repositories");
-  return all.slice(0, MAX_REPOS);
-}
-var repoPath = (ctx, r) => `/repositories/${encodeURIComponent(ctx.workspace)}/${encodeURIComponent(r.slug ?? "")}`;
-var name = (r) => r.full_name ?? r.slug ?? "?";
-var reposPrivate = {
-  code: "bitbucket.repos.private",
-  provider: "bitbucket",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:8.3", "iso:8.4"],
-  run: (ctx) => guarded("api.repositories", async () => {
-    const all = await repos(ctx);
-    if (all.length === 0) return unknown("api.no_repositories");
-    if (shapeMismatch(all, (r) => [r.is_private])) return unknown("api.shape.is_private");
-    const open = all.filter((r) => r.is_private !== true).map(name);
-    const observed = { repositories: all.length, public: open };
-    const evidence = all.map((r) => ({ name: name(r), private: r.is_private ?? null }));
-    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var forkPolicy = {
-  code: "bitbucket.repos.fork_policy",
-  provider: "bitbucket",
-  version: 1,
-  severity: "low",
-  maps: ["soc2:CC6.1", "iso:8.4"],
-  run: (ctx) => guarded("api.repositories", async () => {
-    const priv = (await repos(ctx)).filter((r) => r.is_private === true);
-    if (priv.length === 0) return unknown("api.no_private_repositories");
-    if (shapeMismatch(priv, (r) => [r.fork_policy])) return unknown("api.shape.fork_policy");
-    const loose = priv.filter((r) => r.fork_policy === "allow_forks").map(name);
-    const observed = { privateRepositories: priv.length, publicForksAllowed: loose };
-    const evidence = priv.map((r) => ({ name: name(r), forkPolicy: r.fork_policy ?? null }));
-    return loose.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var defaultReviewers = {
-  code: "bitbucket.repos.default_reviewers",
-  provider: "bitbucket",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC8.1", "iso:8.25", "iso:8.29"],
-  run: (ctx) => guarded("api.default_reviewers", async () => {
-    const all = await repos(ctx);
-    if (all.length === 0) return unknown("api.no_repositories");
-    const without = [];
-    const evidence = [];
-    for (const r of all) {
-      const reviewers = await list4(ctx, `${repoPath(ctx, r)}/effective-default-reviewers`, "pullrequest");
-      evidence.push({ name: name(r), reviewers: reviewers.length });
-      if (reviewers.length === 0) without.push(name(r));
-    }
-    const observed = { repositories: all.length, withoutDefaultReviewers: without };
-    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var STALE_DAYS2 = 90;
-var NEW_DAYS2 = 30;
-var DAY2 = 24 * 3600 * 1e3;
-var deployKeysRecent = {
-  code: "bitbucket.deploy_keys.recent",
-  provider: "bitbucket",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "soc2:CC6.3", "iso:5.18", "iso:8.2"],
-  run: (ctx) => guarded("api.deploy_keys", async () => {
-    const all = await repos(ctx);
-    if (all.length === 0) return unknown("api.no_repositories");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    const stale = [];
-    const evidence = [];
-    for (const r of all) {
-      const keys = await list4(ctx, `${repoPath(ctx, r)}/deploy-keys`, "ssh_key");
-      for (const k of keys) {
-        const used = k.last_used ? Date.parse(k.last_used) : NaN;
-        const added = k.added_on ? Date.parse(k.added_on) : NaN;
-        const fresh = Number.isFinite(used) && now - used <= STALE_DAYS2 * DAY2 || Number.isFinite(added) && now - added <= NEW_DAYS2 * DAY2;
-        evidence.push({ repository: name(r), label: k.label ?? null, addedOn: k.added_on ?? null, lastUsed: k.last_used ?? null });
-        if (!fresh) stale.push(`${name(r)}: ${k.label ?? k.id ?? "?"}`);
-      }
-    }
-    if (evidence.length === 0) return unknown("api.no_deploy_keys", { repositories: all.length });
-    const observed = { deployKeys: evidence.length, staleDays: STALE_DAYS2, stale };
-    return stale.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var SECRET_NAME = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE)/i;
-var pipelineSecrets = {
-  code: "bitbucket.pipelines.secured_variables",
-  provider: "bitbucket",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:8.12", "iso:8.28"],
-  run: (ctx) => guarded("api.pipeline_variables", async () => {
-    const all = await repos(ctx);
-    if (all.length === 0) return unknown("api.no_repositories");
-    const exposed = [];
-    const evidence = [];
-    for (const r of all) {
-      if (!ctx.api) throw new Error("scope:api.not_connected");
-      const probe = await ctx.api.get(`${repoPath(ctx, r)}/pipelines_config/variables?pagelen=1`);
-      if (probe.status === 404) continue;
-      if (probe.status === 403) throw new Error("scope:scope.pipeline");
-      const vars = await list4(ctx, `${repoPath(ctx, r)}/pipelines_config/variables`, "pipeline");
-      for (const v of vars) {
-        const key = v.key ?? "?";
-        if (!SECRET_NAME.test(key)) continue;
-        evidence.push({ repository: name(r), variable: key, secured: v.secured === true });
-        if (v.secured !== true) exposed.push(`${name(r)}: ${key}`);
-      }
-    }
-    if (evidence.length === 0) return unknown("api.no_secret_named_variables", { repositories: all.length });
-    const observed = { secretNamedVariables: evidence.length, unsecured: exposed };
-    return exposed.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var accountTwoFactor = {
-  code: "bitbucket.account.two_factor",
-  provider: "bitbucket",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access"],
-  run: (ctx) => guarded("api.user", async () => {
-    if (!ctx.api) throw new Error("scope:api.not_connected");
-    const r = await ctx.api.get("/user");
-    if (r.status === 403) throw new Error("scope:scope.user");
-    if (r.status !== 200) throw new Error("scope:api.user");
-    const u = r.json;
-    if (typeof u?.has_2fa_enabled !== "boolean") return unknown("api.two_factor_unreported");
-    const observed = { account: u.display_name ?? null, twoStepVerification: u.has_2fa_enabled };
-    return u.has_2fa_enabled ? pass(observed, observed) : fail(observed, observed);
-  })
-};
-var BITBUCKET_CHECKS = [reposPrivate, forkPolicy, defaultReviewers, deployKeysRecent, pipelineSecrets, accountTwoFactor];
-
-// ../lib/checks/providers/hetzner.ts
-var PER_PAGE2 = 50;
-var MAX_PAGES5 = 10;
-async function list5(ctx, resource) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const out = [];
-  for (let page = 1; page <= MAX_PAGES5; page++) {
-    const r = await ctx.api.get(`/${resource}?per_page=${PER_PAGE2}&page=${page}`);
-    if (r.status === 403) throw new Error(`scope:scope.${resource}`);
-    if (r.status !== 200) throw new Error(`scope:api.${resource}`);
-    const body = r.json;
-    const items = body?.[resource];
-    if (!Array.isArray(items)) throw new Error(`scope:api.${resource}`);
-    out.push(...items);
-    if (!body?.meta?.pagination?.next_page) break;
-  }
-  return out;
-}
-var live = (s) => s.status !== "deleting";
-var isPublic2 = (s) => Boolean(s.public_net?.ipv4?.ip || s.public_net?.ipv6?.ip);
-var name2 = (s) => s.name ?? String(s.id ?? "?");
-var serverFirewall = {
-  code: "hetzner.server.firewall",
-  provider: "hetzner",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls"],
-  run: (ctx) => guarded("api.servers", async () => {
-    const servers = (await list5(ctx, "servers")).filter(live).filter(isPublic2);
-    if (servers.length === 0) return unknown("api.no_public_servers");
-    if (shapeMismatch(servers, (s) => [s.public_net?.firewalls])) return unknown("api.shape.firewalls");
-    const bare = servers.filter((s) => !(s.public_net?.firewalls ?? []).some((f) => f.status === "applied")).map(name2);
-    const observed = { publicServers: servers.length, withoutFirewall: bare };
-    const evidence = servers.map((s) => ({ name: name2(s), firewalls: (s.public_net?.firewalls ?? []).map((f) => ({ id: f.id ?? null, status: f.status ?? null })) }));
-    return bare.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var serverBackups = {
-  code: "hetzner.server.backups",
-  provider: "hetzner",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:A1.2", "iso:8.13", "gdpr:art32"],
-  run: (ctx) => guarded("api.servers", async () => {
-    const servers = (await list5(ctx, "servers")).filter(live);
-    if (servers.length === 0) return unknown("api.no_servers");
-    if (shapeMismatch(servers, (s) => [s.backup_window])) return unknown("api.shape.backup_window");
-    const off = servers.filter((s) => !s.backup_window).map(name2);
-    const observed = { servers: servers.length, withoutBackups: off };
-    const evidence = servers.map((s) => ({ name: name2(s), backupWindow: s.backup_window ?? null }));
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var deleteProtection = {
-  code: "hetzner.server.delete_protection",
-  provider: "hetzner",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:A1.2", "soc2:CC6.1", "iso:8.13"],
-  run: (ctx) => guarded("api.servers", async () => {
-    const servers = (await list5(ctx, "servers")).filter(live);
-    if (servers.length === 0) return unknown("api.no_servers");
-    if (shapeMismatch(servers, (s) => [s.protection])) return unknown("api.shape.protection");
-    const off = servers.filter((s) => s.protection?.delete !== true).map(name2);
-    const observed = { servers: servers.length, deletable: off };
-    const evidence = servers.map((s) => ({ name: name2(s), deleteProtection: s.protection?.delete ?? null, rebuildProtection: s.protection?.rebuild ?? null }));
-    return off.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var ADMIN_PORTS = [22, 3389, 5900, 2375, 2376, 3306, 5432, 6379, 27017, 9200, 11211];
-var ANYWHERE = /* @__PURE__ */ new Set(["0.0.0.0/0", "::/0"]);
-function coversAdminPort(port) {
-  if (!port) return [];
-  const m = /^(\d+)(?:-(\d+))?$/.exec(port.trim());
-  if (!m) return [];
-  const lo = Number(m[1]);
-  const hi = m[2] ? Number(m[2]) : lo;
-  return ADMIN_PORTS.filter((p) => p >= lo && p <= hi);
-}
-var adminPortsRestricted = {
-  code: "hetzner.firewall.admin_ports_restricted",
-  provider: "hetzner",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls", "ce:secure-config"],
-  run: (ctx) => guarded("api.firewalls", async () => {
-    const firewalls = (await list5(ctx, "firewalls")).filter((f) => (f.applied_to ?? []).length > 0);
-    if (firewalls.length === 0) return unknown("api.no_applied_firewalls");
-    if (shapeMismatch(firewalls, (f) => [f.rules])) return unknown("api.shape.rules");
-    const open = [];
-    const evidence = firewalls.map((f) => {
-      const exposed = (f.rules ?? []).filter((r) => r.direction === "in" && (r.protocol === "tcp" || r.protocol === "udp") && (r.source_ips ?? []).some((ip) => ANYWHERE.has(ip))).flatMap((r) => coversAdminPort(r.port));
-      const ports = [...new Set(exposed)].sort((a, b) => a - b);
-      if (ports.length) open.push(`${name2(f)}: ${ports.join(", ")}`);
-      return { name: name2(f), rules: (f.rules ?? []).length, adminPortsOpenToInternet: ports };
-    });
-    const observed = { firewalls: firewalls.length, adminPortsOpen: open };
-    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var loadBalancerHttps = {
-  code: "hetzner.load_balancer.https",
-  provider: "hetzner",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
-  run: (ctx) => guarded("api.load_balancers", async () => {
-    const lbs = (await list5(ctx, "load_balancers")).filter((lb) => lb.public_net?.enabled !== false);
-    if (lbs.length === 0) return unknown("api.no_public_load_balancers");
-    if (shapeMismatch(lbs, (lb) => [lb.services])) return unknown("api.shape.services");
-    const weak = lbs.filter((lb) => {
-      const services2 = lb.services ?? [];
-      const https = services2.filter((s) => s.protocol === "https");
-      const plainHttp = services2.filter((s) => s.protocol === "http" && s.listen_port === 80);
-      return https.length === 0 || !https.every((s) => (s.http?.certificates ?? []).length > 0 && s.http?.redirect_http === true) || plainHttp.length > 0;
-    }).map(name2);
-    const observed = { publicLoadBalancers: lbs.length, withoutHttpsRedirect: weak };
-    const evidence = lbs.map((lb) => ({ name: name2(lb), services: (lb.services ?? []).map((s) => ({ protocol: s.protocol ?? null, port: s.listen_port ?? null, certificates: (s.http?.certificates ?? []).length, redirectHttp: s.http?.redirect_http ?? null })) }));
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var HETZNER_CHECKS = [serverFirewall, serverBackups, deleteProtection, adminPortsRestricted, loadBalancerHttps];
-
-// ../lib/checks/providers/azure.ts
-var ROLE_OWNER = "8e3af657-a8ff-443c-a75c-2fe8c4bcb635";
-var MAX_PAGES6 = 10;
-async function list6(api4, path, scope) {
-  const out = [];
-  let next = path;
-  for (let i = 0; i < MAX_PAGES6 && next; i++) {
-    const r = await api4.get(next);
-    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
-    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
-    const body = r.json;
-    out.push(...body?.value ?? []);
-    next = body?.nextLink;
-  }
-  return out;
-}
-var roleTail = (id) => (id ?? "").split("/").pop()?.toLowerCase() ?? "";
-var sub = (ctx) => `/subscriptions/${encodeURIComponent(ctx.subscriptionId)}`;
-function api(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  return ctx.api;
-}
-var name3 = (r) => r.name ?? r.id ?? "?";
-var storageLockedDown = {
-  code: "azure.storage.locked_down",
-  provider: "azure",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "soc2:CC6.7", "iso:8.20", "iso:8.24", "ce:secure-config"],
-  run: (ctx) => guarded("api.storage", async () => {
-    const accounts = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Storage/storageAccounts?api-version=2023-05-01`, "storage");
-    if (accounts.length === 0) return unknown("api.no_storage_accounts");
-    if (shapeMismatch(accounts, (a) => [a.properties])) return unknown("api.shape.properties");
-    const weak = accounts.filter((a) => a.properties?.allowBlobPublicAccess === true || a.properties?.supportsHttpsTrafficOnly !== true || (a.properties?.minimumTlsVersion ?? "TLS1_0") < "TLS1_2").map(name3);
-    const observed = { storageAccounts: accounts.length, weak };
-    const evidence = accounts.map((a) => ({ name: name3(a), blobPublicAccess: a.properties?.allowBlobPublicAccess ?? null, httpsOnly: a.properties?.supportsHttpsTrafficOnly ?? null, minimumTls: a.properties?.minimumTlsVersion ?? null, publicNetworkAccess: a.properties?.publicNetworkAccess ?? null }));
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var ADMIN_PORTS2 = [22, 3389, 5900, 2375, 2376, 1433, 3306, 5432, 6379, 27017, 9200, 11211];
-var ANYWHERE2 = /* @__PURE__ */ new Set(["*", "internet", "0.0.0.0/0", "::/0", "any"]);
-function portsCovered(range) {
-  if (!range) return [];
-  if (range.trim() === "*") return [...ADMIN_PORTS2];
-  const m = /^(\d+)(?:-(\d+))?$/.exec(range.trim());
-  if (!m) return [];
-  const lo = Number(m[1]);
-  const hi = m[2] ? Number(m[2]) : lo;
-  return ADMIN_PORTS2.filter((p) => p >= lo && p <= hi);
-}
-var nsgAdminPorts = {
-  code: "azure.nsg.admin_ports_restricted",
-  provider: "azure",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "iso:8.20", "ce:firewalls", "ce:secure-config"],
-  run: (ctx) => guarded("api.network", async () => {
-    const groups = (await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Network/networkSecurityGroups?api-version=2024-01-01`, "network")).filter(
-      (g) => (g.properties?.subnets ?? []).length + (g.properties?.networkInterfaces ?? []).length > 0
-    );
-    if (groups.length === 0) return unknown("api.no_attached_nsgs");
-    if (shapeMismatch(groups, (g) => [g.properties?.securityRules])) return unknown("api.shape.securityRules");
-    const open = [];
-    const evidence = groups.map((g) => {
-      const ports = /* @__PURE__ */ new Set();
-      for (const r of g.properties?.securityRules ?? []) {
-        const p = r.properties ?? {};
-        if (p.access?.toLowerCase() !== "allow" || p.direction?.toLowerCase() !== "inbound") continue;
-        const sources = [p.sourceAddressPrefix, ...p.sourceAddressPrefixes ?? []].filter((s) => Boolean(s)).map((s) => s.toLowerCase());
-        if (!sources.some((s) => ANYWHERE2.has(s))) continue;
-        for (const range of [p.destinationPortRange, ...p.destinationPortRanges ?? []]) for (const port of portsCovered(range)) ports.add(port);
-      }
-      const sorted = [...ports].sort((a, b) => a - b);
-      if (sorted.length) open.push(`${name3(g)}: ${sorted.join(", ")}`);
-      return { name: name3(g), rules: (g.properties?.securityRules ?? []).length, adminPortsOpenToInternet: sorted };
-    });
-    const observed = { networkSecurityGroups: groups.length, adminPortsOpen: open };
-    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var sqlHardened = {
-  code: "azure.sql.hardened",
-  provider: "azure",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.6", "soc2:CC7.2", "iso:8.15", "iso:8.20", "iso:8.24"],
-  run: (ctx) => guarded("api.sql", async () => {
-    const servers = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Sql/servers?api-version=2021-11-01`, "sql");
-    if (servers.length === 0) return unknown("api.no_sql_servers");
-    if (shapeMismatch(servers, (s) => [s.properties, s.id])) return unknown("api.shape.properties");
-    const weak = [];
-    const evidence = [];
-    for (const s of servers) {
-      const base2 = s.id ?? "";
-      const audit = await api(ctx).get(`${base2}/auditingSettings/default?api-version=2021-11-01`);
-      const auditState = audit.status === 200 ? audit.json?.properties?.state ?? null : null;
-      const rules = await list6(api(ctx), `${base2}/firewallRules?api-version=2021-11-01`, "sql");
-      const openToInternet = rules.some((r) => r.properties?.startIpAddress === "0.0.0.0" && r.properties?.endIpAddress === "255.255.255.255");
-      const tls = s.properties?.minimalTlsVersion ?? null;
-      const ok = auditState === "Enabled" && tls === "1.2" && !openToInternet;
-      evidence.push({ name: name3(s), minimalTls: tls, auditing: auditState, openToInternet });
-      if (!ok) weak.push(name3(s));
-    }
-    const observed = { sqlServers: servers.length, weak };
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var keyVaultProtected = {
-  code: "azure.keyvault.protected",
-  provider: "azure",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:A1.2", "soc2:CC6.1", "iso:8.13", "iso:8.24"],
-  run: (ctx) => guarded("api.keyvault", async () => {
-    const vaults = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.KeyVault/vaults?api-version=2023-07-01`, "keyvault");
-    if (vaults.length === 0) return unknown("api.no_key_vaults");
-    if (shapeMismatch(vaults, (v) => [v.properties])) return unknown("api.shape.properties");
-    const weak = vaults.filter((v) => v.properties?.enableSoftDelete === false || v.properties?.enablePurgeProtection !== true).map(name3);
-    const observed = { keyVaults: vaults.length, withoutDeleteProtection: weak };
-    const evidence = vaults.map((v) => ({ name: name3(v), softDelete: v.properties?.enableSoftDelete ?? null, purgeProtection: v.properties?.enablePurgeProtection ?? null, rbac: v.properties?.enableRbacAuthorization ?? null }));
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var appServiceHttps = {
-  code: "azure.appservice.https_only",
-  provider: "azure",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.7", "iso:8.24", "ce:secure-config"],
-  run: (ctx) => guarded("api.web", async () => {
-    const sites2 = (await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Web/sites?api-version=2022-09-01`, "web")).filter((s) => (s.properties?.state ?? "Running") === "Running");
-    if (sites2.length === 0) return unknown("api.no_web_apps");
-    if (shapeMismatch(sites2, (s) => [s.properties, s.id])) return unknown("api.shape.properties");
-    const weak = [];
-    const evidence = [];
-    for (const s of sites2) {
-      const cfg = await api(ctx).get(`${s.id ?? ""}/config/web?api-version=2022-09-01`);
-      const props = cfg.status === 200 ? cfg.json?.properties ?? {} : {};
-      const minTls = props.minTlsVersion ?? null;
-      const ftps = props.ftpsState ?? null;
-      const ok = s.properties?.httpsOnly === true && minTls !== null && minTls >= "1.2" && ftps !== "AllAllowed";
-      evidence.push({ name: name3(s), httpsOnly: s.properties?.httpsOnly ?? null, minTls, ftps });
-      if (!ok) weak.push(name3(s));
-    }
-    const observed = { webApps: sites2.length, weak };
-    return weak.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var MAX_OWNERS2 = 3;
-var ownersLimited2 = {
-  code: "azure.rbac.owners_limited",
-  provider: "azure",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
-  run: (ctx) => guarded("api.rbac", async () => {
-    const all = await list6(api(ctx), `${sub(ctx)}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter=atScope()`, "rbac");
-    if (shapeMismatch(all, (a) => [a.properties?.roleDefinitionId])) return unknown("api.shape.roleDefinitionId");
-    const owners = all.filter((a) => roleTail(a.properties?.roleDefinitionId) === ROLE_OWNER);
-    const observed = { assignmentsAtScope: all.length, owners: owners.length, max: MAX_OWNERS2 };
-    const evidence = owners.map((a) => ({ principalType: a.properties?.principalType ?? null, scope: a.properties?.scope ?? null }));
-    return owners.length > 0 && owners.length <= MAX_OWNERS2 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var AZURE_CHECKS = [storageLockedDown, nsgAdminPorts, sqlHardened, keyVaultProtected, appServiceHttps, ownersLimited2];
-
-// ../lib/checks/providers/pagerduty.ts
-var LIMIT3 = 100;
-var MAX_PAGES7 = 5;
-async function list7(ctx, path, key, scope) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const out = [];
-  for (let page = 0; page < MAX_PAGES7; page++) {
-    const sep = path.includes("?") ? "&" : "?";
-    const r = await ctx.api.get(`${path}${sep}limit=${LIMIT3}&offset=${page * LIMIT3}`);
-    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
-    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
-    const body = r.json;
-    const items = body?.[key];
-    if (!Array.isArray(items)) throw new Error(`scope:api.${scope}`);
-    out.push(...items);
-    if (!body.more) break;
-  }
-  return out;
-}
-var WEEK_MS = 7 * 24 * 3600 * 1e3;
-var DAY_MS = 24 * 3600 * 1e3;
-function covered(shifts, from, to) {
-  const sorted = shifts.filter((s) => s.end > from && s.start < to).sort((a, b) => a.start - b.start);
-  let cursor = from;
-  for (const s of sorted) {
-    if (s.start > cursor) return false;
-    cursor = Math.max(cursor, s.end);
-    if (cursor >= to) return true;
-  }
-  return cursor >= to;
-}
-var oncallCovered = {
-  code: "pagerduty.oncall.covered",
-  provider: "pagerduty",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC7.3", "soc2:CC7.4", "soc2:A1.1", "iso:5.24", "iso:5.26"],
-  run: (ctx) => guarded("api.oncalls", async () => {
-    const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
-    if (policies.length === 0) return unknown("api.no_escalation_policies");
-    const from = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    const to = from + WEEK_MS;
-    const oncalls = await list7(ctx, `/oncalls?since=${encodeURIComponent(new Date(from).toISOString())}&until=${encodeURIComponent(new Date(to).toISOString())}&earliest=true`, "oncalls", "oncalls");
-    if (shapeMismatch(oncalls, (o) => [o.escalation_policy, o.start, o.end])) return unknown("api.shape.oncalls");
-    const gaps = [];
-    const evidence = policies.map((p) => {
-      const shifts = oncalls.filter((o) => o.escalation_policy?.id === p.id && (o.escalation_level ?? 1) === 1).map((o) => ({ start: o.start ? Date.parse(o.start) : from, end: o.end ? Date.parse(o.end) : to }));
-      const ok = covered(shifts, from, to);
-      if (!ok) gaps.push(p.name ?? p.id);
-      return { policy: p.name ?? p.id, levelOneShifts: shifts.length, coveredNextSevenDays: ok };
-    });
-    const observed = { escalationPolicies: policies.length, withGapsNextSevenDays: gaps };
-    return gaps.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var servicesEscalate = {
-  code: "pagerduty.services.escalation_wired",
-  provider: "pagerduty",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC7.3", "soc2:A1.1", "iso:5.24"],
-  run: (ctx) => guarded("api.services", async () => {
-    const services2 = (await list7(ctx, "/services", "services", "services")).filter((s) => s.status !== "disabled");
-    if (services2.length === 0) return unknown("api.no_services");
-    const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
-    const byId = new Map(policies.map((p) => [p.id, p]));
-    if (shapeMismatch(services2, (s) => [s.escalation_policy]) || shapeMismatch(policies, (p) => [p.escalation_rules])) return unknown("api.shape.escalation_policy");
-    const silent = services2.filter((s) => {
-      const p = s.escalation_policy?.id ? byId.get(s.escalation_policy.id) : void 0;
-      return !p || !(p.escalation_rules ?? []).some((r) => (r.targets ?? []).length > 0);
-    }).map((s) => s.name ?? s.id);
-    const observed = { services: services2.length, withoutEscalationTargets: silent };
-    const evidence = services2.map((s) => ({ service: s.name ?? s.id, status: s.status ?? null, escalationPolicy: s.escalation_policy?.summary ?? null }));
-    return silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var escalationHasBackup = {
-  code: "pagerduty.escalation.backup_level",
-  provider: "pagerduty",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC7.4", "soc2:A1.1", "iso:5.26"],
-  run: (ctx) => guarded("api.escalation_policies", async () => {
-    const policies = await list7(ctx, "/escalation_policies", "escalation_policies", "escalation_policies");
-    if (policies.length === 0) return unknown("api.no_escalation_policies");
-    if (shapeMismatch(policies, (p) => [p.escalation_rules, p.num_loops])) return unknown("api.shape.escalation_rules");
-    const single = policies.filter((p) => (p.escalation_rules ?? []).length < 2 && (p.num_loops ?? 0) < 1).map((p) => p.name ?? p.id);
-    const observed = { escalationPolicies: policies.length, singleLevelNoRepeat: single };
-    const evidence = policies.map((p) => ({ policy: p.name ?? p.id, levels: (p.escalation_rules ?? []).length, repeats: p.num_loops ?? 0 }));
-    return single.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var noStaleIncidents = {
-  code: "pagerduty.incidents.none_stale",
-  provider: "pagerduty",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC7.4", "soc2:CC7.5", "iso:5.26"],
-  run: (ctx) => guarded("api.incidents", async () => {
-    const open = await list7(ctx, "/incidents?statuses[]=triggered&statuses[]=acknowledged&date_range=all", "incidents", "incidents");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    if (shapeMismatch(open, (i) => [i.created_at, i.status])) return unknown("api.shape.created_at");
-    const stale = open.filter((i) => i.created_at && now - Date.parse(i.created_at) > DAY_MS).map((i) => `${i.title ?? i.id} (${i.status ?? "?"})`);
-    const observed = { openIncidents: open.length, olderThanADay: stale };
-    const evidence = open.map((i) => ({ incident: i.title ?? i.id, status: i.status ?? null, urgency: i.urgency ?? null, createdAt: i.created_at ?? null }));
-    return stale.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var PAGERDUTY_CHECKS = [oncallCovered, servicesEscalate, escalationHasBackup, noStaleIncidents];
-
-// ../lib/checks/providers/datadog.ts
-function api2(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  return ctx.api;
-}
-var PAGE = 1e3;
-async function monitors3(ctx) {
-  const out = [];
-  for (let page = 0; page < 5; page++) {
-    const r = await api2(ctx).get(`/api/v1/monitor?page=${page}&page_size=${PAGE}`);
-    if (r.status === 403) throw new Error("scope:scope.monitors_read");
-    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error("scope:api.monitors");
-    out.push(...r.json);
-    if (r.json.length < PAGE) break;
-  }
-  return out;
-}
-var NOTIFY = /@[a-z0-9][\w.@+-]*/i;
-var label3 = (m) => m.name ?? String(m.id ?? "?");
-var monitorsNotify = {
-  code: "datadog.monitors.notify_someone",
-  provider: "datadog",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC7.2", "soc2:A1.1", "iso:8.16"],
-  run: (ctx) => guarded("api.monitors", async () => {
-    const all = await monitors3(ctx);
-    if (shapeMismatch(all, (m) => [m.message, m.name])) return unknown("api.shape.message");
-    const silent = all.filter((m) => !NOTIFY.test(m.message ?? "")).map(label3);
-    const observed = { monitors: all.length, withoutNotification: silent };
-    const evidence = all.map((m) => ({ monitor: label3(m), type: m.type ?? null, state: m.overall_state ?? null, notifies: NOTIFY.test(m.message ?? "") }));
-    return all.length > 0 && silent.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var monitorsNotMuted = {
-  code: "datadog.monitors.none_muted_forever",
-  provider: "datadog",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC7.2", "iso:8.16"],
-  run: (ctx) => guarded("api.monitors", async () => {
-    const all = await monitors3(ctx);
-    if (all.length === 0) return unknown("api.no_monitors");
-    if (shapeMismatch(all, (m) => [m.options])) return unknown("api.shape.options");
-    const muted = all.filter((m) => Object.values(m.options?.silenced ?? {}).some((expiry) => expiry === null)).map(label3);
-    const observed = { monitors: all.length, mutedIndefinitely: muted };
-    const evidence = all.filter((m) => m.options?.silenced && Object.keys(m.options.silenced).length > 0).map((m) => ({ monitor: label3(m), silenced: m.options?.silenced ?? null }));
-    return muted.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var noDataNoticed = {
-  code: "datadog.monitors.no_data_alerts",
-  provider: "datadog",
-  version: 1,
-  severity: "low",
-  maps: ["soc2:CC7.2", "iso:8.16"],
-  run: (ctx) => guarded("api.monitors", async () => {
-    const metric = (await monitors3(ctx)).filter((m) => m.type === "metric alert" || m.type === "query alert" || m.type === "service check");
-    if (metric.length === 0) return unknown("api.no_metric_monitors");
-    if (shapeMismatch(metric, (m) => [m.options])) return unknown("api.shape.options");
-    const quiet = metric.filter((m) => m.options?.notify_no_data !== true && !(m.options?.on_missing_data ?? "").includes("notify")).map(label3);
-    const observed = { metricMonitors: metric.length, silentOnMissingData: quiet };
-    const evidence = metric.map((m) => ({ monitor: label3(m), notifyNoData: m.options?.notify_no_data ?? null, onMissingData: m.options?.on_missing_data ?? null }));
-    return quiet.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-function mask2(email) {
-  if (!email) return "?";
-  const [local, domain] = email.split("@");
-  return domain ? `${local.slice(0, 1)}\u2026@${domain}` : `${local.slice(0, 1)}\u2026`;
-}
-var usersMfa = {
-  code: "datadog.users.mfa",
-  provider: "datadog",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access"],
-  run: (ctx) => guarded("api.users", async () => {
-    const users3 = [];
-    for (let page = 0; page < 10; page++) {
-      const r = await api2(ctx).get(`/api/v2/users?filter[status]=Active&page[size]=100&page[number]=${page}`);
-      if (r.status === 403) throw new Error("scope:scope.user_access_read");
-      if (r.status !== 200) throw new Error("scope:api.users");
-      const data = r.json?.data ?? [];
-      users3.push(...data);
-      if (data.length < 100) break;
-    }
-    const people = users3.filter((u) => u.attributes?.service_account !== true && u.attributes?.disabled !== true);
-    if (people.length === 0) return unknown("api.no_users");
-    if (shapeMismatch(people, (u) => [u.attributes?.mfa_enabled])) return unknown("api.shape.mfa_enabled");
-    const without = people.filter((u) => u.attributes?.mfa_enabled !== true).map((u) => mask2(u.attributes?.email));
-    const observed = { users: people.length, withoutMfa: without };
-    const evidence = people.map((u) => ({ user: mask2(u.attributes?.email), mfa: u.attributes?.mfa_enabled ?? null, lastLogin: u.attributes?.last_login_time ?? null }));
-    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var MIN_RETENTION_DAYS = 15;
-var logRetention = {
-  code: "datadog.logs.retention",
-  provider: "datadog",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC7.2", "iso:8.15", "gdpr:art32"],
-  run: (ctx) => guarded("api.logs", async () => {
-    const r = await api2(ctx).get("/api/v1/logs/config/indexes");
-    if (r.status === 403) throw new Error("scope:scope.logs_read_config");
-    if (r.status !== 200) throw new Error("scope:api.logs");
-    const indexes = r.json?.indexes ?? [];
-    if (indexes.length === 0) return unknown("api.no_log_indexes");
-    if (shapeMismatch(indexes, (i) => [i.num_retention_days])) return unknown("api.shape.num_retention_days");
-    const short = indexes.filter((i) => (i.num_retention_days ?? 0) < MIN_RETENTION_DAYS).map((i) => `${i.name ?? "?"} (${i.num_retention_days ?? 0}d)`);
-    const observed = { indexes: indexes.length, minimumDays: MIN_RETENTION_DAYS, belowMinimum: short };
-    const evidence = indexes.map((i) => ({ index: i.name ?? null, retentionDays: i.num_retention_days ?? null }));
-    return short.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var DATADOG_CHECKS = [monitorsNotify, monitorsNotMuted, noDataNoticed, usersMfa, logRetention];
-
-// ../lib/checks/providers/okta.ts
-var MAX_PAGES8 = 5;
-async function list8(api4, path, scope) {
-  const out = [];
-  let next = path;
-  for (let i = 0; i < MAX_PAGES8 && next; i++) {
-    const r = await api4.get(next);
-    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
-    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error(`scope:api.${scope}`);
-    out.push(...r.json);
-    next = r.next;
-  }
-  return out;
-}
-var USER_CAP2 = 200;
-var DORMANT_DAYS4 = 90;
-var NEW_DAYS3 = 30;
-var MAX_SUPER_ADMINS = 3;
-var DAY3 = 24 * 3600 * 1e3;
-function mask3(login) {
-  if (!login) return "?";
-  const [local, domain] = login.split("@");
-  return domain ? `${local.slice(0, 1)}\u2026@${domain}` : `${local.slice(0, 1)}\u2026`;
-}
-async function activeUsers(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const users3 = await list8(ctx.api, `/users?filter=${encodeURIComponent('status eq "ACTIVE"')}&limit=200`, "users");
-  return users3.length > USER_CAP2 ? null : users3;
-}
-async function signOnRules(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  const policies = await list8(ctx.api, "/policies?type=OKTA_SIGN_ON", "policies");
-  const out = [];
-  for (const p of policies.filter((p2) => p2.status === "ACTIVE")) {
-    const rules = await list8(ctx.api, `/policies/${encodeURIComponent(p.id)}/rules`, "policies");
-    out.push({ policy: p.name ?? p.id, rules: rules.filter((r) => r.status !== "INACTIVE") });
-  }
-  return out;
-}
-var mfaEnforced3 = {
-  code: "okta.signon.mfa_required",
-  provider: "okta",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:5.17", "iso:8.5", "ce:user-access"],
-  run: (ctx) => guarded("api.policies", async () => {
-    const policies = await signOnRules(ctx);
-    if (policies.length === 0) return unknown("api.no_signon_policies");
-    if (shapeMismatch(policies.flatMap((p) => p.rules), (r) => [r.actions?.signon])) return unknown("api.shape.signon");
-    const lax = policies.flatMap((p) => p.rules.filter((r) => r.actions?.signon?.access === "ALLOW" && r.actions?.signon?.requireFactor !== true).map(() => p.policy));
-    const observed = { policies: policies.length, rulesAllowingWithoutFactor: lax };
-    const evidence = policies.map((p) => ({ policy: p.policy, rules: p.rules.map((r) => ({ access: r.actions?.signon?.access ?? null, requireFactor: r.actions?.signon?.requireFactor ?? null })) }));
-    return lax.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var mfaEnrolled = {
-  code: "okta.users.mfa_enrolled",
-  provider: "okta",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC6.1", "iso:5.17", "ce:user-access"],
-  run: (ctx) => guarded("api.factors", async () => {
-    const users3 = await activeUsers(ctx);
-    if (users3 === null) return unknown("api.users.too_many");
-    if (users3.length === 0) return unknown("api.no_active_users");
-    const without = [];
-    const evidence = [];
-    for (const u of users3) {
-      const factors = await list8(ctx.api, `/users/${encodeURIComponent(u.id)}/factors`, "factors");
-      const active2 = factors.filter((f) => f.status === "ACTIVE").map((f) => f.factorType ?? "?");
-      evidence.push({ user: mask3(u.profile?.login), activeFactors: active2 });
-      if (active2.length === 0) without.push(mask3(u.profile?.login));
-    }
-    const observed = { users: users3.length, withoutFactor: without };
-    return without.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var superAdminsLimited = {
-  code: "okta.admins.limited",
-  provider: "okta",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.3", "iso:5.15", "iso:8.2", "ce:user-access"],
-  run: (ctx) => guarded("api.roles", async () => {
-    const users3 = await activeUsers(ctx);
-    if (users3 === null) return unknown("api.users.too_many");
-    if (users3.length === 0) return unknown("api.no_active_users");
-    const supers = [];
-    for (const u of users3) {
-      const roles = await list8(ctx.api, `/users/${encodeURIComponent(u.id)}/roles`, "roles");
-      if (roles.some((r) => r.type === "SUPER_ADMIN")) supers.push(mask3(u.profile?.login));
-    }
-    const observed = { users: users3.length, superAdmins: supers.length, max: MAX_SUPER_ADMINS };
-    const evidence = { superAdmins: supers };
-    return supers.length > 0 && supers.length <= MAX_SUPER_ADMINS ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var dormantUsers4 = {
-  code: "okta.users.dormant",
-  provider: "okta",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.2", "soc2:CC6.3", "iso:5.18", "ce:user-access"],
-  run: (ctx) => guarded("api.users", async () => {
-    const users3 = await activeUsers(ctx);
-    if (users3 === null) return unknown("api.users.too_many");
-    if (users3.length === 0) return unknown("api.no_active_users");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    if (shapeMismatch(users3, (u) => [u.lastLogin, u.created])) return unknown("api.shape.lastLogin");
-    const dormant = users3.filter((u) => {
-      const last = u.lastLogin ? Date.parse(u.lastLogin) : NaN;
-      const created = u.created ? Date.parse(u.created) : NaN;
-      if (Number.isFinite(last)) return now - last > DORMANT_DAYS4 * DAY3;
-      return Number.isFinite(created) ? now - created > NEW_DAYS3 * DAY3 : false;
-    }).map((u) => mask3(u.profile?.login));
-    const observed = { users: users3.length, dormantDays: DORMANT_DAYS4, dormant };
-    const evidence = users3.map((u) => ({ user: mask3(u.profile?.login), lastLogin: u.lastLogin ?? null, created: u.created ?? null }));
-    return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var MAX_IDLE_MINUTES = 24 * 60;
-var MAX_LIFETIME_MINUTES = 30 * 24 * 60;
-var sessionsBounded = {
-  code: "okta.signon.sessions_bounded",
-  provider: "okta",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:8.5"],
-  run: (ctx) => guarded("api.policies", async () => {
-    const policies = await signOnRules(ctx);
-    if (policies.length === 0) return unknown("api.no_signon_policies");
-    if (shapeMismatch(policies.flatMap((p) => p.rules), (r) => [r.actions?.signon?.session])) return unknown("api.shape.session");
-    const loose = [];
-    const evidence = policies.map((p) => ({
-      policy: p.policy,
-      rules: p.rules.filter((r) => r.actions?.signon?.access === "ALLOW").map((r) => {
-        const s = r.actions?.signon?.session ?? {};
-        const idle = s.maxSessionIdleMinutes ?? null;
-        const life = s.maxSessionLifetimeMinutes ?? null;
-        const ok = idle !== null && idle > 0 && idle <= MAX_IDLE_MINUTES && life !== null && life > 0 && life <= MAX_LIFETIME_MINUTES;
-        if (!ok) loose.push(p.policy);
-        return { idleMinutes: idle, lifetimeMinutes: life };
-      })
-    }));
-    const observed = { policies: policies.length, maxIdleMinutes: MAX_IDLE_MINUTES, maxLifetimeMinutes: MAX_LIFETIME_MINUTES, rulesOutOfBounds: [...new Set(loose)] };
-    return loose.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var OKTA_CHECKS = [mfaEnforced3, mfaEnrolled, superAdminsLimited, dormantUsers4, sessionsBounded];
-
-// ../lib/checks/providers/azuredevops.ts
-var API = "api-version=7.1";
-var MAX_PAGES9 = 5;
-var MAX_REPOS2 = 50;
-function api3(ctx) {
-  if (!ctx.api) throw new Error("scope:api.not_connected");
-  return ctx.api;
-}
-var base = (ctx) => `https://dev.azure.com/${encodeURIComponent(ctx.org)}`;
-async function listValues(ctx, url, scope) {
-  const out = [];
-  let token;
-  for (let i = 0; i < MAX_PAGES9; i++) {
-    const r = await api3(ctx).get(token ? `${url}&continuationToken=${encodeURIComponent(token)}` : url);
-    if (r.status === 403) throw new Error(`scope:scope.${scope}`);
-    if (r.status !== 200) throw new Error(`scope:api.${scope}`);
-    out.push(...r.json?.value ?? []);
-    token = r.continuation;
-    if (!token) break;
-  }
-  return out;
-}
-async function projects4(ctx) {
-  return (await listValues(ctx, `${base(ctx)}/_apis/projects?${API}&$top=100`, "projects")).filter((p) => (p.state ?? "wellFormed") === "wellFormed");
-}
-var projectsPrivate = {
-  code: "azuredevops.projects.private",
-  provider: "azuredevops",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.1", "iso:8.3", "iso:8.4"],
-  run: (ctx) => guarded("api.projects", async () => {
-    const all = await projects4(ctx);
-    if (all.length === 0) return unknown("api.no_projects");
-    if (shapeMismatch(all, (p) => [p.visibility])) return unknown("api.shape.visibility");
-    const open = all.filter((p) => (p.visibility ?? "private") !== "private").map((p) => p.name);
-    const observed = { projects: all.length, public: open };
-    const evidence = all.map((p) => ({ name: p.name, visibility: p.visibility ?? null }));
-    return open.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var POLICY_MIN_REVIEWERS = "fa4e907d-c16b-4a4c-9dfa-4906e5d171dd";
-var defaultBranchReviewed = {
-  code: "azuredevops.repos.default_branch_reviewed",
-  provider: "azuredevops",
-  version: 1,
-  severity: "high",
-  maps: ["soc2:CC8.1", "iso:8.25", "iso:8.29", "iso:8.32"],
-  run: (ctx) => guarded("api.policies", async () => {
-    const all = await projects4(ctx);
-    if (all.length === 0) return unknown("api.no_projects");
-    const repos2 = [];
-    for (const p of all) {
-      const rs = await listValues(ctx, `${base(ctx)}/${encodeURIComponent(p.name)}/_apis/git/repositories?${API}`, "repositories");
-      for (const r of rs) if (r.isDisabled !== true && r.defaultBranch) repos2.push({ ...r, projectName: p.name });
-      if (repos2.length >= MAX_REPOS2) break;
-    }
-    if (repos2.length === 0) return unknown("api.no_repositories");
-    const unprotected = [];
-    const evidence = [];
-    for (const r of repos2.slice(0, MAX_REPOS2)) {
-      const policies = await listValues(ctx, `${base(ctx)}/${encodeURIComponent(r.projectName)}/_apis/git/policy/configurations?repositoryId=${encodeURIComponent(r.id)}&refName=${encodeURIComponent(r.defaultBranch)}&${API}`, "policies");
-      const review = policies.find((p) => p.type?.id?.toLowerCase() === POLICY_MIN_REVIEWERS && p.isEnabled === true && p.isDeleted !== true);
-      const count = review?.settings?.minimumApproverCount ?? null;
-      const ok = review !== void 0 && (count ?? 0) >= 1 && review.isBlocking === true && review.settings?.creatorVoteCounts !== true;
-      const label4 = `${r.projectName}/${r.name}`;
-      evidence.push({ repository: label4, defaultBranch: r.defaultBranch, minimumApprovers: count, blocking: review?.isBlocking === true });
-      if (!ok) unprotected.push(label4);
-    }
-    const observed = { repositories: evidence.length, withoutRequiredReview: unprotected };
-    return unprotected.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var pipelinesAsCode = {
-  code: "azuredevops.pipelines.yaml",
-  provider: "azuredevops",
-  version: 1,
-  severity: "low",
-  maps: ["soc2:CC8.1", "iso:8.32"],
-  run: (ctx) => guarded("api.pipelines", async () => {
-    const all = await projects4(ctx);
-    if (all.length === 0) return unknown("api.no_projects");
-    const pipelines = [];
-    for (const p of all) {
-      const ps = await listValues(ctx, `${base(ctx)}/${encodeURIComponent(p.name)}/_apis/pipelines?${API}&$top=100`, "pipelines");
-      for (const x of ps) pipelines.push({ name: `${p.name}/${x.name ?? "?"}`, type: x.configuration?.type ?? "unknown" });
-    }
-    if (pipelines.length === 0) return unknown("api.no_pipelines");
-    if (pipelines.every((x) => x.type === "unknown")) return unknown("api.shape.configuration");
-    const classic = pipelines.filter((x) => x.type !== "yaml").map((x) => x.name);
-    const observed = { pipelines: pipelines.length, notAsCode: classic };
-    return classic.length === 0 ? pass(observed, pipelines) : fail(observed, pipelines);
-  })
-};
-var DORMANT_DAYS5 = 90;
-var NEW_DAYS4 = 30;
-var DAY4 = 24 * 3600 * 1e3;
-function mask4(principal) {
-  if (!principal) return "?";
-  const [local, domain] = principal.split("@");
-  return domain ? `${local.slice(0, 1)}\u2026@${domain}` : `${local.slice(0, 1)}\u2026`;
-}
-var dormantMembers = {
-  code: "azuredevops.members.dormant",
-  provider: "azuredevops",
-  version: 1,
-  severity: "medium",
-  maps: ["soc2:CC6.2", "soc2:CC6.3", "iso:5.18", "ce:user-access"],
-  run: (ctx) => guarded("api.entitlements", async () => {
-    const url = `https://vsaex.dev.azure.com/${encodeURIComponent(ctx.org)}/_apis/userentitlements?${API}&$top=500`;
-    const r = await api3(ctx).get(url);
-    if (r.status === 403) throw new Error("scope:scope.entitlements");
-    if (r.status !== 200) throw new Error("scope:api.entitlements");
-    const items = (r.json?.items ?? r.json?.members ?? []).filter((e) => (e.accessLevel?.status ?? "active") === "active");
-    if (items.length === 0) return unknown("api.no_members");
-    const now = (ctx.now ?? /* @__PURE__ */ new Date()).getTime();
-    if (shapeMismatch(items, (e) => [e.lastAccessedDate, e.dateCreated])) return unknown("api.shape.lastAccessedDate");
-    const dormant = items.filter((e) => {
-      const last = e.lastAccessedDate ? Date.parse(e.lastAccessedDate) : NaN;
-      const created = e.dateCreated ? Date.parse(e.dateCreated) : NaN;
-      if (Number.isFinite(last) && last > Date.parse("1990-01-01T00:00:00Z")) return now - last > DORMANT_DAYS5 * DAY4;
-      return Number.isFinite(created) ? now - created > NEW_DAYS4 * DAY4 : false;
-    }).map((e) => mask4(e.user?.principalName));
-    const observed = { members: items.length, dormantDays: DORMANT_DAYS5, dormant };
-    const evidence = items.map((e) => ({ member: mask4(e.user?.principalName), licence: e.accessLevel?.accountLicenseType ?? null, lastAccessed: e.lastAccessedDate ?? null }));
-    return dormant.length === 0 ? pass(observed, evidence) : fail(observed, evidence);
-  })
-};
-var AZUREDEVOPS_CHECKS = [projectsPrivate, defaultBranchReviewed, pipelinesAsCode, dormantMembers];
-
-// ../lib/checks/registry.ts
-function entries(defs) {
-  return defs.map((d) => ({ code: d.code, provider: d.provider, version: d.version, severity: d.severity, maps: d.maps ?? [] }));
-}
-var CATALOGUE = [
-  ...entries(DOMAIN_CHECKS),
-  ...entries(SUPABASE_CHECKS),
-  ...entries(GITHUB_CHECKS),
-  ...entries(CLOUDFLARE_CHECKS),
-  ...entries(STRIPE_CHECKS),
-  ...entries(EMAIL_CHECKS),
-  ...entries(SENTRY_CHECKS),
-  ...entries(SLACK_CHECKS),
-  ...entries(GOOGLE_CHECKS),
-  ...entries(MICROSOFT_CHECKS),
-  ...entries(UPTIMEROBOT_CHECKS),
-  ...entries(GITLAB_CHECKS),
-  ...entries(FLY_CHECKS),
-  ...entries(VERCEL_CHECKS),
-  ...entries(NETLIFY_CHECKS),
-  ...entries(NEON_CHECKS),
-  ...entries(RENDER_CHECKS),
-  ...entries(REPO_CHECKS),
-  ...entries(HEROKU_CHECKS),
-  ...entries(CLERK_CHECKS),
-  ...entries(ATLAS_CHECKS),
-  ...entries(DIGITALOCEAN_CHECKS),
-  ...entries(UPSTASH_CHECKS),
-  ...entries(BETTERSTACK_CHECKS),
-  ...entries(RAILWAY_CHECKS),
-  ...entries(AUTH0_CHECKS),
-  ...entries(BITBUCKET_CHECKS),
-  ...entries(HETZNER_CHECKS),
-  ...entries(AZURE_CHECKS),
-  ...entries(WORKOS_CHECKS),
-  ...entries(TURSO_CHECKS),
-  ...entries(CHECKLY_CHECKS),
-  ...entries(CIRCLECI_CHECKS),
-  ...entries(AZUREDEVOPS_CHECKS),
-  ...entries(OKTA_CHECKS),
-  ...entries(DATADOG_CHECKS),
-  ...entries(PAGERDUTY_CHECKS)
-];
-var catalogueByCode = new Map(CATALOGUE.map((c) => [c.code, c]));
-
-// ../lib/checks/ingest.ts
+// ../lib/checks/ingest-key.ts
 var KEY = /^snpi_([0-9a-f]{32})_([A-Za-z0-9_-]{32,})$/;
 function parseIngestKey(key) {
   const m = KEY.exec(key.trim());
@@ -6923,9 +7361,9 @@ var LOCAL = {
     env: "CIRCLECI_TOKEN",
     extra: "CIRCLECI_PROJECT",
     label: "CircleCI",
-    run: (t, project) => {
-      if (!CIRCLECI_PROJECT.test(project)) throw new Error("CIRCLECI_PROJECT must be a project slug such as gh/acme/api.");
-      return runCircleCiChecks({ project, api: circleCiApi(t) });
+    run: (t, project2) => {
+      if (!CIRCLECI_PROJECT.test(project2)) throw new Error("CIRCLECI_PROJECT must be a project slug such as gh/acme/api.");
+      return runCircleCiChecks({ project: project2, api: circleCiApi(t) });
     }
   },
   checkly: { env: "CHECKLY_API_KEY", extra: "CHECKLY_ACCOUNT_ID", label: "Checkly", run: (t, account) => runChecklyChecks({ api: checklyApi(t, account) }) },
@@ -6938,30 +7376,107 @@ var LOCAL = {
       return runTursoChecks({ org, api: tursoApi(t) });
     }
   },
-  workos: { env: "WORKOS_API_KEY", label: "WorkOS", run: (t) => runWorkOsChecks({ api: workOsApi(t) }) }
+  workos: { env: "WORKOS_API_KEY", label: "WorkOS", run: (t) => runWorkOsChecks({ api: workOsApi(t) }) },
+  // The scanners. Snoopios does not rescan: it reads what the customer's own
+  // tool already found and asks whether anybody fixed it, and how fast.
+  snyk: {
+    env: "SNYK_TOKEN",
+    extra: "SNYK_ORG_ID",
+    label: "Snyk",
+    run: (t, org) => {
+      if (!SNYK_ORG.test(org)) throw new Error("SNYK_ORG_ID must be the organisation id, which is a GUID rather than the org's name.");
+      return runSnykChecks({ api: snykApi(t), orgId: org });
+    }
+  },
+  gitguardian: { env: "GITGUARDIAN_API_KEY", label: "GitGuardian", run: (t) => runGitGuardianChecks({ api: gitGuardianApi(t) }) },
+  semgrep: {
+    env: "SEMGREP_APP_TOKEN",
+    extra: "SEMGREP_DEPLOYMENT",
+    label: "Semgrep",
+    run: (t, slug) => {
+      if (!SEMGREP_SLUG.test(slug)) throw new Error("SEMGREP_DEPLOYMENT must be the deployment slug.");
+      return runSemgrepChecks({ api: semgrepApi(t), slug });
+    }
+  },
+  // Aikido and Bitwarden exchange a client pair for a short-lived token, so
+  // the secret half is the one in the environment and the id is the extra.
+  aikido: {
+    env: "AIKIDO_CLIENT_SECRET",
+    extra: "AIKIDO_CLIENT_ID",
+    label: "Aikido",
+    run: async (secret, id) => runAikidoChecks(await aikidoContext(id, secret))
+  },
+  sonarqube: {
+    env: "SONAR_TOKEN",
+    extra: "SONAR_PROJECT_KEY",
+    label: "SonarQube",
+    run: (t, key) => {
+      if (!key) throw new Error("SONAR_PROJECT_KEY must be the project key.");
+      return runSonarChecks({ api: sonarApi(process.env.SONAR_HOST_URL || "https://sonarcloud.io", t), projectKey: key });
+    }
+  },
+  // The password and secrets managers. None of these credentials can be made
+  // read-only, which is exactly why they never leave this machine.
+  bitwarden: {
+    env: "BW_CLIENT_SECRET",
+    extra: "BW_CLIENT_ID",
+    label: "Bitwarden",
+    run: async (secret, id) => {
+      const region = process.env.BW_REGION || "com";
+      if (region !== "com" && region !== "eu") throw new Error("BW_REGION must be com or eu.");
+      return runBitwardenChecks(await bitwardenContext(id, secret, region));
+    }
+  },
+  onepassword: {
+    env: "OP_EVENTS_TOKEN",
+    extra: "OP_REGION",
+    label: "1Password",
+    run: (t, region) => {
+      const r = region || "com";
+      if (!HOSTS[r]) throw new Error(`OP_REGION must be one of ${Object.keys(HOSTS).join(", ")}.`);
+      return runOnePasswordChecks({ api: onePasswordApi(t, r) });
+    }
+  },
+  doppler: { env: "DOPPLER_TOKEN", label: "Doppler", run: (t) => runDopplerChecks({ api: dopplerApi(t) }) }
 };
 function text(key) {
   return COPY[key] ?? key;
 }
 function usage() {
   return [
-    `snoopios ${"0.6.0"} \u2014 continuous compliance for small software teams`,
+    `snoopios ${"0.7.0"}: continuous compliance for small software teams`,
     "",
     "Usage:",
     "  snoopios scan <domain> [--email <resend|postmark|mailgun|ses|other>] [--json]",
-    "  snoopios run <netlify|neon|render|heroku|clerk|upstash|betterstack|railway|circleci|checkly|turso|workos> [--json] [--push] [--ci]",
+    "  snoopios run <provider> [--json] [--push] [--ci]        (see the list below)",
     "  snoopios doctor <postgres-connection-string> [--json]",
     "  snoopios repo [path] [--json] [--push] [--ci]",
     "",
     "scan    the domain checks (HTTPS, HSTS, CSP, TLS, SPF, DMARC, CAA, security.txt, privacy",
     "        page); --email adds the sending-domain checks with that provider's defaults",
-    "run     a provider whose token cannot be made read-only, so it runs here instead of on",
-    "        Snoopios's servers. Reads NETLIFY_AUTH_TOKEN, NEON_API_KEY, RENDER_API_KEY,",
-    "        HEROKU_API_KEY, CLERK_SECRET_KEY, UPSTASH_API_KEY with UPSTASH_EMAIL,",
-    "        BETTERSTACK_API_TOKEN, RAILWAY_TOKEN (a project token), CIRCLECI_TOKEN with",
-    "        CIRCLECI_PROJECT (gh/org/repo), CHECKLY_API_KEY with CHECKLY_ACCOUNT_ID,",
-    "        TURSO_API_TOKEN with TURSO_ORG, or WORKOS_API_KEY from the environment.",
-    "        The token never leaves this machine.",
+    "run     a provider whose token cannot be made read-only, or whose token you should not",
+    "        hand to a compliance tool at all. It runs here instead of on Snoopios's",
+    "        servers, and the token never leaves this machine.",
+    "",
+    "        hosting and data    netlify NETLIFY_AUTH_TOKEN | neon NEON_API_KEY",
+    "                            render RENDER_API_KEY | heroku HEROKU_API_KEY",
+    "                            railway RAILWAY_TOKEN | turso TURSO_API_TOKEN + TURSO_ORG",
+    "                            upstash UPSTASH_API_KEY + UPSTASH_EMAIL",
+    "        identity            clerk CLERK_SECRET_KEY | workos WORKOS_API_KEY",
+    "        monitoring and CI   betterstack BETTERSTACK_API_TOKEN | checkly CHECKLY_API_KEY",
+    "                            + CHECKLY_ACCOUNT_ID | circleci CIRCLECI_TOKEN +",
+    "                            CIRCLECI_PROJECT (gh/org/repo)",
+    "        scanning            snyk SNYK_TOKEN + SNYK_ORG_ID | semgrep SEMGREP_APP_TOKEN +",
+    "                            SEMGREP_DEPLOYMENT | gitguardian GITGUARDIAN_API_KEY",
+    "                            aikido AIKIDO_CLIENT_ID + AIKIDO_CLIENT_SECRET",
+    "                            sonarqube SONAR_TOKEN + SONAR_PROJECT_KEY, and",
+    "                            SONAR_HOST_URL for a self-hosted server",
+    "        secrets             onepassword OP_EVENTS_TOKEN + OP_REGION (com, ca, eu, ent)",
+    "                            bitwarden BW_CLIENT_ID + BW_CLIENT_SECRET (+ BW_REGION=eu)",
+    "                            doppler DOPPLER_TOKEN",
+    "",
+    "        The scanners are read, never re-run: Snoopios does not rescan your code. What",
+    "        it asks is whether anybody fixes what your own tools find, and how fast.",
     "doctor  the Supabase SQL checks (RLS on every table, no anon writes, private schema",
     "        closed, SECURITY DEFINER search_path, anon-callable definers) against any",
     "        Postgres connection string. Runs SELECT statements only.",
@@ -7008,7 +7523,7 @@ ${heading}
 }
 async function emit(heading, subject, results, json, pushTo) {
   if (json) {
-    console.log(JSON.stringify({ subject, version: "0.6.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
+    console.log(JSON.stringify({ subject, version: "0.7.0", checks: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, errorScope: r.result.errorScope ?? null })) }, null, 2));
   } else {
     print(heading, rows(results));
   }
@@ -7051,16 +7566,16 @@ async function push(p, results) {
     console.error(key ? "SNOOPIOS_INGEST_KEY is not a Snoopios ingest key (snpi_\u2026). Create one on the project page under Run locally and push." : "SNOOPIOS_INGEST_KEY is not set. Create a key on the project page under Run locally and push, and put it in that environment variable.");
     return false;
   }
-  const base2 = (process.env.SNOOPIOS_URL ?? "https://snoopios.com").replace(/\/+$/, "");
+  const base = (process.env.SNOOPIOS_URL ?? "https://snoopios.com").replace(/\/+$/, "");
   const body = {
     provider: p.provider,
     results: results.map((r) => ({ code: r.code, version: r.version, status: r.result.status, observed: r.result.observed, evidence: r.result.evidence ?? null, errorScope: r.result.errorScope ?? null })),
     runner: detectRunner(p.ci)
   };
   try {
-    const res = await fetch(`${base2}/api/projects/${parsed.projectId}/ingest`, {
+    const res = await fetch(`${base}/api/projects/${parsed.projectId}/ingest`, {
       method: "POST",
-      headers: { authorization: `Bearer ${key}`, "content-type": "application/json", accept: "application/json", connection: "close", "user-agent": `snoopios-cli/${"0.6.0"}` },
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json", accept: "application/json", connection: "close", "user-agent": `snoopios-cli/${"0.7.0"}` },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(3e4)
     });
@@ -7069,7 +7584,7 @@ async function push(p, results) {
       console.error(`Push refused (${res.status}${json?.error ? `, ${json.error}` : ""}). Nothing was stored.`);
       return false;
     }
-    console.error(`Pushed ${json.written} results to ${base2}/app/projects/${parsed.projectId} as ${body.runner.kind === "ci" ? "run in CI" : "run by you"}.`);
+    console.error(`Pushed ${json.written} results to ${base}/app/projects/${parsed.projectId} as ${body.runner.kind === "ci" ? "run in CI" : "run by you"}.`);
     return true;
   } catch (e) {
     console.error(`Push failed: ${e instanceof Error ? e.message : String(e)}. Nothing was stored.`);
@@ -7105,8 +7620,8 @@ async function run(rest) {
 ${usage()}`);
     return 2;
   }
-  const name4 = (positional[0] ?? "").toLowerCase();
-  const p = LOCAL[name4];
+  const name = (positional[0] ?? "").toLowerCase();
+  const p = LOCAL[name];
   if (!p) {
     console.error(`run needs one of ${Object.keys(LOCAL).join(", ")}. Example: snoopios run netlify`);
     return 2;
@@ -7122,7 +7637,7 @@ ${usage()}`);
     return 2;
   }
   const results = await p.run(token, extra);
-  return emit(`snoopios run ${name4}`, name4, results, json, pushFlag ? { provider: name4, ci } : void 0);
+  return emit(`snoopios run ${name}`, name, results, json, pushFlag ? { provider: name, ci } : void 0);
 }
 async function doctor(rest) {
   const { positional, json, push: pushFlag, error } = parse(rest);
@@ -7142,8 +7657,20 @@ ${usage()}`);
     return 2;
   }
   const { default: pg } = await import("pg");
-  const client = new pg.Client({ connectionString: url, ssl: /localhost|127\.0\.0\.1/.test(url) ? void 0 : { rejectUnauthorized: false } });
-  await client.connect();
+  const local = /@(localhost|127\.0\.0\.1)(:|\/|$)/.test(url);
+  const supabase = /@[^/]*\.supabase\.(com|co)(:|\/|$)/.test(url);
+  const ssl = local ? void 0 : supabase ? { ca: "-----BEGIN CERTIFICATE-----\nMIIDxDCCAqygAwIBAgIUbLxMod62P2ktCiAkxnKJwtE9VPYwDQYJKoZIhvcNAQEL\nBQAwazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5l\ndyBDYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJh\nc2UgUm9vdCAyMDIxIENBMB4XDTIxMDQyODEwNTY1M1oXDTMxMDQyNjEwNTY1M1ow\nazELMAkGA1UEBhMCVVMxEDAOBgNVBAgMB0RlbHdhcmUxEzARBgNVBAcMCk5ldyBD\nYXN0bGUxFTATBgNVBAoMDFN1cGFiYXNlIEluYzEeMBwGA1UEAwwVU3VwYWJhc2Ug\nUm9vdCAyMDIxIENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqQXW\nQyHOB+qR2GJobCq/CBmQ40G0oDmCC3mzVnn8sv4XNeWtE5XcEL0uVih7Jo4Dkx1Q\nDmGHBH1zDfgs2qXiLb6xpw/CKQPypZW1JssOTMIfQppNQ87K75Ya0p25Y3ePS2t2\nGtvHxNjUV6kjOZjEn2yWEcBdpOVCUYBVFBNMB4YBHkNRDa/+S4uywAoaTWnCJLUi\ncvTlHmMw6xSQQn1UfRQHk50DMCEJ7Cy1RxrZJrkXXRP3LqQL2ijJ6F4yMfh+Gyb4\nO4XajoVj/+R4GwywKYrrS8PrSNtwxr5StlQO8zIQUSMiq26wM8mgELFlS/32Uclt\nNaQ1xBRizkzpZct9DwIDAQABo2AwXjALBgNVHQ8EBAMCAQYwHQYDVR0OBBYEFKjX\nuXY32CztkhImng4yJNUtaUYsMB8GA1UdIwQYMBaAFKjXuXY32CztkhImng4yJNUt\naUYsMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAB8spzNn+4VU\ntVxbdMaX+39Z50sc7uATmus16jmmHjhIHz+l/9GlJ5KqAMOx26mPZgfzG7oneL2b\nVW+WgYUkTT3XEPFWnTp2RJwQao8/tYPXWEJDc0WVQHrpmnWOFKU/d3MqBgBm5y+6\njB81TU/RG2rVerPDWP+1MMcNNy0491CTL5XQZ7JfDJJ9CCmXSdtTl4uUQnSuv/Qx\nCea13BX2ZgJc7Au30vihLhub52De4P/4gonKsNHYdbWjg7OWKwNv/zitGDVDB9Y2\nCMTyZKG3XEu5Ghl1LEnI3QmEKsqaCLv12BnVjbkSeZsMnevJPs1Ye6TjjJwdik5P\no/bKiIz+Fq8=\n-----END CERTIFICATE-----\n", rejectUnauthorized: true } : { rejectUnauthorized: true };
+  const client = new pg.Client({ connectionString: url, ssl, connectionTimeoutMillis: 15e3 });
+  try {
+    await client.connect();
+  } catch (e) {
+    const err = e;
+    const why = err.code ?? err.errors?.map((x) => x.code).filter(Boolean).join(", ") ?? "";
+    const reason = why || err.message || "network error";
+    const hint = /ssl|tls|cert|self.signed|unable_to_verify|depth_zero|altname|hostname/i.test(reason) ? "The certificate is verified; a self-hosted server needs one the system trusts." : "Check the host and port are reachable from this machine; some networks block outbound 5432 and 6543.";
+    console.error(`Could not connect to the database: ${reason}. ${hint}`);
+    return 2;
+  }
   try {
     const sql = { query: async (q) => (await client.query(q)).rows };
     const all = await runSupabaseChecks({ projectRef: "local", sql });
@@ -7185,8 +7712,8 @@ function gitHistory(cwd, maxBytes) {
 function npmAudit(cwd) {
   return new Promise((res) => {
     const npmCli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
-    const [file2, args] = existsSync(npmCli) ? [process.execPath, [npmCli, "audit", "--json", "--audit-level=none"]] : [process.platform === "win32" ? "npm.cmd" : "npm", ["audit", "--json", "--audit-level=none"]];
-    execFile(file2, args, { cwd, maxBuffer: 32 * 1024 * 1024, windowsHide: true, shell: file2 !== process.execPath && process.platform === "win32" }, (_err, stdout) => {
+    const [file, args] = existsSync(npmCli) ? [process.execPath, [npmCli, "audit", "--json", "--audit-level=none"]] : [process.platform === "win32" ? "npm.cmd" : "npm", ["audit", "--json", "--audit-level=none"]];
+    execFile(file, args, { cwd, maxBuffer: 32 * 1024 * 1024, windowsHide: true, shell: file !== process.execPath && process.platform === "win32" }, (_err, stdout) => {
       try {
         const j = JSON.parse(String(stdout));
         const v = j.metadata?.vulnerabilities;
@@ -7231,7 +7758,7 @@ async function main(argv) {
     return 0;
   }
   if (cmd === "--version" || cmd === "-v") {
-    console.log("0.6.0");
+    console.log("0.7.0");
     return 0;
   }
   if (cmd === "scan") return scan(rest);

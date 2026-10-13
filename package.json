@@ -1,7 +1,7 @@
 {
   "name": "snoopios",
-  "version": "0.6.0",
-  "description": "Check a domain, a git checkout, a Netlify, Neon, Render, Heroku, Clerk, Upstash, Better Stack, Railway, CircleCI, Checkly, Turso or WorkOS account, or a Postgres database the way a compliance reviewer would. Read-only, runs on your machine, sends nothing anywhere.",
+  "version": "0.7.0",
+  "description": "Check a domain, a git checkout, a Postgres database, or twenty providers whose tokens should never leave your machine (hosting, identity, monitoring, CI, code and secret scanners, password managers) the way a compliance reviewer would. Read-only, runs on your machine, sends nothing anywhere unless you ask it to.",
   "license": "MIT",
   "author": "Archema Labs Ltd <hello@snoopios.com> (https://snoopios.com)",
   "homepage": "https://snoopios.com",
